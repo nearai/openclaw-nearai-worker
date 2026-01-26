@@ -63,7 +63,7 @@
     "port": 18789,
     "auth": {
       "mode": "token",
-      "token": "${CLAWDBOT_GATEWAY_TOKEN:-}"
+      "token": "${CLAWDBOT_GATEWAY_TOKEN}"
     },
     "http": {
       "endpoints": {

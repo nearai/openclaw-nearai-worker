@@ -3,14 +3,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        CLAWDBOT_DOCKER_APT_PACKAGES: ""
     image: clawdbot-nearai-worker:latest
     environment:
       HOME: /home/node
       TERM: xterm-256color
-      # Gateway configuration
-      CLAWDBOT_GATEWAY_TOKEN: ${CLAWDBOT_GATEWAY_TOKEN:-}
+      # Gateway configuration (required)
+      CLAWDBOT_GATEWAY_TOKEN: ${CLAWDBOT_GATEWAY_TOKEN}
       # NEAR AI Cloud API Key
       NEARAI_API_KEY: ${NEARAI_API_KEY}
       # Slack configuration
@@ -18,6 +16,8 @@ services:
       SLACK_APP_TOKEN: ${SLACK_APP_TOKEN}
       # Optional: Slack signing secret for HTTP mode
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+      # Optional: Force config regeneration (set to "1" to regenerate config from template)
+      CLAWDBOT_FORCE_CONFIG_REGEN: ${CLAWDBOT_FORCE_CONFIG_REGEN:-0}
     volumes:
       - clawdbot-config:/home/node/.clawdbot
       - clawdbot-workspace:/home/node/clawd
@@ -27,7 +27,7 @@ services:
     init: true
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "clawdbot", "gateway", "--health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:18789/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
