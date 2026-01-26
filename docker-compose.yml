@@ -1,6 +1,6 @@
 services:
   clawdbot-gateway:
-    image: robortyan/clawdbot-nearai-worker:latest
+    image: robortyan/clawdbot-nearai-worker:dev
     environment:
       HOME: /home/node
       TERM: xterm-256color
@@ -34,7 +34,7 @@ services:
         "clawdbot",
         "gateway",
         "--bind",
-        "0.0.0.0",
+        "lan",
         "--port",
         "18789",
         "--verbose"
