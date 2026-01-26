@@ -78,7 +78,7 @@ The configuration is automatically generated from environment variables on first
 
 - **NEAR AI Cloud** as the model provider
 - **GLM-4.7** (`zai-org/GLM-4.7`) as the default model
-- **Slack** configured with `dmPolicy: "pairing"` (DMs require approval) and `groupPolicy: "allowlist"` (groups require explicit allowlist, bot is mention-gated).
+- **Slack** configured with `dmPolicy: "open"` and `groupPolicy: "open"` with `allowFrom: ["*"]` and `groupAllowFrom: ["*"]` (open access for all channels and users)
 
 ### Updating Configuration
 
