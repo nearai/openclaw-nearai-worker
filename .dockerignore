@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.github
+*.md
+!README.md
+.env
+.env.*
+*.log
+oci.tar
+.GIT_REV
+pinned-packages.txt
+

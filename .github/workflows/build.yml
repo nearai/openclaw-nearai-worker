@@ -1,0 +1,86 @@
+name: Build & Deploy
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: docker.io
+  IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/${{ github.event.repository.name }}
+
+jobs:
+  reproducible-docker-image:
+    name: Reproducible Docker Image
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Extract image tag from GitHub ref (branch or tag)
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
+            TAG=${GITHUB_REF_NAME#v}
+            echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} tag"
+          elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
+            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'main' ]]; then echo 'latest'; else echo 'dev'; fi)
+            echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} branch"
+          else
+            echo "Unsupported ref type: ${GITHUB_REF_TYPE}" >&2
+            exit 1
+          fi
+
+          if [ -z "${TAG}" ]; then
+            echo "Unable to parse image tag from ${GITHUB_REF_TYPE}: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Build and push reproducible image
+        run: |
+          ./build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
+
+      - name: Get image digest
+        run: |
+          DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
+          if [ -z "${DIGEST}" ]; then
+            echo "Failed to get image digest from OCI archive" >&2
+            exit 1
+          fi
+          echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          push-to-registry: true
+
+      - name: Generate build summary
+        run: |
+          {
+            echo "## ${{ env.IMAGE_REPOSITORY }} docker image"
+            echo ""
+            echo "- tag: \`${{ env.IMAGE_REFERENCE }}\`"
+            echo "- digest: \`${{ env.IMAGE_DIGEST }}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
+          } >> "$GITHUB_STEP_SUMMARY"

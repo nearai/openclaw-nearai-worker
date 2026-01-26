@@ -1,0 +1,79 @@
+{
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "nearai": {
+        "baseUrl": "https://cloud-api.near.ai/v1",
+        "apiKey": "${NEARAI_API_KEY}",
+        "auth": "api-key",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "zai-org/GLM-4.7",
+            "name": "GLM-4.7",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "nearai/zai-org/GLM-4.7"
+      },
+      "models": {
+        "nearai/zai-org/GLM-4.7": {}
+      },
+      "workspace": "/home/node/clawd",
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8
+      }
+    }
+  },
+  "channels": {
+    "slack": {
+      "enabled": true,
+      "botToken": "${SLACK_BOT_TOKEN}",
+      "appToken": "${SLACK_APP_TOKEN}",
+      "mode": "socket",
+      "groupPolicy": "open",
+      "dmPolicy": "open",
+      "allowFrom": ["*"],
+      "groupAllowFrom": ["*"],
+      "commands": {
+        "native": true,
+        "text": true
+      },
+      "heartbeat": "on"
+    }
+  },
+  "gateway": {
+    "bind": "0.0.0.0",
+    "port": 18789,
+    "auth": {
+      "mode": "token",
+      "token": "${CLAWDBOT_GATEWAY_TOKEN}"
+    },
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        },
+        "responses": {
+          "enabled": true
+        }
+      }
+    }
+  }
+}
