@@ -1,9 +1,6 @@
 services:
   clawdbot-gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: clawdbot-nearai-worker:latest
+    image: robortyan/clawdbot-nearai-worker:latest
     environment:
       HOME: /home/node
       TERM: xterm-256color
