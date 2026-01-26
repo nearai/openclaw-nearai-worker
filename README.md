@@ -35,40 +35,30 @@ Optional variables:
 - `SLACK_SIGNING_SECRET`: Slack signing secret (for HTTP mode)
 - `CLAWDBOT_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
 
-### Building
-
-```bash
-# Build the Docker image
-docker build -t clawdbot-nearai-worker:latest -f Dockerfile .
-
-# Or use docker-compose (builds automatically):
-docker-compose build
-```
-
 ### Running
 
 ```bash
 # Start the service (builds if needed)
-docker-compose up -d
+docker compose up -d
 
 # Or start in foreground to see logs:
-docker-compose up
+docker compose up
 ```
 
 ### View Logs
 
 ```bash
-docker-compose logs -f clawdbot-gateway
+docker compose logs -f clawdbot-gateway
 ```
 
 ### Testing
 
 ```bash
 # Check configuration
-docker-compose exec clawdbot-gateway clawdbot doctor
+docker compose exec clawdbot-gateway clawdbot doctor
 
 # List available models
-docker-compose exec clawdbot-gateway clawdbot models list
+docker compose exec clawdbot-gateway clawdbot models list
 ```
 
 ## Configuration
@@ -87,22 +77,22 @@ To update the configuration after changing environment variables, you have three
 
 1. **Force regeneration** (recommended): Set `CLAWDBOT_FORCE_CONFIG_REGEN=1` and restart the container:
    ```bash
-   # In docker-compose.yml, add to environment:
+   # In docker compose.yml, add to environment:
    CLAWDBOT_FORCE_CONFIG_REGEN: "1"
    
    # Or when running:
-   docker-compose run -e CLAWDBOT_FORCE_CONFIG_REGEN=1 clawdbot-gateway
+   docker compose run -e CLAWDBOT_FORCE_CONFIG_REGEN=1 clawdbot-gateway
    ```
 
 2. **Delete and regenerate**: Remove the config file and restart:
    ```bash
-   docker-compose exec clawdbot-gateway rm /home/node/.clawdbot/clawdbot.json
-   docker-compose restart clawdbot-gateway
+   docker compose exec clawdbot-gateway rm /home/node/.clawdbot/clawdbot.json
+   docker compose restart clawdbot-gateway
    ```
 
 3. **Manual edit**: Edit the config file directly:
    ```bash
-   docker-compose exec clawdbot-gateway vi /home/node/.clawdbot/clawdbot.json
+   docker compose exec clawdbot-gateway vi /home/node/.clawdbot/clawdbot.json
    ```
 
 ### Customizing Configuration
@@ -137,13 +127,13 @@ Key considerations for TEE deployment:
 ### Check Container Status
 
 ```bash
-docker-compose ps
+docker compose ps
 ```
 
 ### View Logs
 
 ```bash
-docker-compose logs -f clawdbot-gateway
+docker compose logs -f clawdbot-gateway
 ```
 
 ⚠️ **Security Note**: Container logs may contain sensitive information. Ensure logs are properly secured and not exposed publicly.
@@ -151,13 +141,13 @@ docker-compose logs -f clawdbot-gateway
 ### Verify Configuration
 
 ```bash
-docker-compose exec clawdbot-gateway clawdbot doctor
+docker compose exec clawdbot-gateway clawdbot doctor
 ```
 
 ### List Models
 
 ```bash
-docker-compose exec clawdbot-gateway clawdbot models list
+docker compose exec clawdbot-gateway clawdbot models list
 ```
 
 ### Security Best Practices
@@ -170,13 +160,13 @@ docker-compose exec clawdbot-gateway clawdbot models list
 ## Common Commands
 
 - `docker build -t clawdbot-nearai-worker:latest -f Dockerfile .` - Build the Docker image
-- `docker-compose up -d` - Start the service
-- `docker-compose down` - Stop the service
-- `docker-compose logs -f clawdbot-gateway` - View logs
-- `docker-compose exec clawdbot-gateway clawdbot doctor` - Test configuration
-- `docker-compose exec clawdbot-gateway clawdbot models list` - List available models
-- `docker-compose exec clawdbot-gateway /bin/bash` - Open shell in container
-- `docker-compose down -v` - Remove containers and volumes
+- `docker compose up -d` - Start the service
+- `docker compose down` - Stop the service
+- `docker compose logs -f clawdbot-gateway` - View logs
+- `docker compose exec clawdbot-gateway clawdbot doctor` - Test configuration
+- `docker compose exec clawdbot-gateway clawdbot models list` - List available models
+- `docker compose exec clawdbot-gateway /bin/bash` - Open shell in container
+- `docker compose down -v` - Remove containers and volumes
 
 ## License
 

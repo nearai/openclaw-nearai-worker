@@ -48,18 +48,16 @@
       "appToken": "${SLACK_APP_TOKEN}",
       "mode": "socket",
       "groupPolicy": "open",
-      "dmPolicy": "open",
-      "allowFrom": ["*"],
-      "groupAllowFrom": ["*"],
-      "commands": {
-        "native": true,
-        "text": true
-      },
-      "heartbeat": "on"
+      "dm": {
+        "enabled": true,
+        "policy": "open",
+        "allowFrom": ["*"]
+      }
     }
   },
   "gateway": {
-    "bind": "0.0.0.0",
+    "mode": "local",
+    "bind": "lan",
     "port": 18789,
     "auth": {
       "mode": "token",
@@ -73,6 +71,13 @@
         "responses": {
           "enabled": true
         }
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "slack": {
+        "enabled": true
       }
     }
   }
