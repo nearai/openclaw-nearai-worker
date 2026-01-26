@@ -46,7 +46,13 @@
       "enabled": true,
       "botToken": "${SLACK_BOT_TOKEN}",
       "appToken": "${SLACK_APP_TOKEN}",
-      "mode": "socket"
+      "mode": "socket",
+      "groupPolicy": "open",
+      "dm": {
+        "enabled": true,
+        "policy": "open",
+        "allowFrom": ["*"]
+      }
     }
   },
   "gateway": {
