@@ -46,20 +46,11 @@
       "enabled": true,
       "botToken": "${SLACK_BOT_TOKEN}",
       "appToken": "${SLACK_APP_TOKEN}",
-      "mode": "socket",
-      "groupPolicy": "open",
-      "dmPolicy": "open",
-      "allowFrom": ["*"],
-      "groupAllowFrom": ["*"],
-      "commands": {
-        "native": true,
-        "text": true
-      },
-      "heartbeat": "on"
+      "mode": "socket"
     }
   },
   "gateway": {
-    "bind": "0.0.0.0",
+    "bind": "lan",
     "port": 18789,
     "auth": {
       "mode": "token",
