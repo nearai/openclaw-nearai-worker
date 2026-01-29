@@ -7,16 +7,19 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Install Clawdbot globally from npm
-RUN npm install -g clawdbot@2026.1.24-3
+# Install Moltbot globally from npm
+# MOLTBOT_VERSION can be set as build arg (e.g., --build-arg MOLTBOT_VERSION=1.0.0)
+# If not specified, installs latest version
+ARG MOLTBOT_VERSION=latest
+RUN npm install -g moltbot@${MOLTBOT_VERSION}
 
 # Create directories for config and workspace
-RUN mkdir -p /home/node/.clawdbot /home/node/clawd && \
+RUN mkdir -p /home/node/.moltbot /home/node/clawd && \
     chown -R node:node /home/node
 
 # Copy entrypoint script and template
 COPY entrypoint.sh /app/entrypoint.sh
-COPY clawdbot.json.template /app/clawdbot.json.template
+COPY moltbot.json.template /app/moltbot.json.template
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production
@@ -24,4 +27,4 @@ USER node
 WORKDIR /home/node
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["clawdbot", "gateway", "--bind", "0.0.0.0", "--port", "18789"]
+CMD ["moltbot", "gateway", "--bind", "0.0.0.0", "--port", "18789"]
