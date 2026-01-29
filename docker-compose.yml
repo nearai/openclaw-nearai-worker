@@ -1,6 +1,6 @@
 services:
   moltbot-gateway:
-    image: robortyan/moltbot-nearai-worker:latest
+    image: robortyan/moltbot-nearai-worker:dev
     environment:
       HOME: /home/node
       TERM: xterm-256color
@@ -15,12 +15,16 @@ services:
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
       # Optional: Force config regeneration (set to "1" to regenerate config from template)
       MOLTBOT_FORCE_CONFIG_REGEN: ${MOLTBOT_FORCE_CONFIG_REGEN:-0}
+      # SSH configuration (optional)
+      SSH_PUBLIC_KEY: ${SSH_PUBLIC_KEY:-}
+      SSH_ENABLED: ${SSH_ENABLED:-0}
     volumes:
       - moltbot-config:/home/node/.moltbot
       - moltbot-workspace:/home/node/clawd
     ports:
       - "18789:18789"
       - "18790:18790"
+      - "2222:2222"
     init: true
     restart: unless-stopped
     healthcheck:
