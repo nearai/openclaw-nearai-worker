@@ -78,5 +78,31 @@ fi
 mkdir -p /home/node/clawd
 chown -R node:node /home/node/clawd
 
+# Setup SSH if SSH_PUBLIC_KEY is provided
+if [ -n "${SSH_PUBLIC_KEY:-}" ]; then
+  echo "Setting up SSH access..."
+  mkdir -p /home/node/.ssh
+  echo "${SSH_PUBLIC_KEY}" > /home/node/.ssh/authorized_keys
+  chmod 700 /home/node/.ssh
+  chmod 600 /home/node/.ssh/authorized_keys
+  chown -R node:node /home/node/.ssh
+  echo "SSH public key configured"
+fi
+
+# Start SSH server in background if SSH_ENABLED is set
+# Port 2222 is non-privileged, so node user can bind to it
+if [ "${SSH_ENABLED:-0}" = "1" ]; then
+  echo "Starting SSH server on port 2222..."
+  mkdir -p /tmp
+  /usr/sbin/sshd -f /etc/ssh/sshd_config -D &
+  SSH_PID=$!
+  sleep 1
+  if kill -0 $SSH_PID 2>/dev/null; then
+    echo "SSH server started successfully on port 2222 (PID: $SSH_PID)"
+  else
+    echo "Warning: SSH server failed to start. Check SSH configuration."
+  fi
+fi
+
 # Execute the command (moltbot is installed globally)
 exec "$@"
