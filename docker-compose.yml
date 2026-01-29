@@ -1,6 +1,6 @@
 services:
   clawdbot-gateway:
-    image: robortyan/clawdbot-nearai-worker:latest
+    image: nearaidev/moltbot-nearai-worker:dev
     environment:
       HOME: /home/node
       TERM: xterm-256color
