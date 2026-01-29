@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-      - feat/moltbot-enhancement
+      - feat/moltbot-nearai
     tags:
       - "v*"
 
