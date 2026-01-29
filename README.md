@@ -25,7 +25,6 @@ cp env.example .env
 
 Required variables:
 - `NEARAI_API_KEY`: NEAR AI Cloud API key
-- `CLAWDBOT_GATEWAY_TOKEN`: Gateway authentication token
 
 Optional variables:
 - `CLAWDBOT_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)

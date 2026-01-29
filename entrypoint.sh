@@ -4,7 +4,6 @@ set -eu -o pipefail
 # Security: Prevent accidental exposure of sensitive environment variables
 # Never log, echo, or print the values of these variables:
 # - NEARAI_API_KEY
-# - CLAWDBOT_GATEWAY_TOKEN
 #
 # Only log variable names in error messages, never their values.
 #
@@ -15,11 +14,6 @@ set -eu -o pipefail
 # Validate required environment variables
 if [ -z "${NEARAI_API_KEY:-}" ]; then
   echo "Error: NEARAI_API_KEY environment variable is required" >&2
-  exit 1
-fi
-
-if [ -z "${CLAWDBOT_GATEWAY_TOKEN:-}" ]; then
-  echo "Error: CLAWDBOT_GATEWAY_TOKEN environment variable is required" >&2
   exit 1
 fi
 
@@ -44,7 +38,6 @@ if [ ! -f /home/node/.clawdbot/clawdbot.json ] || [ "${FORCE_REGEN}" = "1" ]; th
   
   # Export variables for envsubst (only the ones we need)
   export NEARAI_API_KEY
-  export CLAWDBOT_GATEWAY_TOKEN
   
   # Use envsubst to substitute environment variables in the template
   # Clawdbot supports ${VAR_NAME} syntax natively, so we can use the template directly
