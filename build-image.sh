@@ -43,7 +43,7 @@ fi
 # Create .GIT_REV file for build tracking
 git rev-parse HEAD > .GIT_REV
 
-TEMP_TAG="clawdbot-nearai-worker-temp:$(date +%s)"
+TEMP_TAG="moltbot-nearai-worker-temp:$(date +%s)"
 docker buildx build --builder buildkit_20 --no-cache --platform linux/amd64 \
     --build-arg SOURCE_DATE_EPOCH="0" \
     --output type=oci,dest=./oci.tar,rewrite-timestamp=true \

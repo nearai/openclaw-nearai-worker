@@ -1,11 +1,11 @@
 services:
-  clawdbot-gateway:
-    image: robortyan/clawdbot-nearai-worker:latest
+  moltbot-gateway:
+    image: robortyan/moltbot-nearai-worker:latest
     environment:
       HOME: /home/node
       TERM: xterm-256color
       # Gateway configuration (required)
-      CLAWDBOT_GATEWAY_TOKEN: ${CLAWDBOT_GATEWAY_TOKEN}
+      MOLTBOT_GATEWAY_TOKEN: ${MOLTBOT_GATEWAY_TOKEN}
       # NEAR AI Cloud API Key
       NEARAI_API_KEY: ${NEARAI_API_KEY}
       # Slack configuration
@@ -14,10 +14,10 @@ services:
       # Optional: Slack signing secret for HTTP mode
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
       # Optional: Force config regeneration (set to "1" to regenerate config from template)
-      CLAWDBOT_FORCE_CONFIG_REGEN: ${CLAWDBOT_FORCE_CONFIG_REGEN:-0}
+      MOLTBOT_FORCE_CONFIG_REGEN: ${MOLTBOT_FORCE_CONFIG_REGEN:-0}
     volumes:
-      - clawdbot-config:/home/node/.clawdbot
-      - clawdbot-workspace:/home/node/clawd
+      - moltbot-config:/home/node/.moltbot
+      - moltbot-workspace:/home/node/clawd
     ports:
       - "18789:18789"
       - "18790:18790"
@@ -31,7 +31,7 @@ services:
       start_period: 40s
     command:
       [
-        "clawdbot",
+        "moltbot",
         "gateway",
         "--bind",
         "lan",
@@ -41,5 +41,5 @@ services:
       ]
 
 volumes:
-  clawdbot-config:
-  clawdbot-workspace:
+  moltbot-config:
+  moltbot-workspace:

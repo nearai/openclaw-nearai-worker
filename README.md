@@ -1,6 +1,6 @@
-# Clawdbot NEAR AI Worker
+# Moltbot NEAR AI Worker
 
-AI Worker built with Clawdbot and NEAR AI Cloud API, configured for Slack integration.
+AI Worker built with Moltbot and NEAR AI Cloud API, configured for Slack integration.
 
 ## Features
 
@@ -29,11 +29,12 @@ Required variables:
 - `NEARAI_API_KEY`: NEAR AI Cloud API key
 - `SLACK_BOT_TOKEN`: Slack bot token (xoxb-...)
 - `SLACK_APP_TOKEN`: Slack app token (xapp-...)
-- `CLAWDBOT_GATEWAY_TOKEN`: Gateway authentication token
+- `MOLTBOT_GATEWAY_TOKEN`: Gateway authentication token
 
 Optional variables:
 - `SLACK_SIGNING_SECRET`: Slack signing secret (for HTTP mode)
-- `CLAWDBOT_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
+- `MOLTBOT_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
+- `MOLTBOT_VERSION`: Moltbot version to install (default: `latest`). Can be set as build arg when building the Docker image.
 
 ### Running
 
@@ -48,22 +49,22 @@ docker compose up
 ### View Logs
 
 ```bash
-docker compose logs -f clawdbot-gateway
+docker compose logs -f moltbot-gateway
 ```
 
 ### Testing
 
 ```bash
 # Check configuration
-docker compose exec clawdbot-gateway clawdbot doctor
+docker compose exec moltbot-gateway moltbot doctor
 
 # List available models
-docker compose exec clawdbot-gateway clawdbot models list
+docker compose exec moltbot-gateway moltbot models list
 ```
 
 ## Configuration
 
-The configuration is automatically generated from environment variables on first run. The entrypoint script creates `/home/node/.clawdbot/clawdbot.json` with:
+The configuration is automatically generated from environment variables on first run. The entrypoint script creates `/home/node/.moltbot/moltbot.json` with:
 
 - **NEAR AI Cloud** as the model provider
 - **GLM-4.7** (`zai-org/GLM-4.7`) as the default model
@@ -75,29 +76,29 @@ The configuration is automatically generated from environment variables on first
 
 To update the configuration after changing environment variables, you have three options:
 
-1. **Force regeneration** (recommended): Set `CLAWDBOT_FORCE_CONFIG_REGEN=1` and restart the container:
+1. **Force regeneration** (recommended): Set `MOLTBOT_FORCE_CONFIG_REGEN=1` and restart the container:
    ```bash
    # In docker compose.yml, add to environment:
-   CLAWDBOT_FORCE_CONFIG_REGEN: "1"
+   MOLTBOT_FORCE_CONFIG_REGEN: "1"
    
    # Or when running:
-   docker compose run -e CLAWDBOT_FORCE_CONFIG_REGEN=1 clawdbot-gateway
+   docker compose run -e MOLTBOT_FORCE_CONFIG_REGEN=1 moltbot-gateway
    ```
 
 2. **Delete and regenerate**: Remove the config file and restart:
    ```bash
-   docker compose exec clawdbot-gateway rm /home/node/.clawdbot/clawdbot.json
-   docker compose restart clawdbot-gateway
+   docker compose exec moltbot-gateway rm /home/node/.moltbot/moltbot.json
+   docker compose restart moltbot-gateway
    ```
 
 3. **Manual edit**: Edit the config file directly:
    ```bash
-   docker compose exec clawdbot-gateway vi /home/node/.clawdbot/clawdbot.json
+   docker compose exec moltbot-gateway vi /home/node/.moltbot/moltbot.json
    ```
 
 ### Customizing Configuration
 
-After the first run, you can edit `/home/node/.clawdbot/clawdbot.json` directly, or modify the `entrypoint.sh` script to change the default configuration.
+After the first run, you can edit `/home/node/.moltbot/moltbot.json` directly, or modify the `entrypoint.sh` script to change the default configuration.
 
 ## Deployment on TEE Infrastructure
 
@@ -133,7 +134,7 @@ docker compose ps
 ### View Logs
 
 ```bash
-docker compose logs -f clawdbot-gateway
+docker compose logs -f moltbot-gateway
 ```
 
 ⚠️ **Security Note**: Container logs may contain sensitive information. Ensure logs are properly secured and not exposed publicly.
@@ -141,13 +142,13 @@ docker compose logs -f clawdbot-gateway
 ### Verify Configuration
 
 ```bash
-docker compose exec clawdbot-gateway clawdbot doctor
+docker compose exec moltbot-gateway moltbot doctor
 ```
 
 ### List Models
 
 ```bash
-docker compose exec clawdbot-gateway clawdbot models list
+docker compose exec moltbot-gateway moltbot models list
 ```
 
 ### Security Best Practices
@@ -159,13 +160,14 @@ docker compose exec clawdbot-gateway clawdbot models list
 
 ## Common Commands
 
-- `docker build -t clawdbot-nearai-worker:latest -f Dockerfile .` - Build the Docker image
+- `docker build -t moltbot-nearai-worker:latest -f Dockerfile .` - Build the Docker image
+- `docker build --build-arg MOLTBOT_VERSION=1.0.0 -t moltbot-nearai-worker:latest -f Dockerfile .` - Build with specific Moltbot version
 - `docker compose up -d` - Start the service
 - `docker compose down` - Stop the service
-- `docker compose logs -f clawdbot-gateway` - View logs
-- `docker compose exec clawdbot-gateway clawdbot doctor` - Test configuration
-- `docker compose exec clawdbot-gateway clawdbot models list` - List available models
-- `docker compose exec clawdbot-gateway /bin/bash` - Open shell in container
+- `docker compose logs -f moltbot-gateway` - View logs
+- `docker compose exec moltbot-gateway moltbot doctor` - Test configuration
+- `docker compose exec moltbot-gateway moltbot models list` - List available models
+- `docker compose exec moltbot-gateway /bin/bash` - Open shell in container
 - `docker compose down -v` - Remove containers and volumes
 
 ## License
