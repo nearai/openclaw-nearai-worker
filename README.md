@@ -1,11 +1,10 @@
 # Clawdbot NEAR AI Worker
 
-AI Worker built with Clawdbot and NEAR AI Cloud API, configured for Slack integration.
+AI Worker built with Clawdbot and NEAR AI Cloud API.
 
 ## Features
 
 - **NEAR AI Cloud Integration**: Uses NEAR AI Cloud as the model provider
-- **Slack Bot**: Pre-configured Slack bot for team collaboration
 - **Docker Ready**: Easy deployment with Docker and Docker Compose
 
 ## Quick Start
@@ -14,7 +13,6 @@ AI Worker built with Clawdbot and NEAR AI Cloud API, configured for Slack integr
 
 - Docker and Docker Compose
 - NEAR AI Cloud API key
-- Slack Bot Token and App Token
 
 ### Environment Variables
 
@@ -27,12 +25,9 @@ cp env.example .env
 
 Required variables:
 - `NEARAI_API_KEY`: NEAR AI Cloud API key
-- `SLACK_BOT_TOKEN`: Slack bot token (xoxb-...)
-- `SLACK_APP_TOKEN`: Slack app token (xapp-...)
 - `CLAWDBOT_GATEWAY_TOKEN`: Gateway authentication token
 
 Optional variables:
-- `SLACK_SIGNING_SECRET`: Slack signing secret (for HTTP mode)
 - `CLAWDBOT_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
 
 ### Running
@@ -67,7 +62,6 @@ The configuration is automatically generated from environment variables on first
 
 - **NEAR AI Cloud** as the model provider
 - **GLM-4.7** (`zai-org/GLM-4.7`) as the default model
-- **Slack** configured with `dmPolicy: "open"` and `groupPolicy: "open"` with `allowFrom: ["*"]` and `groupAllowFrom: ["*"]` (open access for all channels and users)
 
 ### Updating Configuration
 
@@ -108,14 +102,6 @@ Key considerations for TEE deployment:
 - Use secure secret management systems for API keys and tokens
 - Configure appropriate network policies and access controls
 - Monitor container health using the built-in healthcheck
-
-## Slack Setup
-
-1. Create a Slack App at https://api.slack.com/apps
-2. Enable **Socket Mode** (recommended) or HTTP mode
-3. Get **Bot Token** (`xoxb-...`) and **App Token** (`xapp-...`)
-4. Install the app to your workspace
-5. Invite the bot to channels: `/invite @YourBotName`
 
 ## Ports
 

@@ -24,4 +24,4 @@ USER node
 WORKDIR /home/node
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["clawdbot", "gateway", "--bind", "0.0.0.0", "--port", "18789"]
+CMD ["clawdbot", "gateway", "--bind", "loopback", "--port", "18789"]
