@@ -29,7 +29,7 @@ services:
         "clawdbot",
         "gateway",
         "--bind",
-        "lan",
+        "loopback",
         "--port",
         "18789",
         "--verbose"
