@@ -1,6 +1,6 @@
 services:
   moltbot-gateway:
-    image: nearai/moltbot-nearai-worker:dev
+    image: nearaidev/moltbot-nearai-worker:dev
     environment:
       HOME: /home/node
       TERM: xterm-256color
