@@ -1,16 +1,16 @@
 services:
-  clawdbot-gateway:
-    image: nearaidev/moltbot-nearai-worker:dev
+  openclaw-gateway:
+    image: nearaidev/openclaw-nearai-worker:dev
     environment:
       HOME: /home/node
       TERM: xterm-256color
       # NEAR AI Cloud API Key
       NEARAI_API_KEY: ${NEARAI_API_KEY}
       # Optional: Force config regeneration (set to "1" to regenerate config from template)
-      CLAWDBOT_FORCE_CONFIG_REGEN: ${CLAWDBOT_FORCE_CONFIG_REGEN:-0}
+      OPENCLAW_FORCE_CONFIG_REGEN: ${OPENCLAW_FORCE_CONFIG_REGEN:-0}
     volumes:
-      - clawdbot-config:/home/node/.clawdbot
-      - clawdbot-workspace:/home/node/clawd
+      - openclaw-config:/home/node/.openclaw
+      - openclaw-workspace:/home/node/openclaw
     ports:
       - "18789:18789"
       - "18790:18790"
@@ -24,7 +24,7 @@ services:
       start_period: 40s
     command:
       [
-        "clawdbot",
+        "openclaw",
         "gateway",
         "--bind",
         "loopback",
@@ -34,5 +34,5 @@ services:
       ]
 
 volumes:
-  clawdbot-config:
-  clawdbot-workspace:
+  openclaw-config:
+  openclaw-workspace:

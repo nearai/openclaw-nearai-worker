@@ -18,21 +18,21 @@ if [ -z "${NEARAI_API_KEY:-}" ]; then
 fi
 
 # Create config directory if it doesn't exist
-mkdir -p /home/node/.clawdbot
+mkdir -p /home/node/.openclaw
 
 # Generate config from template if it doesn't exist or if forced
-# Set CLAWDBOT_FORCE_CONFIG_REGEN=1 to force regeneration even if config exists
-FORCE_REGEN="${CLAWDBOT_FORCE_CONFIG_REGEN:-0}"
-if [ ! -f /home/node/.clawdbot/clawdbot.json ] || [ "${FORCE_REGEN}" = "1" ]; then
+# Set OPENCLAW_FORCE_CONFIG_REGEN=1 to force regeneration even if config exists
+FORCE_REGEN="${OPENCLAW_FORCE_CONFIG_REGEN:-0}"
+if [ ! -f /home/node/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; then
   if [ "${FORCE_REGEN}" = "1" ]; then
-    echo "Force regenerating config from template (CLAWDBOT_FORCE_CONFIG_REGEN=1)..."
+    echo "Force regenerating config from template (OPENCLAW_FORCE_CONFIG_REGEN=1)..."
   else
     echo "Generating config from template..."
   fi
   
   # Template file must exist
-  if [ ! -f /app/clawdbot.json.template ]; then
-    echo "Error: Template file /app/clawdbot.json.template not found" >&2
+  if [ ! -f /app/openclaw.json.template ]; then
+    echo "Error: Template file /app/openclaw.json.template not found" >&2
     exit 1
   fi
   
@@ -40,21 +40,21 @@ if [ ! -f /home/node/.clawdbot/clawdbot.json ] || [ "${FORCE_REGEN}" = "1" ]; th
   export NEARAI_API_KEY
   
   # Use envsubst to substitute environment variables in the template
-  # Clawdbot supports ${VAR_NAME} syntax natively, so we can use the template directly
+  # OpenClaw supports ${VAR_NAME} syntax natively, so we can use the template directly
   if command -v envsubst >/dev/null 2>&1; then
-    envsubst < /app/clawdbot.json.template > /home/node/.clawdbot/clawdbot.json
+    envsubst < /app/openclaw.json.template > /home/node/.openclaw/openclaw.json
   else
     echo "Error: envsubst command not found (gettext-base package required)" >&2
     exit 1
   fi
 
-  chown node:node /home/node/.clawdbot/clawdbot.json
-  echo "Config file created at /home/node/.clawdbot/clawdbot.json"
+  chown node:node /home/node/.openclaw/openclaw.json
+  echo "Config file created at /home/node/.openclaw/openclaw.json"
 fi
 
 # Create workspace directory if it doesn't exist
-mkdir -p /home/node/clawd
-chown -R node:node /home/node/clawd
+mkdir -p /home/node/openclaw
+chown -R node:node /home/node/openclaw
 
-# Execute the command (clawdbot is installed globally)
+# Execute the command (openclaw is installed globally)
 exec "$@"

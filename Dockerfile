@@ -19,16 +19,16 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Install Clawdbot globally from npm
-RUN npm install -g clawdbot@2026.1.24-3
+# Install OpenClaw globally from npm
+RUN npm install -g openclaw@latest
 
 # Create directories for config and workspace
-RUN mkdir -p /home/node/.clawdbot /home/node/clawd && \
+RUN mkdir -p /home/node/.openclaw /home/node/openclaw && \
     chown -R node:node /home/node
 
 # Copy entrypoint script and template
 COPY entrypoint.sh /app/entrypoint.sh
-COPY clawdbot.json.template /app/clawdbot.json.template
+COPY openclaw.json.template /app/openclaw.json.template
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production
@@ -36,4 +36,4 @@ USER node
 WORKDIR /home/node
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["clawdbot", "gateway", "--bind", "loopback", "--port", "18789"]
+CMD ["openclaw", "gateway", "--bind", "loopback", "--port", "18789"]

@@ -1,6 +1,6 @@
-# Clawdbot NEAR AI Worker
+# OpenClaw NEAR AI Worker
 
-AI Worker built with Clawdbot and NEAR AI Cloud API.
+AI Worker built with OpenClaw and NEAR AI Cloud API.
 
 ## Features
 
@@ -27,7 +27,7 @@ Required variables:
 - `NEARAI_API_KEY`: NEAR AI Cloud API key
 
 Optional variables:
-- `CLAWDBOT_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
+- `OPENCLAW_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
 
 ### Running
 
@@ -42,22 +42,22 @@ docker compose up
 ### View Logs
 
 ```bash
-docker compose logs -f clawdbot-gateway
+docker compose logs -f openclaw-gateway
 ```
 
 ### Testing
 
 ```bash
 # Check configuration
-docker compose exec clawdbot-gateway clawdbot doctor
+docker compose exec openclaw-gateway openclaw doctor
 
 # List available models
-docker compose exec clawdbot-gateway clawdbot models list
+docker compose exec openclaw-gateway openclaw models list
 ```
 
 ## Configuration
 
-The configuration is automatically generated from environment variables on first run. The entrypoint script creates `/home/node/.clawdbot/clawdbot.json` with:
+The configuration is automatically generated from environment variables on first run. The entrypoint script creates `/home/node/.openclaw/openclaw.json` with:
 
 - **NEAR AI Cloud** as the model provider
 - **GLM-4.7** (`zai-org/GLM-4.7`) as the default model
@@ -68,29 +68,29 @@ The configuration is automatically generated from environment variables on first
 
 To update the configuration after changing environment variables, you have three options:
 
-1. **Force regeneration** (recommended): Set `CLAWDBOT_FORCE_CONFIG_REGEN=1` and restart the container:
+1. **Force regeneration** (recommended): Set `OPENCLAW_FORCE_CONFIG_REGEN=1` and restart the container:
    ```bash
    # In docker compose.yml, add to environment:
-   CLAWDBOT_FORCE_CONFIG_REGEN: "1"
+   OPENCLAW_FORCE_CONFIG_REGEN: "1"
    
    # Or when running:
-   docker compose run -e CLAWDBOT_FORCE_CONFIG_REGEN=1 clawdbot-gateway
+   docker compose run -e OPENCLAW_FORCE_CONFIG_REGEN=1 openclaw-gateway
    ```
 
 2. **Delete and regenerate**: Remove the config file and restart:
    ```bash
-   docker compose exec clawdbot-gateway rm /home/node/.clawdbot/clawdbot.json
-   docker compose restart clawdbot-gateway
+   docker compose exec openclaw-gateway rm /home/node/.openclaw/openclaw.json
+   docker compose restart openclaw-gateway
    ```
 
 3. **Manual edit**: Edit the config file directly:
    ```bash
-   docker compose exec clawdbot-gateway vi /home/node/.clawdbot/clawdbot.json
+   docker compose exec openclaw-gateway vi /home/node/.openclaw/openclaw.json
    ```
 
 ### Customizing Configuration
 
-After the first run, you can edit `/home/node/.clawdbot/clawdbot.json` directly, or modify the `entrypoint.sh` script to change the default configuration.
+After the first run, you can edit `/home/node/.openclaw/openclaw.json` directly, or modify the `entrypoint.sh` script to change the default configuration.
 
 ## Deployment on TEE Infrastructure
 
@@ -118,7 +118,7 @@ docker compose ps
 ### View Logs
 
 ```bash
-docker compose logs -f clawdbot-gateway
+docker compose logs -f openclaw-gateway
 ```
 
 ⚠️ **Security Note**: Container logs may contain sensitive information. Ensure logs are properly secured and not exposed publicly.
@@ -126,13 +126,13 @@ docker compose logs -f clawdbot-gateway
 ### Verify Configuration
 
 ```bash
-docker compose exec clawdbot-gateway clawdbot doctor
+docker compose exec openclaw-gateway openclaw doctor
 ```
 
 ### List Models
 
 ```bash
-docker compose exec clawdbot-gateway clawdbot models list
+docker compose exec openclaw-gateway openclaw models list
 ```
 
 ### Security Best Practices
@@ -144,13 +144,13 @@ docker compose exec clawdbot-gateway clawdbot models list
 
 ## Common Commands (docker compose)
 
-- `docker build -t clawdbot-nearai-worker:latest -f Dockerfile .` - Build the Docker image
+- `docker build -t openclaw-nearai-worker:latest -f Dockerfile .` - Build the Docker image
 - `docker compose up -d` - Start the service
 - `docker compose down` - Stop the service
-- `docker compose logs -f clawdbot-gateway` - View logs
-- `docker compose exec clawdbot-gateway clawdbot doctor` - Test configuration
-- `docker compose exec clawdbot-gateway clawdbot models list` - List available models
-- `docker compose exec clawdbot-gateway /bin/bash` - Open shell in container
+- `docker compose logs -f openclaw-gateway` - View logs
+- `docker compose exec openclaw-gateway openclaw doctor` - Test configuration
+- `docker compose exec openclaw-gateway openclaw models list` - List available models
+- `docker compose exec openclaw-gateway /bin/bash` - Open shell in container
 - `docker compose down -v` - Remove containers and volumes
 
 ## Commands (CVM)
@@ -159,19 +159,19 @@ docker compose exec clawdbot-gateway clawdbot models list
 - ssh -o ProxyCommand="openssl s_client -quiet -connect %h:443 -servername %h" root@<instance-id>-22.infra.near.ai
 
 # list models
-- docker exec clawdbot-gateway clawdbot models list
+- docker exec openclaw-gateway openclaw models list
 
 # list logs
-- docker exec clawdbot-gateway clawdbot logs
+- docker exec openclaw-gateway openclaw logs
 
 # list config
-- docker exec clawdbot-gateway clawdbot config
+- docker exec openclaw-gateway openclaw config
 
 # list sysinfo
-- docker exec clawdbot-gateway clawdbot sysinfo
+- docker exec openclaw-gateway openclaw sysinfo
 
 # bash
-- docker exec -it clawdbot-gateway /bin/bash
+- docker exec -it openclaw-gateway /bin/bash
 
 
 ## License
