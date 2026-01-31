@@ -142,7 +142,7 @@ docker compose exec clawdbot-gateway clawdbot models list
 - **Environment variables**: Use `.env` files with proper permissions (chmod 600) or secret management systems
 - **Container inspection**: Be cautious when using `docker inspect` or `docker exec` as these may expose environment variables
 
-## Common Commands
+## Common Commands (docker compose)
 
 - `docker build -t clawdbot-nearai-worker:latest -f Dockerfile .` - Build the Docker image
 - `docker compose up -d` - Start the service
@@ -152,6 +152,27 @@ docker compose exec clawdbot-gateway clawdbot models list
 - `docker compose exec clawdbot-gateway clawdbot models list` - List available models
 - `docker compose exec clawdbot-gateway /bin/bash` - Open shell in container
 - `docker compose down -v` - Remove containers and volumes
+
+## Commands (CVM)
+
+# ssh login
+- ssh -o ProxyCommand="openssl s_client -quiet -connect %h:443 -servername %h" root@<instance-id>-22.infra.near.ai
+
+# list models
+- docker exec clawdbot-gateway clawdbot models list
+
+# list logs
+- docker exec clawdbot-gateway clawdbot logs
+
+# list config
+- docker exec clawdbot-gateway clawdbot config
+
+# list sysinfo
+- docker exec clawdbot-gateway clawdbot sysinfo
+
+# bash
+- docker exec -it clawdbot-gateway /bin/bash
+
 
 ## License
 
