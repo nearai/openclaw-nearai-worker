@@ -155,23 +155,12 @@ docker compose exec openclaw-gateway openclaw models list
 
 ## Commands (CVM)
 
-# ssh login
-- ssh -o ProxyCommand="openssl s_client -quiet -connect %h:443 -servername %h" root@<instance-id>-22.infra.near.ai
-
-# list models
-- docker exec openclaw-gateway openclaw models list
-
-# list logs
-- docker exec openclaw-gateway openclaw logs
-
-# list config
-- docker exec openclaw-gateway openclaw config
-
-# list sysinfo
-- docker exec openclaw-gateway openclaw sysinfo
-
-# bash
-- docker exec -it openclaw-gateway /bin/bash
+- `ssh -o ProxyCommand="openssl s_client -quiet -connect %h:443 -servername %h" root@<instance-id>-22.infra.near.ai` - SSH login to CVM instance
+- `docker exec openclaw-gateway openclaw models list` - List available models
+- `docker exec openclaw-gateway openclaw logs` - View logs
+- `docker exec openclaw-gateway openclaw config` - Show config
+- `docker exec openclaw-gateway openclaw sysinfo` - Show system info
+- `docker exec -it openclaw-gateway /bin/bash` - Open shell in container
 
 
 ## License
