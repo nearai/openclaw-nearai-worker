@@ -4,10 +4,6 @@ set -eu -o pipefail
 # Security: Prevent accidental exposure of sensitive environment variables
 # Never log, echo, or print the values of these variables:
 # - NEARAI_API_KEY
-# - SLACK_BOT_TOKEN
-# - SLACK_APP_TOKEN
-# - CLAWDBOT_GATEWAY_TOKEN
-# - SLACK_SIGNING_SECRET
 #
 # Only log variable names in error messages, never their values.
 #
@@ -18,21 +14,6 @@ set -eu -o pipefail
 # Validate required environment variables
 if [ -z "${NEARAI_API_KEY:-}" ]; then
   echo "Error: NEARAI_API_KEY environment variable is required" >&2
-  exit 1
-fi
-
-if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
-  echo "Error: SLACK_BOT_TOKEN environment variable is required" >&2
-  exit 1
-fi
-
-if [ -z "${SLACK_APP_TOKEN:-}" ]; then
-  echo "Error: SLACK_APP_TOKEN environment variable is required" >&2
-  exit 1
-fi
-
-if [ -z "${CLAWDBOT_GATEWAY_TOKEN:-}" ]; then
-  echo "Error: CLAWDBOT_GATEWAY_TOKEN environment variable is required" >&2
   exit 1
 fi
 
@@ -57,9 +38,6 @@ if [ ! -f /home/node/.clawdbot/clawdbot.json ] || [ "${FORCE_REGEN}" = "1" ]; th
   
   # Export variables for envsubst (only the ones we need)
   export NEARAI_API_KEY
-  export SLACK_BOT_TOKEN
-  export SLACK_APP_TOKEN
-  export CLAWDBOT_GATEWAY_TOKEN
   
   # Use envsubst to substitute environment variables in the template
   # Clawdbot supports ${VAR_NAME} syntax natively, so we can use the template directly
@@ -69,7 +47,7 @@ if [ ! -f /home/node/.clawdbot/clawdbot.json ] || [ "${FORCE_REGEN}" = "1" ]; th
     echo "Error: envsubst command not found (gettext-base package required)" >&2
     exit 1
   fi
-  
+
   chown node:node /home/node/.clawdbot/clawdbot.json
   echo "Config file created at /home/node/.clawdbot/clawdbot.json"
 fi

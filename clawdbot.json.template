@@ -41,28 +41,10 @@
       }
     }
   },
-  "channels": {
-    "slack": {
-      "enabled": true,
-      "botToken": "${SLACK_BOT_TOKEN}",
-      "appToken": "${SLACK_APP_TOKEN}",
-      "mode": "socket",
-      "groupPolicy": "open",
-      "dm": {
-        "enabled": true,
-        "policy": "open",
-        "allowFrom": ["*"]
-      }
-    }
-  },
   "gateway": {
     "mode": "local",
-    "bind": "lan",
+    "bind": "loopback",
     "port": 18789,
-    "auth": {
-      "mode": "token",
-      "token": "${CLAWDBOT_GATEWAY_TOKEN}"
-    },
     "http": {
       "endpoints": {
         "chatCompletions": {
@@ -71,13 +53,6 @@
         "responses": {
           "enabled": true
         }
-      }
-    }
-  },
-  "plugins": {
-    "entries": {
-      "slack": {
-        "enabled": true
       }
     }
   }
