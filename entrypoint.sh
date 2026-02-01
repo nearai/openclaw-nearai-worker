@@ -4,6 +4,7 @@ set -eu -o pipefail
 # Security: Prevent accidental exposure of sensitive environment variables
 # Never log, echo, or print the values of these variables:
 # - NEARAI_API_KEY
+# - OPENCLAW_GATEWAY_TOKEN
 #
 # Only log variable names in error messages, never their values.
 #
@@ -15,6 +16,12 @@ set -eu -o pipefail
 if [ -z "${NEARAI_API_KEY:-}" ]; then
   echo "Error: NEARAI_API_KEY environment variable is required" >&2
   exit 1
+fi
+
+# Auto-generate gateway auth token if not configured (export so envsubst sees it)
+if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
+  OPENCLAW_GATEWAY_TOKEN=$(openssl rand -hex 32)
+  export OPENCLAW_GATEWAY_TOKEN
 fi
 
 # Create config directory if it doesn't exist
@@ -35,10 +42,11 @@ if [ ! -f /home/node/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; th
     echo "Error: Template file /app/openclaw.json.template not found" >&2
     exit 1
   fi
-  
+
   # Export variables for envsubst (only the ones we need)
   export NEARAI_API_KEY
-  
+  export OPENCLAW_GATEWAY_TOKEN
+
   # Use envsubst to substitute environment variables in the template
   # OpenClaw supports ${VAR_NAME} syntax natively, so we can use the template directly
   if command -v envsubst >/dev/null 2>&1; then

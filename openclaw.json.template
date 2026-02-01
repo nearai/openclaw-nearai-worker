@@ -43,6 +43,10 @@
   },
   "gateway": {
     "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "${OPENCLAW_GATEWAY_TOKEN}"
+    },
     "bind": "loopback",
     "port": 18789,
     "http": {
