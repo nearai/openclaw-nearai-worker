@@ -36,4 +36,4 @@ USER node
 WORKDIR /home/node
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["openclaw", "gateway", "--bind", "loopback", "--port", "18789"]
+CMD ["openclaw", "gateway", "run", "--bind", "loopback", "--port", "18789"]

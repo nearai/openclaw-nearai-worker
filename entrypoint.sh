@@ -57,11 +57,13 @@ if [ ! -f /home/node/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; th
   fi
 
   chown node:node /home/node/.openclaw/openclaw.json
+  chmod 600 /home/node/.openclaw/openclaw.json
   echo "Config file created at /home/node/.openclaw/openclaw.json"
 fi
 
 # Create workspace directory if it doesn't exist
 mkdir -p /home/node/openclaw
+chmod 700 /home/node/openclaw
 chown -R node:node /home/node/openclaw
 
 # Execute the command (openclaw is installed globally)
