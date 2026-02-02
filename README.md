@@ -28,6 +28,7 @@ Required variables:
 
 Optional variables:
 - `OPENCLAW_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
+- `OPENCLAW_GATEWAY_BIND`: Gateway bind address — `lan` (default) or `loopback`. See [Gateway binding and security](#gateway-binding-and-security).
 
 ### Running
 
@@ -60,7 +61,24 @@ docker compose exec openclaw-gateway openclaw models list
 The configuration is automatically generated from environment variables on first run. The entrypoint script creates `/home/agent/.openclaw/openclaw.json` with:
 
 - **NEAR AI Cloud** as the model provider
-- **GLM-4.7** (`zai-org/GLM-4.7`) as the default model
+- **GLM-4.7** (`zai-org/GLM-4.7`) as the default primary model
+- Three models available for agents: GLM-4.7, DeepSeek V3.1, and Qwen3 30B A3B Instruct
+
+### Available Models
+
+The worker is preconfigured with the following models from NEAR AI Cloud. You can use any of them when sending requests to the gateway or when configuring agents.
+
+| Model | ID | Context | Reasoning | Description |
+|-------|-----|---------|-----------|-------------|
+| **GLM-4.7** (default) | `nearai/zai-org/GLM-4.7` | 200K tokens | No | Z.ai GLM 4.7 — strong agentic coding, tool use, and reasoning. Default primary model. |
+| **DeepSeek V3.1** | `nearai/deepseek-ai/DeepSeek-V3.1` | 128K tokens | Yes | Hybrid model with thinking and non-thinking modes. Good for complex reasoning and tool use. |
+| **Qwen3 30B A3B Instruct** | `nearai/Qwen/Qwen3-30B-A3B-Instruct-2507` | 262K tokens | No | MoE model with long context. Efficient for instruction following and multilingual tasks. |
+
+**Using a specific model**
+
+- **Primary model**: The default primary model is GLM-4.7. To change it, edit `openclaw.json` (or the template) and set `agents.defaults.model.primary` to one of the IDs above (e.g. `nearai/deepseek-ai/DeepSeek-V3.1`).
+- **Per-request**: When calling the gateway API (chat completions or responses), specify the `model` parameter in your request body with the desired model ID.
+- **List at runtime**: Run `openclaw models list` inside the container to see all configured models and their IDs.
 
 ### Updating Configuration
 
@@ -90,7 +108,11 @@ To update the configuration after changing environment variables, you have three
 
 ### Customizing Configuration
 
-After the first run, you can edit `/home/agent/.openclaw/openclaw.json` directly, or modify the `entrypoint.sh` script to change the default configuration.
+After the first run, you can edit `/home/agent/.openclaw/openclaw.json` directly to:
+- Change the **primary model** (`agents.defaults.model.primary`) to any of the available model IDs (see [Available Models](#available-models))
+- Add or remove models in `agents.defaults.models`
+- Adjust concurrency, workspace paths, or gateway settings
+
 
 ## Deployment on TEE Infrastructure
 
@@ -106,6 +128,13 @@ Key considerations for TEE deployment:
 
 - **18789**: Gateway WebSocket and HTTP API
 - **18790**: Browser bridge (if enabled)
+
+## Gateway binding and security
+
+The gateway bind setting controls which network interfaces the gateway listens on:
+
+- **`lan`** (default): Listens on all interfaces (0.0.0.0). The gateway is reachable from any device on the local network (and from the internet if the host is exposed).
+- **`loopback`**: Listens only on localhost (127.0.0.1). Access is limited to the same host. Use this when only local processes or port-forwarding need the gateway.
 
 ## Troubleshooting
 
@@ -141,6 +170,7 @@ docker compose exec openclaw-gateway openclaw models list
 - **Secure log storage**: Ensure Docker logs are stored securely and access is restricted
 - **Environment variables**: Use `.env` files with proper permissions (chmod 600) or secret management systems
 - **Container inspection**: Be cautious when using `docker inspect` or `docker exec` as these may expose environment variables
+- **Gateway binding**: The default is `lan`; follow the guidance in [Gateway binding and security](#gateway-binding-and-security). Set `OPENCLAW_GATEWAY_BIND=loopback` to restrict to localhost only.
 
 ## Common Commands (docker compose)
 

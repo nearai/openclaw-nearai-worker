@@ -48,6 +48,7 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
   # Export variables for envsubst (only the ones we need)
   export NEARAI_API_KEY
   export OPENCLAW_GATEWAY_TOKEN
+  export OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
 
   # Use envsubst to substitute environment variables in the template
   # OpenClaw supports ${VAR_NAME} syntax natively, so we can use the template directly

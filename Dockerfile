@@ -1,14 +1,11 @@
-FROM ubuntu:24.04
+FROM node:24-bookworm@sha256:b2b2184ba9b78c022e1d6a7924ec6fba577adf28f15c9d9c457730cc4ad3807a
 
-# Install Node.js 22 and system dependencies and useful tools for OpenClaw agent execution
+# Install system dependencies and tools for OpenClaw agent execution (Node.js already in base image)
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      openssl \
       curl \
       ca-certificates \
-      gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends \
-      nodejs \
       gettext-base \
       git \
       wget \
@@ -39,11 +36,11 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Create non-root user for OpenClaw agents
-# Use UID 1001 to avoid conflict with Ubuntu's default UID 1000
+# Use UID 1001 to avoid conflict with default UID 1000
 RUN useradd -m -u 1001 agent
 
 # Install OpenClaw globally from npm
-RUN npm install -g openclaw@latest
+RUN npm install -g openclaw@2026.2.1
 
 # Create directories for config and workspace
 RUN mkdir -p /home/agent/.openclaw /home/agent/openclaw && \
