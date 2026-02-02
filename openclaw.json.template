@@ -34,7 +34,7 @@
       "models": {
         "nearai/zai-org/GLM-4.7": {}
       },
-      "workspace": "/home/node/openclaw",
+      "workspace": "/home/agent/openclaw",
       "maxConcurrent": 4,
       "subagents": {
         "maxConcurrent": 8

@@ -2,15 +2,15 @@ services:
   openclaw-gateway:
     image: nearaidev/openclaw-nearai-worker:dev
     environment:
-      HOME: /home/node
+      HOME: /home/agent
       TERM: xterm-256color
       # NEAR AI Cloud API Key
       NEARAI_API_KEY: ${NEARAI_API_KEY}
       # Optional: Force config regeneration (set to "1" to regenerate config from template)
       OPENCLAW_FORCE_CONFIG_REGEN: ${OPENCLAW_FORCE_CONFIG_REGEN:-0}
     volumes:
-      - openclaw-config:/home/node/.openclaw
-      - openclaw-workspace:/home/node/openclaw
+      - openclaw-config:/home/agent/.openclaw
+      - openclaw-workspace:/home/agent/openclaw
     ports:
       - "18789:18789"
       - "18790:18790"

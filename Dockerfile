@@ -38,15 +38,16 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Create node user with home directory (matching node image convention)
-RUN groupadd -r node && useradd -r -g node -m -d /home/node node
+# Create non-root user for OpenClaw agents
+# Use UID 1001 to avoid conflict with Ubuntu's default UID 1000
+RUN useradd -m -u 1001 agent
 
 # Install OpenClaw globally from npm
 RUN npm install -g openclaw@latest
 
 # Create directories for config and workspace
-RUN mkdir -p /home/node/.openclaw /home/node/openclaw && \
-    chown -R node:node /home/node
+RUN mkdir -p /home/agent/.openclaw /home/agent/openclaw && \
+    chown -R agent:agent /home/agent
 
 # Copy entrypoint script and template
 COPY entrypoint.sh /app/entrypoint.sh
@@ -54,8 +55,8 @@ COPY openclaw.json.template /app/openclaw.json.template
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production
-USER node
-WORKDIR /home/node
+USER agent
+WORKDIR /home/agent
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["openclaw", "gateway", "run", "--bind", "loopback", "--port", "18789"]
