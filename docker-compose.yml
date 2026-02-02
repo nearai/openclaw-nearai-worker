@@ -26,6 +26,7 @@ services:
       [
         "openclaw",
         "gateway",
+        "run",
         "--bind",
         "loopback",
         "--port",

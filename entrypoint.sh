@@ -4,6 +4,7 @@ set -eu -o pipefail
 # Security: Prevent accidental exposure of sensitive environment variables
 # Never log, echo, or print the values of these variables:
 # - NEARAI_API_KEY
+# - OPENCLAW_GATEWAY_TOKEN
 #
 # Only log variable names in error messages, never their values.
 #
@@ -17,8 +18,16 @@ if [ -z "${NEARAI_API_KEY:-}" ]; then
   exit 1
 fi
 
+# Auto-generate gateway auth token if not configured (export so envsubst sees it)
+if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
+  OPENCLAW_GATEWAY_TOKEN=$(openssl rand -hex 32)
+  export OPENCLAW_GATEWAY_TOKEN
+fi
+
 # Create config directory if it doesn't exist
 mkdir -p /home/node/.openclaw
+chmod 700 /home/node/.openclaw
+chown node:node /home/node/.openclaw
 
 # Generate config from template if it doesn't exist or if forced
 # Set OPENCLAW_FORCE_CONFIG_REGEN=1 to force regeneration even if config exists
@@ -35,10 +44,11 @@ if [ ! -f /home/node/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; th
     echo "Error: Template file /app/openclaw.json.template not found" >&2
     exit 1
   fi
-  
+
   # Export variables for envsubst (only the ones we need)
   export NEARAI_API_KEY
-  
+  export OPENCLAW_GATEWAY_TOKEN
+
   # Use envsubst to substitute environment variables in the template
   # OpenClaw supports ${VAR_NAME} syntax natively, so we can use the template directly
   if command -v envsubst >/dev/null 2>&1; then
@@ -49,11 +59,13 @@ if [ ! -f /home/node/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; th
   fi
 
   chown node:node /home/node/.openclaw/openclaw.json
+  chmod 600 /home/node/.openclaw/openclaw.json
   echo "Config file created at /home/node/.openclaw/openclaw.json"
 fi
 
 # Create workspace directory if it doesn't exist
 mkdir -p /home/node/openclaw
+chmod 700 /home/node/openclaw
 chown -R node:node /home/node/openclaw
 
 # Execute the command (openclaw is installed globally)
