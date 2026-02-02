@@ -1,13 +1,17 @@
-FROM node:22-bookworm@sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935
+FROM ubuntu:24.04
 
-# Install system dependencies and useful tools
+# Install Node.js 22 and system dependencies and useful tools for OpenClaw agent execution
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      curl \
+      ca-certificates \
+      gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends \
+      nodejs \
       gettext-base \
       git \
-      curl \
       wget \
-      ca-certificates \
       build-essential \
       python3 \
       python3-pip \
@@ -15,9 +19,27 @@ RUN apt-get update && \
       netcat-traditional \
       iputils-ping \
       procps \
-      vim && \
+      vim \
+      unzip \
+      zip \
+      tar \
+      gzip \
+      bzip2 \
+      xz-utils \
+      sed \
+      awk \
+      grep \
+      dnsutils \
+      strace \
+      lsof \
+      rsync \
+      less \
+      nano && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Create node user with home directory (matching node image convention)
+RUN groupadd -r node && useradd -r -g node -m -d /home/node node
 
 # Install OpenClaw globally from npm
 RUN npm install -g openclaw@latest
