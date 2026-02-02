@@ -26,6 +26,8 @@ fi
 
 # Create config directory if it doesn't exist
 mkdir -p /home/node/.openclaw
+chmod 700 /home/node/.openclaw
+chown node:node /home/node/.openclaw
 
 # Generate config from template if it doesn't exist or if forced
 # Set OPENCLAW_FORCE_CONFIG_REGEN=1 to force regeneration even if config exists
