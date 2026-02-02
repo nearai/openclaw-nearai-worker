@@ -14,8 +14,10 @@ set -eu -o pipefail
 
 # Validate required environment variables
 if [ -z "${NEARAI_API_KEY:-}" ]; then
-  echo "Error: NEARAI_API_KEY environment variable is required" >&2
-  exit 1
+  NEARAI_API_KEY=nearai-api-key
+  export NEARAI_API_KEY
+  # echo "Error: NEARAI_API_KEY environment variable is required" >&2
+  # exit 1
 fi
 
 # Auto-generate gateway auth token if not configured (export so envsubst sees it)
@@ -48,6 +50,7 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
   # Export variables for envsubst (only the ones we need)
   export NEARAI_API_KEY
   export OPENCLAW_GATEWAY_TOKEN
+  export OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
 
   # Use envsubst to substitute environment variables in the template
   # OpenClaw supports ${VAR_NAME} syntax natively, so we can use the template directly

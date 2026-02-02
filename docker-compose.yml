@@ -8,6 +8,8 @@ services:
       NEARAI_API_KEY: ${NEARAI_API_KEY}
       # Optional: Force config regeneration (set to "1" to regenerate config from template)
       OPENCLAW_FORCE_CONFIG_REGEN: ${OPENCLAW_FORCE_CONFIG_REGEN:-0}
+      # Optional: Gateway bind address — "lan" (default) or "loopback". See README security section.
+      OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
     volumes:
       - openclaw-config:/home/agent/.openclaw
       - openclaw-workspace:/home/agent/openclaw
@@ -28,7 +30,7 @@ services:
         "gateway",
         "run",
         "--bind",
-        "lan",
+        "${OPENCLAW_GATEWAY_BIND:-lan}",
         "--port",
         "18789",
         "--verbose"

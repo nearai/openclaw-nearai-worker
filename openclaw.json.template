@@ -77,7 +77,7 @@
       "mode": "token",
       "token": "${OPENCLAW_GATEWAY_TOKEN}"
     },
-    "bind": "lan",
+    "bind": "${OPENCLAW_GATEWAY_BIND}",
     "port": 18789,
     "http": {
       "endpoints": {
