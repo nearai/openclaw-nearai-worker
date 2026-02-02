@@ -27,7 +27,7 @@ RUN apt-get update && \
       bzip2 \
       xz-utils \
       sed \
-      awk \
+      mawk \
       grep \
       dnsutils \
       strace \
