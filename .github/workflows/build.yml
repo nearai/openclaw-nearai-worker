@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - fix/gateway-token-auth
     tags:
       - "v*"
 
