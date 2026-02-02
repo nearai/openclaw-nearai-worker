@@ -25,14 +25,14 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
 fi
 
 # Create config directory if it doesn't exist
-mkdir -p /home/node/.openclaw
-chmod 700 /home/node/.openclaw
-chown node:node /home/node/.openclaw
+# Note: Directory is already created and owned by agent in Dockerfile, but ensure it exists
+mkdir -p /home/agent/.openclaw
+chmod 700 /home/agent/.openclaw 2>/dev/null || true
 
 # Generate config from template if it doesn't exist or if forced
 # Set OPENCLAW_FORCE_CONFIG_REGEN=1 to force regeneration even if config exists
 FORCE_REGEN="${OPENCLAW_FORCE_CONFIG_REGEN:-0}"
-if [ ! -f /home/node/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; then
+if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; then
   if [ "${FORCE_REGEN}" = "1" ]; then
     echo "Force regenerating config from template (OPENCLAW_FORCE_CONFIG_REGEN=1)..."
   else
@@ -52,21 +52,21 @@ if [ ! -f /home/node/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; th
   # Use envsubst to substitute environment variables in the template
   # OpenClaw supports ${VAR_NAME} syntax natively, so we can use the template directly
   if command -v envsubst >/dev/null 2>&1; then
-    envsubst < /app/openclaw.json.template > /home/node/.openclaw/openclaw.json
+    envsubst < /app/openclaw.json.template > /home/agent/.openclaw/openclaw.json
   else
     echo "Error: envsubst command not found (gettext-base package required)" >&2
     exit 1
   fi
 
-  chown node:node /home/node/.openclaw/openclaw.json
-  chmod 600 /home/node/.openclaw/openclaw.json
-  echo "Config file created at /home/node/.openclaw/openclaw.json"
+  # File is created by agent user, so ownership is correct
+  chmod 600 /home/agent/.openclaw/openclaw.json
+  echo "Config file created at /home/agent/.openclaw/openclaw.json"
 fi
 
 # Create workspace directory if it doesn't exist
-mkdir -p /home/node/openclaw
-chmod 700 /home/node/openclaw
-chown -R node:node /home/node/openclaw
+# Note: Directory is already created and owned by agent in Dockerfile, but ensure it exists
+mkdir -p /home/agent/openclaw
+chmod 700 /home/agent/openclaw 2>/dev/null || true
 
 # Execute the command with automatic restart (openclaw is installed globally)
 # The loop keeps the container alive and restarts the gateway if it exits

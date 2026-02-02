@@ -57,7 +57,7 @@ docker compose exec openclaw-gateway openclaw models list
 
 ## Configuration
 
-The configuration is automatically generated from environment variables on first run. The entrypoint script creates `/home/node/.openclaw/openclaw.json` with:
+The configuration is automatically generated from environment variables on first run. The entrypoint script creates `/home/agent/.openclaw/openclaw.json` with:
 
 - **NEAR AI Cloud** as the model provider
 - **GLM-4.7** (`zai-org/GLM-4.7`) as the default model
@@ -79,18 +79,18 @@ To update the configuration after changing environment variables, you have three
 
 2. **Delete and regenerate**: Remove the config file and restart:
    ```bash
-   docker compose exec openclaw-gateway rm /home/node/.openclaw/openclaw.json
+   docker compose exec openclaw-gateway rm /home/agent/.openclaw/openclaw.json
    docker compose restart openclaw-gateway
    ```
 
 3. **Manual edit**: Edit the config file directly:
    ```bash
-   docker compose exec openclaw-gateway vi /home/node/.openclaw/openclaw.json
+   docker compose exec openclaw-gateway vi /home/agent/.openclaw/openclaw.json
    ```
 
 ### Customizing Configuration
 
-After the first run, you can edit `/home/node/.openclaw/openclaw.json` directly, or modify the `entrypoint.sh` script to change the default configuration.
+After the first run, you can edit `/home/agent/.openclaw/openclaw.json` directly, or modify the `entrypoint.sh` script to change the default configuration.
 
 ## Deployment on TEE Infrastructure
 
