@@ -56,5 +56,14 @@ fi
 mkdir -p /home/node/openclaw
 chown -R node:node /home/node/openclaw
 
-# Execute the command (openclaw is installed globally)
-exec "$@"
+# Execute the command with automatic restart (openclaw is installed globally)
+# The loop keeps the container alive and restarts the gateway if it exits
+RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
+
+while true; do
+  echo "Starting: $*"
+  "$@" || true
+  EXIT_CODE=$?
+  echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."
+  sleep "$RESTART_DELAY"
+done
