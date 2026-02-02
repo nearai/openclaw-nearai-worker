@@ -28,7 +28,7 @@ services:
         "gateway",
         "run",
         "--bind",
-        "loopback",
+        "lan",
         "--port",
         "18789",
         "--verbose"

@@ -59,4 +59,4 @@ USER agent
 WORKDIR /home/agent
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["openclaw", "gateway", "run", "--bind", "loopback", "--port", "18789"]
+CMD ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789"]
