@@ -14,8 +14,10 @@ set -eu -o pipefail
 
 # Validate required environment variables
 if [ -z "${NEARAI_API_KEY:-}" ]; then
-  echo "Error: NEARAI_API_KEY environment variable is required" >&2
-  exit 1
+  NEARAI_API_KEY=nearai-api-key
+  export NEARAI_API_KEY
+  # echo "Error: NEARAI_API_KEY environment variable is required" >&2
+  # exit 1
 fi
 
 # Auto-generate gateway auth token if not configured (export so envsubst sees it)
