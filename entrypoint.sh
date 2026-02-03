@@ -32,6 +32,10 @@ setup_ssh() {
     chmod 600 /home/agent/.ssh/authorized_keys
     echo "SSH authorized_keys configured successfully"
     
+    # Create privilege separation directory required by sshd
+    mkdir -p /run/sshd
+    chmod 0755 /run/sshd
+
     # Start SSH daemon on port 2222 (non-privileged); listen on all interfaces for external access
     echo "Starting SSH daemon on port 2222..."
     SSHD_OUTPUT=$(/usr/sbin/sshd -f /dev/null \
