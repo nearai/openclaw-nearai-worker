@@ -36,6 +36,9 @@ setup_ssh() {
     mkdir -p /run/sshd
     chmod 0755 /run/sshd
 
+    # Unlock agent account to allow SSH key-based login (account may be locked by default)
+    passwd -d agent 2>/dev/null || usermod -U agent 2>/dev/null || true
+
     # Start SSH daemon on port 2222 (non-privileged); listen on all interfaces for external access
     echo "Starting SSH daemon on port 2222..."
     SSHD_OUTPUT=$(/usr/sbin/sshd -f /dev/null \
