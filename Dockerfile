@@ -59,7 +59,7 @@ COPY openclaw.json.template /app/openclaw.json.template
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production
-USER agent
+# Run entrypoint as root so it can fix volume ownership; main process drops to agent via runuser
 WORKDIR /home/agent
 
 # Expose SSH port (2222 - non-privileged)

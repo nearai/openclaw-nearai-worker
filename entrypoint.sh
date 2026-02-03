@@ -13,6 +13,10 @@ set -eu -o pipefail
 # in the shell output. If debugging is needed, use explicit echo statements
 # that only print variable names, not values.
 
+# Ensure volume mount points are writable by agent (Docker often creates volumes as root)
+mkdir -p /home/agent/.openclaw /home/agent/openclaw
+chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
+
 # ============================================
 # SSH Server Configuration (runs as agent user on port 2222)
 # ============================================
@@ -49,6 +53,7 @@ setup_ssh() {
   else
     echo "Warning: SSH_PUBKEY not set - SSH access will not be available" >&2
   fi
+  chown -R agent:agent /home/agent/.ssh 2>/dev/null || true
 }
 
 setup_ssh
@@ -106,7 +111,7 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
     exit 1
   fi
 
-  # File is created by agent user, so ownership is correct
+  chown agent:agent /home/agent/.openclaw/openclaw.json
   chmod 600 /home/agent/.openclaw/openclaw.json
   echo "Config file created at /home/agent/.openclaw/openclaw.json"
 fi
@@ -122,7 +127,7 @@ RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
 
 while true; do
   echo "Starting: $*"
-  "$@" || true
+  runuser -u agent -- "$@" || true
   EXIT_CODE=$?
   echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."
   sleep "$RESTART_DELAY"
