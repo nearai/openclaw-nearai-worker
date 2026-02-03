@@ -23,15 +23,16 @@ setup_ssh() {
   if [ -n "${SSH_PUBKEY:-}" ]; then
     echo "Configuring SSH authorized_keys..."
     mkdir -p /home/agent/.ssh
-    echo "${SSH_PUBKEY}" > /home/agent/.ssh/authorized_keys
+    printf '%s\n' "${SSH_PUBKEY}" > /home/agent/.ssh/authorized_keys
     chmod 700 /home/agent/.ssh
     chmod 600 /home/agent/.ssh/authorized_keys
     echo "SSH authorized_keys configured successfully"
     
-    # Start SSH daemon on port 2222 (non-privileged)
+    # Start SSH daemon on port 2222 (non-privileged); listen on all interfaces for external access
     echo "Starting SSH daemon on port 2222..."
     SSHD_OUTPUT=$(/usr/sbin/sshd -f /dev/null \
       -o Port=2222 \
+      -o ListenAddress=0.0.0.0 \
       -o HostKey=/home/agent/ssh/ssh_host_ed25519_key \
       -o AuthorizedKeysFile=/home/agent/.ssh/authorized_keys \
       -o PasswordAuthentication=no \

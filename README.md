@@ -29,6 +29,7 @@ Required variables:
 Optional variables:
 - `OPENCLAW_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
 - `OPENCLAW_GATEWAY_BIND`: Gateway bind address — `lan` (default) or `loopback`. See [Gateway binding and security](#gateway-binding-and-security).
+- `SSH_PUBKEY`: Your SSH public key (e.g. contents of `~/.ssh/id_ed25519.pub`). When set, enables SSH server on port 2222 for key-based login as user `agent`. See [SSH access](#ssh-access).
 
 ### Running
 
@@ -128,6 +129,7 @@ Key considerations for TEE deployment:
 
 - **18789**: Gateway WebSocket and HTTP API
 - **18790**: Browser bridge (if enabled)
+- **2222**: SSH (when `SSH_PUBKEY` is set). Published as `0.0.0.0:2222` so the container is reachable from outside the host.
 
 ## Gateway binding and security
 
@@ -166,11 +168,12 @@ docker compose exec openclaw-gateway openclaw models list
 
 ### Security Best Practices
 
-- **Never log sensitive values**: The entrypoint script is designed to never log API keys, tokens, or secrets
+- **Never log sensitive values**: The entrypoint script is designed to never log API keys, tokens, SSH keys, or secrets
 - **Secure log storage**: Ensure Docker logs are stored securely and access is restricted
 - **Environment variables**: Use `.env` files with proper permissions (chmod 600) or secret management systems
 - **Container inspection**: Be cautious when using `docker inspect` or `docker exec` as these may expose environment variables
 - **Gateway binding**: The default is `lan`; follow the guidance in [Gateway binding and security](#gateway-binding-and-security). Set `OPENCLAW_GATEWAY_BIND=loopback` to restrict to localhost only.
+- **SSH**: Only enable SSH when needed by setting `SSH_PUBKEY`. Use key-based auth only; ensure port 2222 is not exposed to the internet unless you intend external access and have secured the host.
 
 ## Common Commands (docker compose)
 

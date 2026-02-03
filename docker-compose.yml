@@ -10,13 +10,16 @@ services:
       OPENCLAW_FORCE_CONFIG_REGEN: ${OPENCLAW_FORCE_CONFIG_REGEN:-0}
       # Optional: Gateway bind address — "lan" (default) or "loopback". See README security section.
       OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
+      # Optional: SSH public key for key-based login (enables SSH server on port 2222; required for external SSH).
+      SSH_PUBKEY: ${SSH_PUBKEY:-}
     volumes:
       - openclaw-config:/home/agent/.openclaw
       - openclaw-workspace:/home/agent/openclaw
     ports:
       - "18789:18789"
       - "18790:18790"
-      - "2222:2222"
+      # SSH (port 2222): bind 0.0.0.0 so container is reachable from external network (host firewall/NAT must allow 2222).
+      - "0.0.0.0:2222:2222"
     init: true
     restart: unless-stopped
     healthcheck:
