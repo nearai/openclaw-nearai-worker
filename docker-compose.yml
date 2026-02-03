@@ -16,10 +16,11 @@ services:
       - openclaw-config:/home/agent/.openclaw
       - openclaw-workspace:/home/agent/openclaw
     ports:
+      # OpenClaw
       - "18789:18789"
       - "18790:18790"
-      # SSH (port 2222): bind 0.0.0.0 so container is reachable from external network (host firewall/NAT must allow 2222).
-      - "0.0.0.0:2222:2222"
+      # SSH (port 2222)
+      - 2222:2222"
     init: true
     restart: unless-stopped
     healthcheck:

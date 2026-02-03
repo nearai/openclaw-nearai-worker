@@ -27,7 +27,8 @@ setup_ssh() {
   if [ -n "${SSH_PUBKEY:-}" ]; then
     echo "Configuring SSH authorized_keys..."
     mkdir -p /home/agent/.ssh
-    printf '%s\n' "${SSH_PUBKEY}" > /home/agent/.ssh/authorized_keys
+    # Trim leading/trailing whitespace and blank lines (env can add them); one key per line
+    printf '%s' "${SSH_PUBKEY}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' > /home/agent/.ssh/authorized_keys
     chmod 700 /home/agent/.ssh
     chmod 600 /home/agent/.ssh/authorized_keys
     echo "SSH authorized_keys configured successfully"
@@ -71,6 +72,8 @@ setup_ssh
 
 # Validate required environment variables
 if [ -z "${NEARAI_API_KEY:-}" ]; then
+  echo "Warning: NEARAI_API_KEY environment variable is not provided. Using placeholder 'nearai-api-key'." >&2
+  echo "Warning: The service may not function correctly without a valid API key." >&2
   NEARAI_API_KEY=nearai-api-key
   export NEARAI_API_KEY
   # echo "Error: NEARAI_API_KEY environment variable is required" >&2
