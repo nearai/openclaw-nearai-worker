@@ -28,8 +28,11 @@ setup_ssh() {
     echo "Configuring SSH authorized_keys..."
     mkdir -p /home/agent/.ssh
     echo "${SSH_PUBKEY}" > /home/agent/.ssh/authorized_keys
+    # Ensure correct permissions for StrictModes (home directory must not be world-writable)
+    chmod 755 /home/agent
     chmod 700 /home/agent/.ssh
     chmod 600 /home/agent/.ssh/authorized_keys
+    chown -R agent:agent /home/agent/.ssh
     echo "SSH authorized_keys configured successfully"
     
     # Create privilege separation directory required by sshd
@@ -49,7 +52,7 @@ setup_ssh() {
       -o PasswordAuthentication=no \
       -o PermitRootLogin=no \
       -o PidFile=/home/agent/ssh/sshd.pid \
-      -o StrictModes=no 2>&1) && SSHD_RC=0 || SSHD_RC=$?
+      -o StrictModes=yes 2>&1) && SSHD_RC=0 || SSHD_RC=$?
     if [ "$SSHD_RC" -eq 0 ]; then
       echo "SSH daemon started on port 2222"
     else
