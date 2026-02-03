@@ -27,8 +27,7 @@ setup_ssh() {
   if [ -n "${SSH_PUBKEY:-}" ]; then
     echo "Configuring SSH authorized_keys..."
     mkdir -p /home/agent/.ssh
-    # Trim leading/trailing whitespace and blank lines (env can add them); one key per line
-    printf '%s' "${SSH_PUBKEY}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' > /home/agent/.ssh/authorized_keys
+    echo "${SSH_PUBKEY}" > /home/agent/.ssh/authorized_keys
     chmod 700 /home/agent/.ssh
     chmod 600 /home/agent/.ssh/authorized_keys
     echo "SSH authorized_keys configured successfully"
