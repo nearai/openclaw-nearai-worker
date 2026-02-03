@@ -30,15 +30,21 @@ setup_ssh() {
     
     # Start SSH daemon on port 2222 (non-privileged)
     echo "Starting SSH daemon on port 2222..."
-    /usr/sbin/sshd -f /dev/null \
+    SSHD_OUTPUT=$(/usr/sbin/sshd -f /dev/null \
       -o Port=2222 \
       -o HostKey=/home/agent/ssh/ssh_host_ed25519_key \
       -o AuthorizedKeysFile=/home/agent/.ssh/authorized_keys \
       -o PasswordAuthentication=no \
       -o PermitRootLogin=no \
       -o PidFile=/home/agent/ssh/sshd.pid \
-      -o StrictModes=no
-    echo "SSH daemon started on port 2222"
+      -o StrictModes=no 2>&1) && SSHD_RC=0 || SSHD_RC=$?
+    if [ "$SSHD_RC" -eq 0 ]; then
+      echo "SSH daemon started on port 2222"
+    else
+      echo "Warning: Failed to start SSH daemon (exit code: $SSHD_RC)" >&2
+      echo "SSHD output: $SSHD_OUTPUT" >&2
+      echo "SSH access will not be available" >&2
+    fi
   else
     echo "Warning: SSH_PUBKEY not set - SSH access will not be available" >&2
   fi
