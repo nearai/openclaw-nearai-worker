@@ -5,6 +5,7 @@ set -eu -o pipefail
 # Never log, echo, or print the values of these variables:
 # - NEARAI_API_KEY
 # - OPENCLAW_GATEWAY_TOKEN
+# - SSH_PUBKEY
 #
 # Only log variable names in error messages, never their values.
 #
@@ -12,8 +13,69 @@ set -eu -o pipefail
 # in the shell output. If debugging is needed, use explicit echo statements
 # that only print variable names, not values.
 
+# Ensure volume mount points are writable by agent (Docker often creates volumes as root)
+mkdir -p /home/agent/.openclaw /home/agent/openclaw
+chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
+
+# ============================================
+# SSH Server Configuration (runs as agent user on port 2222)
+# ============================================
+setup_ssh() {
+  echo "Setting up SSH server..."
+  
+  # Configure authorized_keys from SSH_PUBKEY environment variable
+  if [ -n "${SSH_PUBKEY:-}" ]; then
+    echo "Configuring SSH authorized_keys..."
+    mkdir -p /home/agent/.ssh
+    echo "${SSH_PUBKEY}" > /home/agent/.ssh/authorized_keys
+    # Ensure correct permissions for StrictModes (home directory must not be world-writable)
+    chmod 755 /home/agent
+    chmod 700 /home/agent/.ssh
+    chmod 600 /home/agent/.ssh/authorized_keys
+    chown -R agent:agent /home/agent/.ssh
+    echo "SSH authorized_keys configured successfully"
+    
+    # Create privilege separation directory required by sshd
+    mkdir -p /run/sshd
+    chmod 0755 /run/sshd
+
+    # Unlock agent account to allow SSH key-based login (account may be locked by default)
+    passwd -d agent 2>/dev/null || usermod -U agent 2>/dev/null || true
+
+    # Start SSH daemon on port 2222 (non-privileged); listen on all interfaces for external access
+    echo "Starting SSH daemon on port 2222..."
+    SSHD_OUTPUT=$(/usr/sbin/sshd -f /dev/null \
+      -o Port=2222 \
+      -o ListenAddress=0.0.0.0 \
+      -o HostKey=/home/agent/ssh/ssh_host_ed25519_key \
+      -o AuthorizedKeysFile=/home/agent/.ssh/authorized_keys \
+      -o PasswordAuthentication=no \
+      -o PermitRootLogin=no \
+      -o PidFile=/home/agent/ssh/sshd.pid \
+      -o StrictModes=yes 2>&1) && SSHD_RC=0 || SSHD_RC=$?
+    if [ "$SSHD_RC" -eq 0 ]; then
+      echo "SSH daemon started on port 2222"
+    else
+      echo "Warning: Failed to start SSH daemon (exit code: $SSHD_RC)" >&2
+      echo "SSHD output: $SSHD_OUTPUT" >&2
+      echo "SSH access will not be available" >&2
+    fi
+  else
+    echo "Warning: SSH_PUBKEY not set - SSH access will not be available" >&2
+  fi
+  chown -R agent:agent /home/agent/.ssh 2>/dev/null || true
+}
+
+setup_ssh
+
+# ============================================
+# OpenClaw Configuration
+# ============================================
+
 # Validate required environment variables
 if [ -z "${NEARAI_API_KEY:-}" ]; then
+  echo "Warning: NEARAI_API_KEY environment variable is not provided. Using placeholder 'nearai-api-key'." >&2
+  echo "Warning: The service may not function correctly without a valid API key." >&2
   NEARAI_API_KEY=nearai-api-key
   export NEARAI_API_KEY
   # echo "Error: NEARAI_API_KEY environment variable is required" >&2
@@ -61,7 +123,7 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
     exit 1
   fi
 
-  # File is created by agent user, so ownership is correct
+  chown agent:agent /home/agent/.openclaw/openclaw.json
   chmod 600 /home/agent/.openclaw/openclaw.json
   echo "Config file created at /home/agent/.openclaw/openclaw.json"
 fi
@@ -77,7 +139,7 @@ RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
 
 while true; do
   echo "Starting: $*"
-  "$@" || true
+  runuser -p -u agent -- "$@" || true
   EXIT_CODE=$?
   echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."
   sleep "$RESTART_DELAY"

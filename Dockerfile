@@ -4,6 +4,7 @@ FROM node:24-bookworm@sha256:b2b2184ba9b78c022e1d6a7924ec6fba577adf28f15c9d9c457
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       openssl \
+      openssh-server \
       curl \
       ca-certificates \
       gettext-base \
@@ -39,6 +40,12 @@ RUN apt-get update && \
 # Use UID 1001 to avoid conflict with default UID 1000
 RUN useradd -m -u 1001 agent
 
+# Configure SSH server to run on non-privileged port 2222
+RUN mkdir -p /home/agent/.ssh /home/agent/ssh && \
+    ssh-keygen -t ed25519 -f /home/agent/ssh/ssh_host_ed25519_key -N "" && \
+    chmod 700 /home/agent/.ssh && \
+    chown -R agent:agent /home/agent/.ssh /home/agent/ssh
+
 # Install OpenClaw globally from npm
 RUN npm install -g openclaw@2026.2.1
 
@@ -52,8 +59,11 @@ COPY openclaw.json.template /app/openclaw.json.template
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production
-USER agent
+# Run entrypoint as root so it can fix volume ownership; main process drops to agent via runuser
 WORKDIR /home/agent
+
+# Expose ports
+EXPOSE 18789 18790 2222
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789"]
