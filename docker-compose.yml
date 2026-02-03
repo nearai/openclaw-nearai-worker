@@ -16,6 +16,7 @@ services:
     ports:
       - "18789:18789"
       - "18790:18790"
+      - "2222:2222"
     init: true
     restart: unless-stopped
     healthcheck:
