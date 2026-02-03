@@ -62,8 +62,8 @@ ENV NODE_ENV=production
 # Run entrypoint as root so it can fix volume ownership; main process drops to agent via runuser
 WORKDIR /home/agent
 
-# Expose SSH port (2222 - non-privileged)
-EXPOSE 2222
+# Expose ports
+EXPOSE 18789 18790 2222
 
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789"]
