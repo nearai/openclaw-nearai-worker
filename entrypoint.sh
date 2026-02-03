@@ -5,12 +5,50 @@ set -eu -o pipefail
 # Never log, echo, or print the values of these variables:
 # - NEARAI_API_KEY
 # - OPENCLAW_GATEWAY_TOKEN
+# - SSH_PUBKEY
 #
 # Only log variable names in error messages, never their values.
 #
 # WARNING: Do not enable debug mode (set -x) as it will expose all variable values
 # in the shell output. If debugging is needed, use explicit echo statements
 # that only print variable names, not values.
+
+# ============================================
+# SSH Server Configuration
+# ============================================
+setup_ssh() {
+  echo "Setting up SSH server..."
+  
+  # Create .ssh directory if it doesn't exist
+  mkdir -p /home/agent/.ssh
+  chmod 700 /home/agent/.ssh
+  
+  # Configure authorized_keys from SSH_PUBKEY environment variable
+  if [ -n "${SSH_PUBKEY:-}" ]; then
+    echo "Configuring SSH authorized_keys..."
+    echo "${SSH_PUBKEY}" > /home/agent/.ssh/authorized_keys
+    chmod 600 /home/agent/.ssh/authorized_keys
+    chown -R agent:agent /home/agent/.ssh
+    echo "SSH authorized_keys configured successfully"
+  else
+    echo "Warning: SSH_PUBKEY not set - SSH access will not be available" >&2
+  fi
+  
+  # Ensure /run/sshd exists (required for privilege separation)
+  mkdir -p /run/sshd
+  
+  # Start SSH daemon
+  echo "Starting SSH daemon..."
+  /usr/sbin/sshd
+  echo "SSH daemon started on port 22"
+}
+
+# Run SSH setup (runs as root)
+setup_ssh
+
+# ============================================
+# OpenClaw Configuration
+# ============================================
 
 # Validate required environment variables
 if [ -z "${NEARAI_API_KEY:-}" ]; then
@@ -30,6 +68,7 @@ fi
 # Note: Directory is already created and owned by agent in Dockerfile, but ensure it exists
 mkdir -p /home/agent/.openclaw
 chmod 700 /home/agent/.openclaw 2>/dev/null || true
+chown agent:agent /home/agent/.openclaw
 
 # Generate config from template if it doesn't exist or if forced
 # Set OPENCLAW_FORCE_CONFIG_REGEN=1 to force regeneration even if config exists
@@ -61,7 +100,8 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
     exit 1
   fi
 
-  # File is created by agent user, so ownership is correct
+  # Ensure proper ownership
+  chown agent:agent /home/agent/.openclaw/openclaw.json
   chmod 600 /home/agent/.openclaw/openclaw.json
   echo "Config file created at /home/agent/.openclaw/openclaw.json"
 fi
@@ -70,14 +110,16 @@ fi
 # Note: Directory is already created and owned by agent in Dockerfile, but ensure it exists
 mkdir -p /home/agent/openclaw
 chmod 700 /home/agent/openclaw 2>/dev/null || true
+chown agent:agent /home/agent/openclaw
 
-# Execute the command with automatic restart (openclaw is installed globally)
+# Execute the command with automatic restart as agent user (openclaw is installed globally)
 # The loop keeps the container alive and restarts the gateway if it exits
 RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
 
+echo "Starting main process as agent user..."
 while true; do
   echo "Starting: $*"
-  "$@" || true
+  gosu agent "$@" || true
   EXIT_CODE=$?
   echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."
   sleep "$RESTART_DELAY"
