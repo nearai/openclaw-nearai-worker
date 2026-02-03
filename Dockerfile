@@ -36,30 +36,21 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Configure SSH server
-RUN mkdir -p /run/sshd && \
-    ssh-keygen -A && \
-    sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && \
-    sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && \
-    sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
-    echo "AllowUsers agent" >> /etc/ssh/sshd_config
-
-# Install gosu for running main process as non-root user
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends gosu && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
 # Create non-root user for OpenClaw agents
 # Use UID 1001 to avoid conflict with default UID 1000
 RUN useradd -m -u 1001 agent
 
+# Configure SSH server to run on non-privileged port 2222
+RUN mkdir -p /home/agent/.ssh /home/agent/ssh && \
+    ssh-keygen -t ed25519 -f /home/agent/ssh/ssh_host_ed25519_key -N "" && \
+    chmod 700 /home/agent/.ssh && \
+    chown -R agent:agent /home/agent/.ssh /home/agent/ssh
+
 # Install OpenClaw globally from npm
 RUN npm install -g openclaw@2026.2.1
 
-# Create directories for config, workspace, and SSH
-RUN mkdir -p /home/agent/.openclaw /home/agent/openclaw /home/agent/.ssh && \
-    chmod 700 /home/agent/.ssh && \
+# Create directories for config and workspace
+RUN mkdir -p /home/agent/.openclaw /home/agent/openclaw && \
     chown -R agent:agent /home/agent
 
 # Copy entrypoint script and template
@@ -68,11 +59,11 @@ COPY openclaw.json.template /app/openclaw.json.template
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production
+USER agent
 WORKDIR /home/agent
 
-# Expose SSH port
-EXPOSE 22
+# Expose SSH port (2222 - non-privileged)
+EXPOSE 2222
 
-# Entrypoint runs as root to start sshd, then drops to agent for main process
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789"]
