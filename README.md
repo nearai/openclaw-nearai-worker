@@ -47,6 +47,114 @@ docker compose up
 docker compose logs -f openclaw-gateway
 ```
 
+---
+
+## Multi-Tenant Deployment
+
+For deploying multiple isolated OpenClaw instances (one per user), use the multi-tenant setup with the Management API.
+
+### Prerequisites
+
+- Docker and Docker Compose
+- NEAR AI Cloud API key
+- A server with ports 8080 (Management API) and 19001-19999 (user instances) accessible
+
+### Setup
+
+1. **Configure environment:**
+   ```bash
+   cp env.prod.example .env.prod
+   # Edit .env.prod:
+   # - OPENCLAW_HOST_ADDRESS (your server's public IP/hostname)
+   # - ADMIN_TOKEN will be auto-generated if not set
+   # Note: NEARAI_API_KEY is provided per-user in the create request
+   ```
+
+2. **Deploy:**
+   ```bash
+   chmod +x deploy.sh
+   ./deploy.sh
+   ```
+
+3. **Create users via Management API:**
+   ```bash
+   # Set your admin token (from .env.prod)
+   export ADMIN_TOKEN="your-token-here"
+   
+   # Create a user (with their NEAR AI API key and optional SSH public key)
+   curl -X POST http://<server>:8080/users \
+     -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -d '{
+       "user_id": "alice",
+       "nearai_api_key": "sk-user-nearai-api-key",
+       "ssh_pubkey": "ssh-ed25519 AAAA... user@host"
+     }'
+   
+   # Response includes gateway port, SSH port, and connection info:
+   # {
+   #   "user_id": "alice",
+   #   "token": "abc123...",
+   #   "gateway_port": 19001,
+   #   "ssh_port": 19002,
+   #   "url": "http://<server>:19001",
+   #   "dashboard_url": "http://<server>:19001/?token=abc123...",
+   #   "ssh_command": "ssh -p 19002 agent@<server>",
+   #   "status": "running"
+   # }
+   ```
+
+### Management API Authentication
+
+All API endpoints (except `/health`) require authentication via Bearer token:
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://<server>:8080/users
+```
+
+The `ADMIN_TOKEN` must be a 32-character hex string. Generate one with:
+```bash
+openssl rand -hex 16
+```
+
+### Management API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check (no auth required) |
+| `POST` | `/users` | Create user (`{"user_id": "...", "nearai_api_key": "...", "ssh_pubkey": "..."}`) |
+| `GET` | `/users` | List all users |
+| `GET` | `/users/{id}` | Get user details |
+| `DELETE` | `/users/{id}` | Delete user and container |
+| `POST` | `/users/{id}/restart` | Restart user's container |
+| `POST` | `/users/{id}/stop` | Stop user's container |
+| `POST` | `/users/{id}/start` | Start user's container |
+
+### User Access
+
+Each user gets two consecutive ports:
+- **Gateway port** (e.g., 19001): Web UI and API access at `http://<server>:<gateway_port>`
+- **SSH port** (e.g., 19002): SSH access via `ssh -p <ssh_port> agent@<server>`
+
+The SSH public key provided during user creation is injected into the container, allowing key-based SSH authentication.
+
+### Device Pairing
+
+- The **first device** connecting to each user's instance is auto-approved
+- Subsequent devices require manual approval via Telegram bot or CLI:
+  ```bash
+  # Via container CLI
+  docker exec -u agent openclaw-<user_id> openclaw devices list
+  docker exec -u agent openclaw-<user_id> openclaw devices approve <request-id>
+  ```
+
+### Firewall Configuration
+
+Ensure these ports are open:
+- `8080` - Management API
+- `19001-19999` - User OpenClaw instances (gateway + SSH ports)
+
+---
+
 ### Testing
 
 ```bash

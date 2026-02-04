@@ -1,6 +1,7 @@
 services:
   openclaw-gateway:
-    image: nearaidev/openclaw-nearai-worker:dev
+    build: .
+    image: openclaw-nearai-worker:local
     environment:
       HOME: /home/agent
       TERM: xterm-256color
@@ -20,7 +21,7 @@ services:
       - "18789:18789"
       - "18790:18790"
       # SSH (port 2222)
-      - 2222:2222"
+      - "2222:2222"
     init: true
     restart: unless-stopped
     healthcheck:

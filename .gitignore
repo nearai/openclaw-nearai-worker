@@ -1,6 +1,13 @@
 .env
 .env.*
 !.env.example
+!env.prod.example
 .build/
 *.log
 node_modules/
+
+# Rust build artifacts
+management-api/target/
+
+# Runtime data
+management-api/data/

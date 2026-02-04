@@ -1,0 +1,53 @@
+# Simple Multi-Tenant OpenClaw Deployment (Direct Port Access)
+# 
+# This compose file sets up ONLY the Management API.
+# No Traefik - users access containers directly via IP:port.
+# Only the Management API has Docker socket access.
+#
+# Usage:
+#   1. Copy env.prod.example to .env.prod and configure
+#   2. docker compose -f docker-compose.simple.yml up -d
+#   3. Use the management API to create user containers
+
+services:
+  # ============================================
+  # Management API (Rust/Axum)
+  # ============================================
+  # This is the ONLY container with Docker socket access.
+  # It creates/manages user containers programmatically.
+  management-api:
+    build:
+      context: ./management-api
+      dockerfile: Dockerfile
+    image: openclaw-management-api:local
+    container_name: openclaw-management-api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Docker socket - ONLY mounted here, not in user containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      - management-data:/app/data
+    networks:
+      - openclaw-network
+    environment:
+      - RUST_LOG=info
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - OPENCLAW_HOST_ADDRESS=${OPENCLAW_HOST_ADDRESS:-localhost}
+      - OPENCLAW_IMAGE=${OPENCLAW_IMAGE:-openclaw-nearai-worker:local}
+      - OPENCLAW_NETWORK=openclaw-network
+      - LISTEN_ADDR=0.0.0.0:8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  openclaw-network:
+    name: openclaw-network
+    driver: bridge
+
+volumes:
+  management-data:
