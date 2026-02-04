@@ -44,8 +44,13 @@ RUN useradd -m -u 1001 -s /bin/bash agent && \
     grep -q "^agent:.*:/bin/bash$" /etc/passwd || (echo "Error: agent user shell not set to bash" >&2 && exit 1)
 
 # Install Homebrew as the agent user (non-interactive mode)
+# Create the Homebrew directory structure and set ownership before installation
+USER root
+RUN mkdir -p /home/linuxbrew/.linuxbrew && \
+    chown -R agent:agent /home/linuxbrew
+
+# Switch to agent user and install Homebrew
 # The installer detects Docker environment and runs non-interactively
-# Set SHELL to bash to ensure Homebrew installer runs correctly
 USER agent
 SHELL ["/bin/bash", "-c"]
 RUN curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | bash
@@ -59,11 +64,15 @@ RUN npm install -g pnpm bun openclaw@2026.2.1
 
 # Configure SSH server, directories, brew, and npm for agent user
 RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/openclaw /home/agent/.npm-global && \
+    # Set ownership immediately after creating directories so agent user can write to them
+    chown -R agent:agent /home/agent && \
     ssh-keygen -t ed25519 -f /home/agent/ssh/ssh_host_ed25519_key -N "" && \
     chmod 700 /home/agent/.ssh && \
+    chown -R agent:agent /home/agent/.ssh /home/agent/ssh && \
     # Configure brew environment in .bashrc (PATH already in ENV, but shellenv sets additional variables)
     echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/agent/.bashrc && \
     # Configure npm to use local directory for global packages (prevents permission errors as non-root)
+    # Ownership is already set above, so agent user can write npm config
     su - agent -c 'npm config set prefix "/home/agent/.npm-global"' && \
     # Add npm-global to PATH in .bashrc (PATH already in ENV, but this ensures it's in shell sessions)
     echo 'export PATH="/home/agent/.npm-global/bin:${PATH}"' >> /home/agent/.bashrc && \
@@ -73,7 +82,7 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/
     # Create symlink for easy brew access
     ln -s /home/linuxbrew/.linuxbrew/bin/brew /usr/local/bin/brew && \
     chmod +x /usr/local/bin/brew && \
-    # Set ownership for all agent user files
+    # Ensure all files created above are owned by agent user
     chown -R agent:agent /home/agent
 
 # Copy entrypoint script and template
