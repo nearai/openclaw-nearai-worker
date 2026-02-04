@@ -78,13 +78,21 @@ RUN npm install -g openclaw@2026.2.1
 RUN mkdir -p /home/agent/.openclaw /home/agent/openclaw && \
     chown -R agent:agent /home/agent
 
+# Configure npm for agent user to use local directory for global packages
+# This prevents permission errors when installing global packages as non-root
+RUN mkdir -p /home/agent/.npm-global && \
+    chown -R agent:agent /home/agent/.npm-global && \
+    su - agent -c 'npm config set prefix "/home/agent/.npm-global"' && \
+    echo 'export PATH="/home/agent/.npm-global/bin:${PATH}"' >> /home/agent/.bashrc && \
+    echo 'export PATH="/home/agent/.npm-global/bin:${PATH}"' >> /etc/profile.d/npm-agent.sh
+
 # Copy entrypoint script and template
 COPY entrypoint.sh /app/entrypoint.sh
 COPY openclaw.json.template /app/openclaw.json.template
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production
-ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+ENV PATH="/home/agent/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
 # Run entrypoint as root so it can fix volume ownership; main process drops to agent via runuser
 WORKDIR /home/agent
 
