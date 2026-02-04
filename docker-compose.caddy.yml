@@ -1,0 +1,72 @@
+# Multi-Tenant OpenClaw with Caddy HTTPS
+#
+# Caddy provides automatic Let's Encrypt certificates.
+# 
+# Usage:
+#   1. Set OPENCLAW_DOMAIN in .env.prod (e.g., openclaw.example.com)
+#   2. Point DNS to your server:
+#      - A record: openclaw.example.com -> 51.91.160.170
+#      - A record (wildcard): *.openclaw.example.com -> 51.91.160.170
+#   3. Run: docker compose -f docker-compose.caddy.yml --env-file .env.prod up -d
+
+services:
+  # ============================================
+  # Caddy Reverse Proxy (Automatic HTTPS)
+  # ============================================
+  caddy:
+    image: caddy:2-alpine
+    container_name: openclaw-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - openclaw-network
+    environment:
+      - OPENCLAW_DOMAIN=${OPENCLAW_DOMAIN:-localhost}
+      - LISTEN_PORT=${LISTEN_PORT:-47392}
+
+  # ============================================
+  # Management API
+  # ============================================
+  management-api:
+    build:
+      context: ./management-api
+      dockerfile: Dockerfile
+    image: openclaw-management-api:local
+    container_name: openclaw-management-api
+    restart: unless-stopped
+    expose:
+      - "${LISTEN_PORT:-47392}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - management-data:/app/data
+    networks:
+      - openclaw-network
+    environment:
+      - RUST_LOG=info
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - OPENCLAW_HOST_ADDRESS=${OPENCLAW_DOMAIN:-localhost}
+      - OPENCLAW_IMAGE=${OPENCLAW_IMAGE:-openclaw-nearai-worker:local}
+      - OPENCLAW_NETWORK=openclaw-network
+      - LISTEN_ADDR=0.0.0.0:${LISTEN_PORT:-47392}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${LISTEN_PORT:-47392}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  openclaw-network:
+    name: openclaw-network
+    driver: bridge
+
+volumes:
+  caddy-data:
+  caddy-config:
+  management-data:

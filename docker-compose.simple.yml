@@ -23,7 +23,7 @@ services:
     container_name: openclaw-management-api
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${LISTEN_PORT:-47392}:${LISTEN_PORT:-47392}"
     volumes:
       # Docker socket - ONLY mounted here, not in user containers
       - /var/run/docker.sock:/var/run/docker.sock
@@ -36,9 +36,9 @@ services:
       - OPENCLAW_HOST_ADDRESS=${OPENCLAW_HOST_ADDRESS:-localhost}
       - OPENCLAW_IMAGE=${OPENCLAW_IMAGE:-openclaw-nearai-worker:local}
       - OPENCLAW_NETWORK=openclaw-network
-      - LISTEN_ADDR=0.0.0.0:8080
+      - LISTEN_ADDR=${LISTEN_ADDR:-0.0.0.0:47392}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:${LISTEN_PORT:-47392}/health"]
       interval: 30s
       timeout: 10s
       retries: 3

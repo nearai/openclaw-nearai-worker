@@ -2,8 +2,8 @@ use bollard::models::{
     ContainerCreateBody, HostConfig, Mount, MountTypeEnum, NetworkCreateRequest, PortBinding,
 };
 use bollard::query_parameters::{
-    CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
-    RestartContainerOptions, StartContainerOptions, StopContainerOptions,
+    CreateContainerOptions, ListContainersOptions, RemoveContainerOptions, RestartContainerOptions,
+    StartContainerOptions, StopContainerOptions,
 };
 use bollard::Docker;
 use std::collections::HashMap;
@@ -18,23 +18,29 @@ impl DockerManager {
     pub async fn new() -> Result<Self, ApiError> {
         let client = Docker::connect_with_local_defaults()
             .map_err(|e| ApiError::Internal(format!("Failed to connect to Docker: {}", e)))?;
-        
+
         // Test connection
-        client.ping().await
+        client
+            .ping()
+            .await
             .map_err(|e| ApiError::Internal(format!("Failed to ping Docker: {}", e)))?;
-        
+
         tracing::info!("Connected to Docker daemon");
         Ok(Self { client })
     }
 
     pub async fn ensure_network(&self, network_name: &str) -> Result<(), ApiError> {
-        let networks = self.client
+        let networks = self
+            .client
             .list_networks(None)
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to list networks: {}", e)))?;
 
         let exists = networks.iter().any(|n| {
-            n.name.as_ref().map(|name| name == network_name).unwrap_or(false)
+            n.name
+                .as_ref()
+                .map(|name| name == network_name)
+                .unwrap_or(false)
         });
 
         if !exists {
@@ -46,7 +52,7 @@ impl DockerManager {
                 })
                 .await
                 .map_err(|e| ApiError::Internal(format!("Failed to create network: {}", e)))?;
-            
+
             tracing::info!("Created Docker network: {}", network_name);
         }
 
@@ -66,17 +72,24 @@ impl DockerManager {
         network_name: &str,
     ) -> Result<(), ApiError> {
         // Check if container already exists
-        let containers = self.client
+        let containers = self
+            .client
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.to_string()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.to_string()],
+                )])),
                 ..Default::default()
             }))
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to list containers: {}", e)))?;
 
         if !containers.is_empty() {
-            return Err(ApiError::Conflict(format!("Container {} already exists", container_name)));
+            return Err(ApiError::Conflict(format!(
+                "Container {} already exists",
+                container_name
+            )));
         }
 
         // Volume name for persistent data
@@ -101,11 +114,14 @@ impl DockerManager {
         // Container labels for management
         let mut labels = HashMap::new();
         labels.insert("openclaw.managed".to_string(), "true".to_string());
-        labels.insert("openclaw.user".to_string(), container_name.replace("openclaw-", ""));
+        labels.insert(
+            "openclaw.user".to_string(),
+            container_name.replace("openclaw-", ""),
+        );
 
         // Port bindings for direct access (gateway + SSH)
         let mut port_bindings = HashMap::new();
-        
+
         // Gateway port mapping (container 18789 -> host gateway_port)
         port_bindings.insert(
             "18789/tcp".to_string(),
@@ -114,7 +130,7 @@ impl DockerManager {
                 host_port: Some(gateway_port.to_string()),
             }]),
         );
-        
+
         // SSH port mapping (container 22 -> host ssh_port)
         port_bindings.insert(
             "22/tcp".to_string(),
@@ -178,7 +194,12 @@ impl DockerManager {
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to create container: {}", e)))?;
 
-        tracing::info!("Created container: {} (gateway:{}, ssh:{})", container_name, gateway_port, ssh_port);
+        tracing::info!(
+            "Created container: {} (gateway:{}, ssh:{})",
+            container_name,
+            gateway_port,
+            ssh_port
+        );
         Ok(())
     }
 
@@ -187,27 +208,39 @@ impl DockerManager {
             .start_container(container_name, None::<StartContainerOptions>)
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to start container: {}", e)))?;
-        
+
         tracing::info!("Started container: {}", container_name);
         Ok(())
     }
 
     pub async fn stop_container(&self, container_name: &str) -> Result<(), ApiError> {
         self.client
-            .stop_container(container_name, Some(StopContainerOptions { t: Some(10), signal: None }))
+            .stop_container(
+                container_name,
+                Some(StopContainerOptions {
+                    t: Some(10),
+                    signal: None,
+                }),
+            )
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to stop container: {}", e)))?;
-        
+
         tracing::info!("Stopped container: {}", container_name);
         Ok(())
     }
 
     pub async fn restart_container(&self, container_name: &str) -> Result<(), ApiError> {
         self.client
-            .restart_container(container_name, Some(RestartContainerOptions { t: Some(10), signal: None }))
+            .restart_container(
+                container_name,
+                Some(RestartContainerOptions {
+                    t: Some(10),
+                    signal: None,
+                }),
+            )
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to restart container: {}", e)))?;
-        
+
         tracing::info!("Restarted container: {}", container_name);
         Ok(())
     }
@@ -224,23 +257,31 @@ impl DockerManager {
             )
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to remove container: {}", e)))?;
-        
+
         tracing::info!("Removed container: {}", container_name);
         Ok(())
     }
 
     pub async fn get_container_status(&self, container_name: &str) -> Result<String, ApiError> {
-        let containers = self.client
+        let containers = self
+            .client
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![format!("^/{}$", container_name)])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![format!("^/{}$", container_name)],
+                )])),
                 ..Default::default()
             }))
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to list containers: {}", e)))?;
 
         if let Some(container) = containers.first() {
-            Ok(container.state.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "unknown".to_string()))
+            Ok(container
+                .state
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string()))
         } else {
             Ok("not_found".to_string())
         }

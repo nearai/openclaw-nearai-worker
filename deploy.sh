@@ -140,12 +140,6 @@ if [ "$BUILD_ONLY" -eq 1 ]; then
 fi
 
 # ============================================
-# Create Docker Network
-# ============================================
-log_info "Ensuring Docker network exists..."
-docker network create openclaw-network 2>/dev/null || true
-
-# ============================================
 # Create Required Directories
 # ============================================
 log_info "Creating required directories..."
@@ -178,7 +172,8 @@ fi
 
 # Test Management API health
 sleep 3
-if curl -s http://localhost:8080/health | grep -q "OK"; then
+LISTEN_PORT="${LISTEN_PORT:-47392}"
+if curl -s "http://localhost:$LISTEN_PORT/health" | grep -q "OK"; then
   log_info "Management API health check passed"
 else
   log_warn "Management API health check failed - service may still be starting"
@@ -193,8 +188,8 @@ log_info "Deployment Complete!"
 log_info "============================================"
 echo ""
 echo "Services:"
-echo "  - Management API: http://localhost:8080"
-echo "  - Management API: http://$HOST_ADDRESS:8080 (external)"
+echo "  - Management API: http://localhost:$LISTEN_PORT"
+echo "  - Management API: http://$HOST_ADDRESS:$LISTEN_PORT (external)"
 echo ""
 echo "Authentication:"
 echo "  All API requests require: Authorization: Bearer \$ADMIN_TOKEN"
@@ -206,7 +201,7 @@ echo "  # Set your admin token (from $ENV_FILE):"
 echo "  export ADMIN_TOKEN=\"$ADMIN_TOKEN\""
 echo ""
 echo "  # Create a user (with their NEAR AI API key and optional SSH public key):"
-echo "  curl -X POST http://$HOST_ADDRESS:8080/users \\"
+echo "  curl -X POST http://$HOST_ADDRESS:$LISTEN_PORT/users \\"
 echo "    -H 'Content-Type: application/json' \\"
 echo "    -H \"Authorization: Bearer \$ADMIN_TOKEN\" \\"
 echo "    -d '{"
@@ -228,19 +223,19 @@ echo "  #   \"status\": \"running\""
 echo "  # }"
 echo ""
 echo "  # List all users:"
-echo "  curl -H \"Authorization: Bearer \$ADMIN_TOKEN\" http://$HOST_ADDRESS:8080/users"
+echo "  curl -H \"Authorization: Bearer \$ADMIN_TOKEN\" http://$HOST_ADDRESS:$LISTEN_PORT/users"
 echo ""
 echo "  # Get user details:"
-echo "  curl -H \"Authorization: Bearer \$ADMIN_TOKEN\" http://$HOST_ADDRESS:8080/users/alice"
+echo "  curl -H \"Authorization: Bearer \$ADMIN_TOKEN\" http://$HOST_ADDRESS:$LISTEN_PORT/users/alice"
 echo ""
 echo "  # Delete a user:"
-echo "  curl -X DELETE -H \"Authorization: Bearer \$ADMIN_TOKEN\" http://$HOST_ADDRESS:8080/users/alice"
+echo "  curl -X DELETE -H \"Authorization: Bearer \$ADMIN_TOKEN\" http://$HOST_ADDRESS:$LISTEN_PORT/users/alice"
 echo ""
 echo "User Container Access:"
 echo "  - Gateway: http://$HOST_ADDRESS:{gateway_port}"
 echo "  - SSH:     ssh -p {ssh_port} agent@$HOST_ADDRESS"
 echo "  - Ports are allocated in pairs starting at 19001 (gateway), 19002 (ssh)"
 echo ""
-log_info "Note: Ensure firewall allows ports 8080 and 19001-19999"
+log_info "Note: Ensure firewall allows ports $LISTEN_PORT and 19001-19999"
 log_info "Note: Each user gets 2 consecutive ports (gateway + SSH)"
 log_info "Note: Only the Management API has Docker socket access"
