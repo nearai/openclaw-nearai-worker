@@ -39,9 +39,7 @@ RUN apt-get update && \
 
 # Create non-root user for OpenClaw agents
 # Use UID 1001 to avoid conflict with default UID 1000
-# Set shell to bash (required for Homebrew installer and SSH sessions)
-RUN useradd -m -u 1001 -s /bin/bash agent && \
-    grep -q "^agent:.*:/bin/bash$" /etc/passwd || (echo "Error: agent user shell not set to bash" >&2 && exit 1)
+RUN useradd -m -u 1001 agent
 
 # Install Homebrew as the agent user (non-interactive mode)
 # Create the Homebrew directory structure and set ownership before installation
@@ -52,7 +50,6 @@ RUN mkdir -p /home/linuxbrew/.linuxbrew && \
 # Switch to agent user and install Homebrew
 # The installer detects Docker environment and runs non-interactively
 USER agent
-SHELL ["/bin/bash", "-c"]
 RUN curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | bash
 
 # Switch back to root for remaining setup
@@ -76,9 +73,6 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/
     su - agent -c 'npm config set prefix "/home/agent/.npm-global"' && \
     # Add npm-global to PATH in .bashrc (PATH already in ENV, but this ensures it's in shell sessions)
     echo 'export PATH="/home/agent/.npm-global/bin:${PATH}"' >> /home/agent/.bashrc && \
-    # Ensure SSH login shells source .bashrc (both .profile and .bash_profile for compatibility)
-    echo '[ -f ~/.bashrc ] && . ~/.bashrc' >> /home/agent/.profile && \
-    echo '[ -f ~/.bashrc ] && . ~/.bashrc' >> /home/agent/.bash_profile && \
     # Create symlink for easy brew access
     ln -s /home/linuxbrew/.linuxbrew/bin/brew /usr/local/bin/brew && \
     chmod +x /usr/local/bin/brew && \
@@ -88,7 +82,6 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/
 # Install OpenClaw as agent user so it goes to /home/agent/.npm-global/bin
 # This ensures it's in the agent user's PATH (npm config was already set above)
 USER agent
-SHELL ["/bin/bash", "-c"]
 RUN npm install -g openclaw@2026.2.1
 
 # Switch back to root for final setup
