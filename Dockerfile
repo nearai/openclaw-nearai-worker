@@ -59,8 +59,8 @@ RUN curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.s
 USER root
 SHELL ["/bin/sh", "-c"]
 
-# Install pnpm, bun, and OpenClaw globally via npm
-RUN npm install -g pnpm bun openclaw@2026.2.1
+# Install pnpm and bun globally via npm (as root, available system-wide)
+RUN npm install -g pnpm bun
 
 # Configure SSH server, directories, brew, and npm for agent user
 RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/openclaw /home/agent/.npm-global && \
@@ -84,6 +84,16 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/
     chmod +x /usr/local/bin/brew && \
     # Ensure all files created above are owned by agent user
     chown -R agent:agent /home/agent
+
+# Install OpenClaw as agent user so it goes to /home/agent/.npm-global/bin
+# This ensures it's in the agent user's PATH (npm config was already set above)
+USER agent
+SHELL ["/bin/bash", "-c"]
+RUN npm install -g openclaw@2026.2.1
+
+# Switch back to root for final setup
+USER root
+SHELL ["/bin/sh", "-c"]
 
 # Copy entrypoint script and template
 COPY entrypoint.sh /app/entrypoint.sh
