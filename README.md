@@ -71,8 +71,8 @@ The worker is preconfigured with the following models from NEAR AI Cloud. You ca
 
 | Model | ID | Context | Reasoning | Description |
 |-------|-----|---------|-----------|-------------|
-| **GLM-4.7** (default) | `nearai/zai-org/GLM-4.7` | 200K tokens | No | Z.ai GLM 4.7 — strong agentic coding, tool use, and reasoning. Default primary model. |
-| **DeepSeek V3.1** | `nearai/deepseek-ai/DeepSeek-V3.1` | 128K tokens | Yes | Hybrid model with thinking and non-thinking modes. Good for complex reasoning and tool use. |
+| **GLM-4.7** (default) | `nearai/zai-org/GLM-4.7` | 200K tokens | Yes | Z.ai GLM 4.7 — strong agentic coding, tool use, and reasoning. Default primary model. |
+| **DeepSeek V3.1** | `nearai/deepseek-ai/DeepSeek-V3.1` | 128K tokens | No | Hybrid model with thinking and non-thinking modes. Good for complex reasoning and tool use. |
 | **Qwen3 30B A3B Instruct** | `nearai/Qwen/Qwen3-30B-A3B-Instruct-2507` | 262K tokens | No | MoE model with long context. Efficient for instruction following and multilingual tasks. |
 
 **Using a specific model**
