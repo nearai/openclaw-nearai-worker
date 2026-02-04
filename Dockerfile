@@ -32,59 +32,49 @@ RUN apt-get update && \
       lsof \
       rsync \
       less \
-      nano && \
+      nano \
+      file && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Create non-root user for OpenClaw agents
 # Use UID 1001 to avoid conflict with default UID 1000
-RUN useradd -m -u 1001 agent
-
-# Install Homebrew (Linux) as non-root user
-# Note: Homebrew cannot be installed as root - must be installed as a non-root user
-# build-essential, curl, git, and procps are already installed above
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      file && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+# Set shell to bash (required for Homebrew installer and SSH sessions)
+RUN useradd -m -u 1001 -s /bin/bash agent && \
+    grep -q "^agent:.*:/bin/bash$" /etc/passwd || (echo "Error: agent user shell not set to bash" >&2 && exit 1)
 
 # Install Homebrew as the agent user (non-interactive mode)
 # The installer detects Docker environment and runs non-interactively
+# Set SHELL to bash to ensure Homebrew installer runs correctly
 USER agent
-RUN /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < /dev/null
+SHELL ["/bin/bash", "-c"]
+RUN curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | bash
 
 # Switch back to root for remaining setup
 USER root
-RUN echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /etc/profile.d/brew.sh && \
-    echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /root/.bashrc && \
-    echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/agent/.bashrc && \
-    ln -s /home/linuxbrew/.linuxbrew/bin/brew /usr/local/bin/brew && \
-    chmod +x /usr/local/bin/brew
+SHELL ["/bin/sh", "-c"]
 
-# Configure SSH server to run on non-privileged port 2222
-RUN mkdir -p /home/agent/.ssh /home/agent/ssh && \
+# Install pnpm, bun, and OpenClaw globally via npm
+RUN npm install -g pnpm bun openclaw@2026.2.1
+
+# Configure SSH server, directories, brew, and npm for agent user
+RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/openclaw /home/agent/.npm-global && \
     ssh-keygen -t ed25519 -f /home/agent/ssh/ssh_host_ed25519_key -N "" && \
     chmod 700 /home/agent/.ssh && \
-    chown -R agent:agent /home/agent/.ssh /home/agent/ssh
-
-# Install pnpm and bun globally via npm
-RUN npm install -g pnpm bun
-
-# Install OpenClaw globally from npm
-RUN npm install -g openclaw@2026.2.1
-
-# Create directories for config and workspace
-RUN mkdir -p /home/agent/.openclaw /home/agent/openclaw && \
-    chown -R agent:agent /home/agent
-
-# Configure npm for agent user to use local directory for global packages
-# This prevents permission errors when installing global packages as non-root
-RUN mkdir -p /home/agent/.npm-global && \
-    chown -R agent:agent /home/agent/.npm-global && \
+    # Configure brew environment in .bashrc (PATH already in ENV, but shellenv sets additional variables)
+    echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/agent/.bashrc && \
+    # Configure npm to use local directory for global packages (prevents permission errors as non-root)
     su - agent -c 'npm config set prefix "/home/agent/.npm-global"' && \
+    # Add npm-global to PATH in .bashrc (PATH already in ENV, but this ensures it's in shell sessions)
     echo 'export PATH="/home/agent/.npm-global/bin:${PATH}"' >> /home/agent/.bashrc && \
-    echo 'export PATH="/home/agent/.npm-global/bin:${PATH}"' >> /etc/profile.d/npm-agent.sh
+    # Ensure SSH login shells source .bashrc (both .profile and .bash_profile for compatibility)
+    echo '[ -f ~/.bashrc ] && . ~/.bashrc' >> /home/agent/.profile && \
+    echo '[ -f ~/.bashrc ] && . ~/.bashrc' >> /home/agent/.bash_profile && \
+    # Create symlink for easy brew access
+    ln -s /home/linuxbrew/.linuxbrew/bin/brew /usr/local/bin/brew && \
+    chmod +x /usr/local/bin/brew && \
+    # Set ownership for all agent user files
+    chown -R agent:agent /home/agent
 
 # Copy entrypoint script and template
 COPY entrypoint.sh /app/entrypoint.sh

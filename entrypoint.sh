@@ -139,7 +139,10 @@ RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
 
 while true; do
   echo "Starting: $*"
-  runuser -p -u agent -- "$@" || true
+  # Use runuser with bash shell (-s /bin/bash) to ensure bash is available
+  # This ensures commands like 'openclaw onboard' that may install packages via npm/brew work correctly
+  # The -p flag preserves environment variables (including PATH set in Dockerfile)
+  runuser -p -s /bin/bash -u agent -- "$@" || true
   EXIT_CODE=$?
   echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."
   sleep "$RESTART_DELAY"
