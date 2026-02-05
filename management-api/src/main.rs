@@ -1,23 +1,16 @@
 use axum::{
-    body::Body,
     extract::{FromRequestParts, Path, State},
-    http::uri::Uri,
     http::{request::Parts, StatusCode},
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use tokio::sync::RwLock;
-use tower::{Layer, Service};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 
 mod docker;
 mod error;
@@ -26,8 +19,6 @@ mod store;
 use docker::DockerManager;
 use error::ApiError;
 use store::{User, UserStore};
-
-type HyperClient = Client<HttpConnector, Body>;
 
 const ADMIN_TOKEN_HEX_LEN: usize = 32;
 
@@ -41,8 +32,8 @@ struct AppState {
 #[derive(Clone)]
 struct AppConfig {
     admin_token: String,
-    host_address: String,  // Public IP or hostname for direct port access
-    openclaw_domain: Option<String>,  // If set, *.openclaw_domain is proxied to openclaw-{subdomain}:18789
+    host_address: String,
+    openclaw_domain: Option<String>,  // Used for generating HTTPS URLs
     openclaw_image: String,
     network_name: String,
 }
@@ -69,109 +60,6 @@ impl FromRequestParts<AppState> for AdminAuth {
         }
 
         Ok(AdminAuth)
-    }
-}
-
-/// If host is `subdomain.openclaw_domain`, returns Some(sanitized_subdomain).
-/// Subdomain is sanitized to alphanumeric + hyphen only (safe for container names).
-fn extract_subdomain(host: &str, domain: &str) -> Option<String> {
-    let host = host.split(':').next()?; // strip port
-    let domain_lower = domain.to_lowercase();
-    let host_lower = host.to_lowercase();
-    let suffix = format(".{}", domain_lower);
-    let subdomain = host_lower.strip_suffix(&suffix)?;
-    if subdomain.is_empty() {
-        return None;
-    }
-    // Sanitize: only alphanumeric and hyphen (same as user_id validation)
-    let sanitized: String = subdomain
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect();
-    if sanitized.is_empty() || sanitized.len() > 32 {
-        return None;
-    }
-    Some(sanitized)
-}
-
-/// Tower layer: when OPENCLAW_DOMAIN is set and request Host is a subdomain, proxy to openclaw-{subdomain}:18789.
-#[derive(Clone)]
-struct SubdomainProxyLayer {
-    openclaw_domain: Option<String>,
-    client: HyperClient,
-}
-
-impl<S> Layer<S> for SubdomainProxyLayer {
-    type Service = SubdomainProxyService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        SubdomainProxyService {
-            openclaw_domain: self.openclaw_domain.clone(),
-            client: self.client.clone(),
-            inner,
-        }
-    }
-}
-
-struct SubdomainProxyService<S> {
-    openclaw_domain: Option<String>,
-    client: HyperClient,
-    inner: S,
-}
-
-impl<S, ReqBody> Service<axum::http::Request<ReqBody>> for SubdomainProxyService<S>
-where
-    S: Service<axum::http::Request<ReqBody>, Response = Response> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-    ReqBody: Send + 'static,
-{
-    type Response = Response;
-    type Error = S::Error;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
-        let host = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let domain = self.openclaw_domain.clone();
-        let client = self.client.clone();
-        let inner = self.inner.clone();
-        Box::pin(async move {
-            let subdomain = domain
-                .as_ref()
-                .and_then(|d| host.as_ref().and_then(|h| extract_subdomain(h, d)));
-            if let Some(sub) = subdomain {
-                let path_query = req
-                    .uri()
-                    .path_and_query()
-                    .map(|p| p.as_str())
-                    .unwrap_or("/");
-                let upstream_uri = format!("http://openclaw-{}:18789{}", sub, path_query);
-                if let Ok(uri) = Uri::try_from(upstream_uri.as_str()) {
-                    let (parts, body) = req.into_parts();
-                    let mut upstream_req = axum::http::Request::from_parts(parts, body);
-                    *upstream_req.uri_mut() = uri;
-                    match client.request(upstream_req).await {
-                        Ok(resp) => return Ok(resp.into_response()),
-                        Err(e) => {
-                            tracing::debug!("Subdomain proxy upstream error ({}): {}", sub, e);
-                            return Ok((
-                                StatusCode::BAD_GATEWAY,
-                                format!("Upstream unavailable: {}", e),
-                            )
-                                .into_response());
-                        }
-                    }
-                }
-            }
-            inner.call(req).await
-        })
     }
 }
 
@@ -226,6 +114,10 @@ async fn main() -> anyhow::Result<()> {
     // Load or create user store
     let store = Arc::new(RwLock::new(UserStore::load_or_create("data/users.json")?));
 
+    if let Some(ref domain) = config.openclaw_domain {
+        tracing::info!("OPENCLAW_DOMAIN set: user URLs will use https://{{user}}.{}", domain);
+    }
+
     let state = AppState {
         docker,
         store,
@@ -245,19 +137,6 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
-
-    // When OPENCLAW_DOMAIN is set, proxy *.domain to openclaw-{subdomain}:18789
-    let app = if let Some(domain) = &config.openclaw_domain {
-        let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
-        let layer = SubdomainProxyLayer {
-            openclaw_domain: Some(domain.clone()),
-            client,
-        };
-        tracing::info!("Dynamic subdomains enabled: *.{} -> openclaw-{{user}}:18789", domain);
-        app.layer(layer)
-    } else {
-        app
-    };
 
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -290,6 +169,20 @@ struct CreateUserResponse {
     dashboard_url: String,
     ssh_command: String,
     status: String,
+}
+
+/// Generate URL and dashboard_url based on config
+fn generate_urls(config: &AppConfig, user_id: &str, gateway_port: u16, token: &str) -> (String, String) {
+    match &config.openclaw_domain {
+        Some(domain) => {
+            let base = format!("https://{}.{}", user_id, domain);
+            (base.clone(), format!("{}/?token={}", base, token))
+        }
+        None => {
+            let base = format!("http://{}:{}", config.host_address, gateway_port);
+            (base.clone(), format!("{}/?token={}", base, token))
+        }
+    }
 }
 
 async fn create_user(
@@ -360,16 +253,7 @@ async fn create_user(
 
     tracing::info!("Created user container: {} (gateway:{}, ssh:{})", user_id, gateway_port, ssh_port);
 
-    let (url, dashboard_url) = match &state.config.openclaw_domain {
-        Some(domain) => {
-            let base = format!("https://{}.{}", user_id, domain);
-            (base.clone(), format!("{}/?token={}", base, token))
-        }
-        None => {
-            let base = format!("http://{}:{}", state.config.host_address, gateway_port);
-            (base.clone(), format!("{}/?token={}", base, token))
-        }
-    };
+    let (url, dashboard_url) = generate_urls(&state.config, &user_id, gateway_port, &token);
     let ssh_command = format!("ssh -p {} agent@{}", ssh_port, state.config.host_address);
     
     Ok((
@@ -413,8 +297,7 @@ async fn get_user(
     match user {
         Some(user) => {
             let status = state.docker.get_container_status(&user.container_name).await?;
-            let url = format!("http://{}:{}", state.config.host_address, user.gateway_port);
-            let dashboard_url = format!("{}/?token={}", url, user.token);
+            let (url, dashboard_url) = generate_urls(&state.config, &user.user_id, user.gateway_port, &user.token);
             let ssh_command = format!("ssh -p {} agent@{}", user.ssh_port, state.config.host_address);
             Ok(Json(UserResponse {
                 user_id: user.user_id,
@@ -450,8 +333,7 @@ async fn list_users(
     for user in users {
         let status = state.docker.get_container_status(&user.container_name).await
             .unwrap_or_else(|_| "unknown".to_string());
-        let url = format!("http://{}:{}", state.config.host_address, user.gateway_port);
-        let dashboard_url = format!("{}/?token={}", url, user.token);
+        let (url, dashboard_url) = generate_urls(&state.config, &user.user_id, user.gateway_port, &user.token);
         let ssh_command = format!("ssh -p {} agent@{}", user.ssh_port, state.config.host_address);
         responses.push(UserResponse {
             user_id: user.user_id.clone(),

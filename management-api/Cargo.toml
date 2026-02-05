@@ -8,7 +8,6 @@ description = "Management API for multi-tenant OpenClaw deployment"
 # Web framework
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1.44", features = ["full"] }
-tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Serialization
@@ -17,9 +16,6 @@ serde_json = "1.0.138"
 
 # Docker
 bollard = "0.20"
-
-# Reverse proxy for dynamic subdomains
-hyper-util = { version = "0.1", features = ["client-legacy", "rt-tokio"] }
 
 # Utilities
 uuid = { version = "1.12", features = ["v4"] }
