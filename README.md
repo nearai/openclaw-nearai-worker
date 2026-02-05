@@ -57,7 +57,7 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
 
 - Docker and Docker Compose
 - NEAR AI Cloud API key
-- A server with ports 8080 (Management API) and 19001-19999 (user instances) accessible
+- A server with Management API port (default 47392) and 19001-19999 (user instances) accessible; for HTTPS, nginx and certbot on the host
 
 ### Setup
 
@@ -82,7 +82,7 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
    export ADMIN_TOKEN="your-token-here"
    
    # Create a user (with their NEAR AI API key and optional SSH public key)
-   curl -X POST http://<server>:8080/users \
+   curl -X POST http://<server>:47392/users \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer $ADMIN_TOKEN" \
      -d '{
@@ -108,7 +108,7 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
 
 All API endpoints (except `/health`) require authentication via Bearer token:
 ```bash
-curl -H "Authorization: Bearer $ADMIN_TOKEN" http://<server>:8080/users
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://<server>:47392/users
 ```
 
 The `ADMIN_TOKEN` must be a 32-character hex string. Generate one with:
@@ -137,6 +137,36 @@ Each user gets two consecutive ports:
 
 The SSH public key provided during user creation is injected into the container, allowing key-based SSH authentication.
 
+### HTTPS with nginx and certbot
+
+Production HTTPS uses **nginx** on the host with **certbot** for Let’s Encrypt. No reverse proxy runs in Docker.
+
+1. **Set domain in env**
+   - In `.env.prod`: `OPENCLAW_DOMAIN=openclaw.example.com` (your domain).
+
+2. **Start the stack** (management API only; nginx runs on the host)
+   ```bash
+   docker compose -f docker-compose.nginx.yml --env-file .env.prod up -d
+   ```
+   The API listens on `127.0.0.1:47392` so only nginx can reach it.
+
+3. **Configure nginx**
+   - Copy `nginx-openclaw.conf` into your nginx config (e.g. `/etc/nginx/sites-available/openclaw`).
+   - Replace `OPENCLAW_DOMAIN` in the file with your domain (e.g. `openclaw.example.com`).
+   - Enable the site and reload nginx: `sudo nginx -t && sudo systemctl reload nginx`.
+
+4. **Get certificates**
+   ```bash
+   sudo certbot --nginx -d openclaw.example.com -d "*.openclaw.example.com"
+   ```
+   Certbot will add `listen 443 ssl` and certificate paths to the server block.
+
+5. **DNS**
+   - A record: `openclaw.example.com` → your server IP.
+   - A record: `*.openclaw.example.com` → your server IP.
+
+After this, the main domain serves the Management API over HTTPS, and each user gets a subdomain (e.g. `alice.openclaw.example.com`) proxied to their OpenClaw instance automatically.
+
 ### Device Pairing
 
 - The **first device** connecting to each user's instance is auto-approved
@@ -150,7 +180,7 @@ The SSH public key provided during user creation is injected into the container,
 ### Firewall Configuration
 
 Ensure these ports are open:
-- `8080` - Management API
+- `47392` - Management API (or bind to localhost only when behind nginx)
 - `19001-19999` - User OpenClaw instances (gateway + SSH ports)
 
 ---
