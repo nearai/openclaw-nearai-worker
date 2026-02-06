@@ -12,11 +12,11 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod docker;
+mod compose;
 mod error;
 mod store;
 
-use docker::DockerManager;
+use compose::ComposeManager;
 use error::ApiError;
 use store::{User, UserStore};
 
@@ -24,7 +24,7 @@ const ADMIN_TOKEN_HEX_LEN: usize = 32;
 
 #[derive(Clone)]
 struct AppState {
-    docker: Arc<DockerManager>,
+    compose: Arc<ComposeManager>,
     store: Arc<RwLock<UserStore>>,
     config: AppConfig,
 }
@@ -35,7 +35,7 @@ struct AppConfig {
     host_address: String,
     openclaw_domain: Option<String>,  // Used for generating HTTPS URLs
     openclaw_image: String,
-    network_name: String,
+    compose_file: std::path::PathBuf,
 }
 
 /// Extractor that validates the admin token from the Authorization header
@@ -53,9 +53,14 @@ impl FromRequestParts<AppState> for AdminAuth {
 
         let token = auth_header
             .strip_prefix("Bearer ")
-            .ok_or_else(|| ApiError::Unauthorized("Invalid Authorization header format. Expected: Bearer <token>".into()))?;
+            .or_else(|| auth_header.strip_prefix("bearer "))
+            .ok_or_else(|| ApiError::Unauthorized("Invalid Authorization header format. Expected: Bearer <token>".into()))?
+            .trim();
 
-        if token != state.config.admin_token {
+        // Normalize to hex-only to ignore trailing newline/\r/null from env or header
+        let token_hex: String = token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        let expected_hex: String = state.config.admin_token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        if token_hex != expected_hex || token_hex.len() != 32 {
             return Err(ApiError::Unauthorized("Invalid admin token".into()));
         }
 
@@ -88,12 +93,14 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load and validate admin token
-    let admin_token = std::env::var("ADMIN_TOKEN")
-        .expect("ADMIN_TOKEN must be set");
+    // Load and validate admin token; normalize to hex-only (ignores trailing newline/\r from env)
+    let admin_token_raw = std::env::var("ADMIN_TOKEN").expect("ADMIN_TOKEN must be set");
+    let admin_token: String = admin_token_raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     validate_admin_token(&admin_token)?;
     
     // Load configuration from environment
+    let compose_file = std::env::var("COMPOSE_FILE")
+        .unwrap_or_else(|_| "/app/docker-compose.worker.yml".to_string());
     let config = AppConfig {
         admin_token,
         host_address: std::env::var("OPENCLAW_HOST_ADDRESS")
@@ -101,15 +108,15 @@ async fn main() -> anyhow::Result<()> {
         openclaw_domain: std::env::var("OPENCLAW_DOMAIN").ok(),
         openclaw_image: std::env::var("OPENCLAW_IMAGE")
             .unwrap_or_else(|_| "openclaw-nearai-worker:local".to_string()),
-        network_name: std::env::var("OPENCLAW_NETWORK")
-            .unwrap_or_else(|_| "openclaw-network".to_string()),
+        compose_file: std::path::PathBuf::from(compose_file),
     };
 
-    // Initialize Docker manager
-    let docker = Arc::new(DockerManager::new().await?);
-    
-    // Ensure network exists
-    docker.ensure_network(&config.network_name).await?;
+    // Initialize Compose manager (creates env dir, validates compose file)
+    let compose = Arc::new(ComposeManager::new(
+        config.compose_file.clone(),
+        std::path::PathBuf::from("data/envs"),
+        config.openclaw_image.clone(),
+    )?);
 
     // Load or create user store
     let store = Arc::new(RwLock::new(UserStore::load_or_create("data/users.json")?));
@@ -119,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = AppState {
-        docker,
+        compose,
         store,
         config,
     };
@@ -127,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
     // Build router
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/version", get(version))
         .route("/users", get(list_users))
         .route("/users", post(create_user))
         .route("/users/{user_id}", get(get_user))
@@ -149,6 +157,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+async fn version() -> &'static str {
+    "hex_norm_v1"
 }
 
 #[derive(Deserialize)]
@@ -217,30 +229,22 @@ async fn create_user(
         store.next_available_ports()
     };
 
-    // Create the container
-    let container_name = format!("openclaw-{}", user_id);
-    
-    state.docker.create_openclaw_container(
-        &container_name,
-        &state.config.openclaw_image,
+    // Spin up the worker compose project
+    state.compose.up(
+        &user_id,
         &req.nearai_api_key,
         &token,
         gateway_port,
         ssh_port,
         req.ssh_pubkey.as_deref(),
-        &state.config.network_name,
-    ).await?;
+    )?;
 
-    // Start the container
-    state.docker.start_container(&container_name).await?;
-
-    // Store user info (note: API key stored for potential container recreation)
+    // Store user info
     let user = User {
         user_id: user_id.clone(),
         token: token.clone(),
         gateway_port,
         ssh_port,
-        container_name: container_name.clone(),
         created_at: chrono::Utc::now(),
         ssh_pubkey: req.ssh_pubkey.clone(),
         nearai_api_key: req.nearai_api_key.clone(),
@@ -296,7 +300,7 @@ async fn get_user(
 
     match user {
         Some(user) => {
-            let status = state.docker.get_container_status(&user.container_name).await?;
+            let status = state.compose.status(&user.user_id)?;
             let (url, dashboard_url) = generate_urls(&state.config, &user.user_id, user.gateway_port, &user.token);
             let ssh_command = format!("ssh -p {} agent@{}", user.ssh_port, state.config.host_address);
             Ok(Json(UserResponse {
@@ -331,7 +335,7 @@ async fn list_users(
 
     let mut responses = Vec::new();
     for user in users {
-        let status = state.docker.get_container_status(&user.container_name).await
+        let status = state.compose.status(&user.user_id)
             .unwrap_or_else(|_| "unknown".to_string());
         let (url, dashboard_url) = generate_urls(&state.config, &user.user_id, user.gateway_port, &user.token);
         let ssh_command = format!("ssh -p {} agent@{}", user.ssh_port, state.config.host_address);
@@ -362,10 +366,9 @@ async fn delete_user(
     };
 
     match user {
-        Some(user) => {
-            // Stop and remove container
-            state.docker.stop_container(&user.container_name).await.ok();
-            state.docker.remove_container(&user.container_name).await?;
+        Some(_user) => {
+            // Tear down the compose project (removes containers + volumes)
+            state.compose.down(&user_id)?;
 
             // Remove from store
             {
@@ -391,8 +394,8 @@ async fn restart_user(
     };
 
     match user {
-        Some(user) => {
-            state.docker.restart_container(&user.container_name).await?;
+        Some(_user) => {
+            state.compose.restart(&user_id)?;
             tracing::info!("Restarted user container: {}", user_id);
             Ok(Json(serde_json::json!({"status": "restarted"})))
         }
@@ -411,8 +414,8 @@ async fn stop_user(
     };
 
     match user {
-        Some(user) => {
-            state.docker.stop_container(&user.container_name).await?;
+        Some(_user) => {
+            state.compose.stop(&user_id)?;
             tracing::info!("Stopped user container: {}", user_id);
             Ok(Json(serde_json::json!({"status": "stopped"})))
         }
@@ -431,8 +434,8 @@ async fn start_user(
     };
 
     match user {
-        Some(user) => {
-            state.docker.start_container(&user.container_name).await?;
+        Some(_user) => {
+            state.compose.start(&user_id)?;
             tracing::info!("Started user container: {}", user_id);
             Ok(Json(serde_json::json!({"status": "started"})))
         }

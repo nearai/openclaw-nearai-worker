@@ -20,7 +20,8 @@ set -eu -o pipefail
 #   ./deploy.sh [--build-only] [--no-start]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
 
 # Colors for output
 RED='\033[0;31m'
@@ -82,14 +83,14 @@ log_info "Pre-flight checks passed"
 # ============================================
 # Environment Configuration
 # ============================================
-ENV_FILE=".env.prod"
+ENV_FILE="deploy/.env.prod"
 
 if [ ! -f "$ENV_FILE" ]; then
   log_warn "Environment file $ENV_FILE not found"
   
-  if [ -f "env.prod.example" ]; then
+  if [ -f "deploy/env.prod.example" ]; then
     log_info "Creating $ENV_FILE from template..."
-    cp env.prod.example "$ENV_FILE"
+    cp deploy/env.prod.example "$ENV_FILE"
     log_warn "Please edit $ENV_FILE with your configuration before proceeding"
     log_warn "Required: OPENCLAW_HOST_ADDRESS (your server's public IP)"
     exit 1
@@ -126,13 +127,13 @@ log_info "ADMIN_TOKEN is configured (use with 'Authorization: Bearer \$ADMIN_TOK
 # Build OpenClaw Worker Image
 # ============================================
 log_info "Building OpenClaw worker image..."
-docker build -t openclaw-nearai-worker:local .
+docker build -t openclaw-nearai-worker:local ./worker
 
 # ============================================
-# Build Management API Image
+# Build Compose API Image
 # ============================================
-log_info "Building Management API image..."
-docker build -t openclaw-management-api:local ./management-api
+log_info "Building Compose API image..."
+docker build --build-arg CACHEBUST="$(date +%s)" -t openclaw-compose-api:local ./compose-api
 
 if [ "$BUILD_ONLY" -eq 1 ]; then
   log_info "Build complete (--build-only specified)"
@@ -140,22 +141,16 @@ if [ "$BUILD_ONLY" -eq 1 ]; then
 fi
 
 # ============================================
-# Create Required Directories
-# ============================================
-log_info "Creating required directories..."
-mkdir -p data
-
-# ============================================
 # Start Services
 # ============================================
 if [ "$NO_START" -eq 1 ]; then
   log_info "Services not started (--no-start specified)"
-  log_info "Run: docker compose -f docker-compose.simple.yml up -d"
+  log_info "Run: docker compose -f deploy/docker-compose.simple.yml --env-file deploy/.env.prod up -d"
   exit 0
 fi
 
 log_info "Starting services..."
-docker compose -f docker-compose.simple.yml --env-file "$ENV_FILE" up -d
+docker compose -f deploy/docker-compose.simple.yml --env-file "$ENV_FILE" up -d
 
 # ============================================
 # Wait for Services
@@ -163,20 +158,20 @@ docker compose -f docker-compose.simple.yml --env-file "$ENV_FILE" up -d
 log_info "Waiting for services to be ready..."
 sleep 5
 
-# Check Management API
-if docker ps --filter "name=openclaw-management-api" --format "{{.Status}}" | grep -q "Up"; then
-  log_info "Management API is running"
+# Check Compose API
+if docker ps --filter "name=openclaw-compose-api" --format "{{.Status}}" | grep -q "Up"; then
+  log_info "Compose API is running"
 else
-  log_warn "Management API may not be running correctly"
+  log_warn "Compose API may not be running correctly"
 fi
 
-# Test Management API health
+# Test Compose API health
 sleep 3
 LISTEN_PORT="${LISTEN_PORT:-47392}"
 if curl -s "http://localhost:$LISTEN_PORT/health" | grep -q "OK"; then
-  log_info "Management API health check passed"
+  log_info "Compose API health check passed"
 else
-  log_warn "Management API health check failed - service may still be starting"
+  log_warn "Compose API health check failed - service may still be starting"
 fi
 
 # ============================================
@@ -188,8 +183,8 @@ log_info "Deployment Complete!"
 log_info "============================================"
 echo ""
 echo "Services:"
-echo "  - Management API: http://localhost:$LISTEN_PORT"
-echo "  - Management API: http://$HOST_ADDRESS:$LISTEN_PORT (external)"
+echo "  - Compose API: http://localhost:$LISTEN_PORT"
+echo "  - Compose API: http://$HOST_ADDRESS:$LISTEN_PORT (external)"
 echo ""
 echo "Authentication:"
 echo "  All API requests require: Authorization: Bearer \$ADMIN_TOKEN"
@@ -238,4 +233,4 @@ echo "  - Ports are allocated in pairs starting at 19001 (gateway), 19002 (ssh)"
 echo ""
 log_info "Note: Ensure firewall allows ports $LISTEN_PORT and 19001-19999"
 log_info "Note: Each user gets 2 consecutive ports (gateway + SSH)"
-log_info "Note: Only the Management API has Docker socket access"
+log_info "Note: Only the Compose API has Docker socket access"

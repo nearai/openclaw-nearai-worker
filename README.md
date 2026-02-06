@@ -2,6 +2,14 @@
 
 AI Worker built with OpenClaw and NEAR AI Cloud API.
 
+## Repository layout
+
+| Directory | Purpose |
+|-----------|---------|
+| **worker/** | OpenClaw worker Docker image (Dockerfile, entrypoint, config template). Single-tenant runs use this. |
+| **compose-api/** | Multi-tenant Compose API (Rust/Axum). Spawns one Docker Compose project per user; requires Docker socket. |
+| **deploy/** | Deployment configs and scripts: compose files (single-tenant, multi-tenant, nginx/HTTPS), nginx template, env examples, `deploy.sh`, `build-image.sh`. |
+
 ## Features
 
 - **NEAR AI Cloud Integration**: Uses NEAR AI Cloud as the model provider
@@ -16,10 +24,10 @@ AI Worker built with OpenClaw and NEAR AI Cloud API.
 
 ### Environment Variables
 
-Create a `.env` file (copy from `env.example`):
+Create a `.env` file (copy from `worker/env.example`):
 
 ```bash
-cp env.example .env
+cp worker/env.example .env
 # Edit .env with your credentials
 ```
 
@@ -33,52 +41,54 @@ Optional variables:
 
 ### Running
 
+From the repo root:
+
 ```bash
-# Start the service (builds if needed)
-docker compose up -d
+# Start the service (builds worker image if needed)
+docker compose -f deploy/docker-compose.yml up -d
 
 # Or start in foreground to see logs:
-docker compose up
+docker compose -f deploy/docker-compose.yml up
 ```
 
 ### View Logs
 
 ```bash
-docker compose logs -f openclaw-gateway
+docker compose -f deploy/docker-compose.yml logs -f openclaw-gateway
 ```
 
 ---
 
 ## Multi-Tenant Deployment
 
-For deploying multiple isolated OpenClaw instances (one per user), use the multi-tenant setup with the Management API.
+For deploying multiple isolated OpenClaw instances (one per user), use the multi-tenant setup with the Compose API.
 
 ### Prerequisites
 
 - Docker and Docker Compose
 - NEAR AI Cloud API key
-- A server with Management API port (default 47392) and 19001-19999 (user instances) accessible; for HTTPS, nginx and certbot on the host
+- A server with Compose API port (default 47392) and 19001-19999 (user instances) accessible; for HTTPS, nginx and certbot on the host
 
 ### Setup
 
 1. **Configure environment:**
    ```bash
-   cp env.prod.example .env.prod
-   # Edit .env.prod:
+   cp deploy/env.prod.example deploy/.env.prod
+   # Edit deploy/.env.prod:
    # - OPENCLAW_HOST_ADDRESS (your server's public IP/hostname)
    # - ADMIN_TOKEN will be auto-generated if not set
    # Note: NEARAI_API_KEY is provided per-user in the create request
    ```
 
-2. **Deploy:**
+2. **Deploy** (from repo root):
    ```bash
-   chmod +x deploy.sh
-   ./deploy.sh
+   chmod +x deploy/deploy.sh
+   ./deploy/deploy.sh
    ```
 
-3. **Create users via Management API:**
+3. **Create users via Compose API:**
    ```bash
-   # Set your admin token (from .env.prod)
+   # Set your admin token (from deploy/.env.prod)
    export ADMIN_TOKEN="your-token-here"
    
    # Create a user (with their NEAR AI API key and optional SSH public key)
@@ -104,7 +114,7 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
    # }
    ```
 
-### Management API Authentication
+### Compose API Authentication
 
 All API endpoints (except `/health`) require authentication via Bearer token:
 ```bash
@@ -116,7 +126,7 @@ The `ADMIN_TOKEN` must be a 32-character hex string. Generate one with:
 openssl rand -hex 16
 ```
 
-### Management API Endpoints
+### Compose API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -165,22 +175,22 @@ Production HTTPS uses **nginx** on the host with **certbot** for Let’s Encrypt
    - A record: `openclaw.example.com` → your server IP.
    - A record: `*.openclaw.example.com` → your server IP.
 
-After this, the main domain serves the Management API over HTTPS, and each user gets a subdomain (e.g. `alice.openclaw.example.com`) proxied to their OpenClaw instance automatically.
+After this, the main domain serves the Compose API over HTTPS, and each user gets a subdomain (e.g. `alice.openclaw.example.com`) proxied to their OpenClaw instance automatically.
 
 ### Device Pairing
 
 - The **first device** connecting to each user's instance is auto-approved
 - Subsequent devices require manual approval via Telegram bot or CLI:
   ```bash
-  # Via container CLI
-  docker exec -u agent openclaw-<user_id> openclaw devices list
-  docker exec -u agent openclaw-<user_id> openclaw devices approve <request-id>
+  # Via container CLI (gateway container name is openclaw-<user_id>-gateway-1)
+  docker exec -u agent openclaw-<user_id>-gateway-1 openclaw devices list
+  docker exec -u agent openclaw-<user_id>-gateway-1 openclaw devices approve <request-id>
   ```
 
 ### Firewall Configuration
 
 Ensure these ports are open:
-- `47392` - Management API (or bind to localhost only when behind nginx)
+- `47392` - Compose API (or bind to localhost only when behind nginx)
 - `19001-19999` - User OpenClaw instances (gateway + SSH ports)
 
 ---
@@ -188,11 +198,11 @@ Ensure these ports are open:
 ### Testing
 
 ```bash
-# Check configuration
-docker compose exec openclaw-gateway openclaw doctor
+# Check configuration (single-tenant: use deploy/docker-compose.yml)
+docker compose -f deploy/docker-compose.yml exec openclaw-gateway openclaw doctor
 
 # List available models
-docker compose exec openclaw-gateway openclaw models list
+docker compose -f deploy/docker-compose.yml exec openclaw-gateway openclaw models list
 ```
 
 ## Configuration
@@ -227,22 +237,22 @@ To update the configuration after changing environment variables, you have three
 
 1. **Force regeneration** (recommended): Set `OPENCLAW_FORCE_CONFIG_REGEN=1` and restart the container:
    ```bash
-   # In docker compose.yml, add to environment:
+   # In deploy/docker-compose.yml, add to environment:
    OPENCLAW_FORCE_CONFIG_REGEN: "1"
    
    # Or when running:
-   docker compose run -e OPENCLAW_FORCE_CONFIG_REGEN=1 openclaw-gateway
+   docker compose -f deploy/docker-compose.yml run -e OPENCLAW_FORCE_CONFIG_REGEN=1 openclaw-gateway
    ```
 
 2. **Delete and regenerate**: Remove the config file and restart:
    ```bash
-   docker compose exec openclaw-gateway rm /home/agent/.openclaw/openclaw.json
-   docker compose restart openclaw-gateway
+   docker compose -f deploy/docker-compose.yml exec openclaw-gateway rm /home/agent/.openclaw/openclaw.json
+   docker compose -f deploy/docker-compose.yml restart openclaw-gateway
    ```
 
 3. **Manual edit**: Edit the config file directly:
    ```bash
-   docker compose exec openclaw-gateway vi /home/agent/.openclaw/openclaw.json
+   docker compose -f deploy/docker-compose.yml exec openclaw-gateway vi /home/agent/.openclaw/openclaw.json
    ```
 
 ### Customizing Configuration
@@ -281,13 +291,13 @@ The gateway bind setting controls which network interfaces the gateway listens o
 ### Check Container Status
 
 ```bash
-docker compose ps
+docker compose -f deploy/docker-compose.yml ps
 ```
 
 ### View Logs
 
 ```bash
-docker compose logs -f openclaw-gateway
+docker compose -f deploy/docker-compose.yml logs -f openclaw-gateway
 ```
 
 ⚠️ **Security Note**: Container logs may contain sensitive information. Ensure logs are properly secured and not exposed publicly.
@@ -295,13 +305,13 @@ docker compose logs -f openclaw-gateway
 ### Verify Configuration
 
 ```bash
-docker compose exec openclaw-gateway openclaw doctor
+docker compose -f deploy/docker-compose.yml exec openclaw-gateway openclaw doctor
 ```
 
 ### List Models
 
 ```bash
-docker compose exec openclaw-gateway openclaw models list
+docker compose -f deploy/docker-compose.yml exec openclaw-gateway openclaw models list
 ```
 
 ### Security Best Practices
@@ -315,14 +325,21 @@ docker compose exec openclaw-gateway openclaw models list
 
 ## Common Commands (docker compose)
 
-- `docker build -t openclaw-nearai-worker:latest -f Dockerfile .` - Build the Docker image
-- `docker compose up -d` - Start the service
-- `docker compose down` - Stop the service
-- `docker compose logs -f openclaw-gateway` - View logs
-- `docker compose exec openclaw-gateway openclaw doctor` - Test configuration
-- `docker compose exec openclaw-gateway openclaw models list` - List available models
-- `docker compose exec openclaw-gateway /bin/bash` - Open shell in container
-- `docker compose down -v` - Remove containers and volumes
+All from repo root. Single-tenant (one worker):
+
+- `docker build -t openclaw-nearai-worker:latest ./worker` - Build the worker image
+- `docker compose -f deploy/docker-compose.yml up -d` - Start the service
+- `docker compose -f deploy/docker-compose.yml down` - Stop the service
+- `docker compose -f deploy/docker-compose.yml logs -f openclaw-gateway` - View logs
+- `docker compose -f deploy/docker-compose.yml exec openclaw-gateway openclaw doctor` - Test configuration
+- `docker compose -f deploy/docker-compose.yml exec openclaw-gateway openclaw models list` - List available models
+- `docker compose -f deploy/docker-compose.yml exec openclaw-gateway /bin/bash` - Open shell in container
+- `docker compose -f deploy/docker-compose.yml down -v` - Remove containers and volumes
+
+Multi-tenant (Compose API + per-user workers):
+
+- `cd compose-api && ./build-local.sh` - Build Compose API image (or `docker build --build-arg CACHEBUST=$(date +%s) -t openclaw-compose-api:local .`)
+- `docker compose -f deploy/docker-compose.simple.yml --env-file deploy/.env.prod up -d` - Start Compose API
 
 ## Commands (CVM)
 

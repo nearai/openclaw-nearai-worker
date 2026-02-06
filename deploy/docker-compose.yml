@@ -1,6 +1,6 @@
 services:
   openclaw-gateway:
-    build: .
+    build: ../worker
     image: openclaw-nearai-worker:local
     environment:
       HOME: /home/agent

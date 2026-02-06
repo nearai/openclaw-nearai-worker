@@ -17,7 +17,6 @@ pub struct User {
     pub token: String,
     pub gateway_port: u16,
     pub ssh_port: u16,
-    pub container_name: String,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub ssh_pubkey: Option<String>,

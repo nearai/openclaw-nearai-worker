@@ -1,0 +1,36 @@
+# Per-user worker template. Used with:
+#   docker compose -p openclaw-{user_id} -f docker-compose.worker.yml --env-file .../envs/{user_id}.env up -d
+# Env file must set: NEARAI_API_KEY, OPENCLAW_GATEWAY_TOKEN, GATEWAY_PORT, SSH_PORT, OPENCLAW_IMAGE (optional).
+
+services:
+  gateway:
+    image: ${OPENCLAW_IMAGE:-openclaw-nearai-worker:local}
+    environment:
+      HOME: /home/agent
+      TERM: xterm-256color
+      NEARAI_API_KEY: ${NEARAI_API_KEY}
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
+      OPENCLAW_FORCE_CONFIG_REGEN: ${OPENCLAW_FORCE_CONFIG_REGEN:-1}
+      OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
+      OPENCLAW_AUTO_APPROVE_DEVICES: ${OPENCLAW_AUTO_APPROVE_DEVICES:-1}
+      SSH_PUBKEY: ${SSH_PUBKEY:-}
+    volumes:
+      - config:/home/agent/.openclaw
+      - workspace:/home/agent/openclaw
+    ports:
+      - "${GATEWAY_PORT}:18789"
+      - "${SSH_PORT}:2222"
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:18789/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    command:
+      ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789", "--verbose"]
+
+volumes:
+  config:
+  workspace:

@@ -57,7 +57,7 @@ jobs:
 
       - name: Build and push reproducible image
         run: |
-          ./build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
+          ./deploy/build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
 
       - name: Get image digest
         run: |
