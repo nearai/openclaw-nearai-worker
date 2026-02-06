@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+!.env.dstack.example
 !env.prod.example
 .build/
 *.log

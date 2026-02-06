@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
@@ -13,10 +14,13 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod compose;
+mod dns;
 mod error;
+mod nginx_conf;
 mod store;
 
 use compose::ComposeManager;
+use dns::CloudflareDns;
 use error::ApiError;
 use store::{User, UserStore};
 
@@ -27,6 +31,7 @@ struct AppState {
     compose: Arc<ComposeManager>,
     store: Arc<RwLock<UserStore>>,
     config: AppConfig,
+    dns: Option<Arc<CloudflareDns>>,
 }
 
 #[derive(Clone)]
@@ -36,6 +41,9 @@ struct AppConfig {
     openclaw_domain: Option<String>,  // Used for generating HTTPS URLs
     openclaw_image: String,
     compose_file: std::path::PathBuf,
+    dstack_app_id: Option<String>,
+    nginx_map_path: PathBuf,
+    ingress_container_name: String,
 }
 
 /// Extractor that validates the admin token from the Authorization header
@@ -101,6 +109,13 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration from environment
     let compose_file = std::env::var("COMPOSE_FILE")
         .unwrap_or_else(|_| "/app/docker-compose.worker.yml".to_string());
+
+    // Fetch APP_ID from dstack.sock if available
+    let dstack_app_id = fetch_dstack_app_id().await;
+    if let Some(ref app_id) = dstack_app_id {
+        tracing::info!("dstack APP_ID: {}", app_id);
+    }
+
     let config = AppConfig {
         admin_token,
         host_address: std::env::var("OPENCLAW_HOST_ADDRESS")
@@ -109,6 +124,27 @@ async fn main() -> anyhow::Result<()> {
         openclaw_image: std::env::var("OPENCLAW_IMAGE")
             .unwrap_or_else(|_| "openclaw-nearai-worker:local".to_string()),
         compose_file: std::path::PathBuf::from(compose_file),
+        dstack_app_id,
+        nginx_map_path: PathBuf::from(
+            std::env::var("NGINX_MAP_PATH").unwrap_or_else(|_| "/data/nginx/backends.map".to_string()),
+        ),
+        ingress_container_name: std::env::var("INGRESS_CONTAINER_NAME")
+            .unwrap_or_else(|_| "dstack-ingress".to_string()),
+    };
+
+    // Initialize Cloudflare DNS client if configured
+    let dns = match (
+        std::env::var("CLOUDFLARE_API_TOKEN").ok(),
+        std::env::var("CLOUDFLARE_ZONE_ID").ok(),
+    ) {
+        (Some(token), Some(zone_id)) => {
+            tracing::info!("Cloudflare DNS client initialized");
+            Some(Arc::new(CloudflareDns::new(&token, &zone_id)))
+        }
+        _ => {
+            tracing::info!("Cloudflare DNS not configured (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ZONE_ID not set)");
+            None
+        }
     };
 
     // Initialize Compose manager (creates env dir, validates compose file)
@@ -129,7 +165,16 @@ async fn main() -> anyhow::Result<()> {
         compose,
         store,
         config,
+        dns,
     };
+
+    // Spawn background sync loop for nginx map + DNS reconciliation
+    if state.config.openclaw_domain.is_some() {
+        let sync_state = state.clone();
+        tokio::spawn(async move {
+            background_sync_loop(sync_state).await;
+        });
+    }
 
     // Build router
     let app = Router::new()
@@ -255,6 +300,15 @@ async fn create_user(
         store.add(user)?;
     }
 
+    // Create DNS TXT record immediately so routing works right away
+    if let (Some(ref dns), Some(ref domain), Some(ref app_id)) =
+        (&state.dns, &state.config.openclaw_domain, &state.config.dstack_app_id)
+    {
+        if let Err(e) = dns.ensure_txt_record(&user_id, domain, app_id, 443).await {
+            tracing::warn!("Failed to create DNS record for {}: {}", user_id, e);
+        }
+    }
+
     tracing::info!("Created user container: {} (gateway:{}, ssh:{})", user_id, gateway_port, ssh_port);
 
     let (url, dashboard_url) = generate_urls(&state.config, &user_id, gateway_port, &token);
@@ -370,6 +424,15 @@ async fn delete_user(
             // Tear down the compose project (removes containers + volumes)
             state.compose.down(&user_id)?;
 
+            // Delete DNS TXT record immediately
+            if let (Some(ref dns), Some(ref domain)) =
+                (&state.dns, &state.config.openclaw_domain)
+            {
+                if let Err(e) = dns.delete_txt_record(&user_id, domain).await {
+                    tracing::warn!("Failed to delete DNS record for {}: {}", user_id, e);
+                }
+            }
+
             // Remove from store
             {
                 let mut store = state.store.write().await;
@@ -448,4 +511,87 @@ fn generate_token() -> String {
     let mut rng = rand::rng();
     let bytes: [u8; 32] = rng.random();
     hex::encode(bytes)
+}
+
+/// Fetches the APP_ID from dstack.sock (GET http://localhost/Info via unix socket).
+/// Returns None if dstack.sock is not available.
+async fn fetch_dstack_app_id() -> Option<String> {
+    let sock_path = "/var/run/dstack.sock";
+    if !std::path::Path::new(sock_path).exists() {
+        tracing::info!("dstack.sock not found, skipping APP_ID fetch");
+        return None;
+    }
+
+    // Shell out to curl for simplicity — avoids pulling in hyper unix socket deps
+    let output = std::process::Command::new("curl")
+        .args(["--unix-socket", sock_path, "-s", "http://localhost/Info"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let body = String::from_utf8_lossy(&o.stdout);
+            // Parse JSON and extract app_id
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(app_id) = v.get("app_id").and_then(|v| v.as_str()) {
+                    return Some(app_id.to_string());
+                }
+            }
+            tracing::warn!("dstack /Info response missing app_id: {}", body);
+            None
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!("Failed to fetch dstack APP_ID: {}", stderr);
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Failed to run curl for dstack APP_ID: {}", e);
+            None
+        }
+    }
+}
+
+/// Background loop that syncs the nginx backends map and DNS TXT records.
+async fn background_sync_loop(state: AppState) {
+    let domain = match &state.config.openclaw_domain {
+        Some(d) => d.clone(),
+        None => return,
+    };
+
+    let mut dns_tick: u32 = 0;
+    const DNS_SYNC_INTERVAL: u32 = 12; // Every 12 * 5s = 60s
+
+    tracing::info!("Background sync loop started (domain: {})", domain);
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        // Read current users
+        let users = {
+            let store = state.store.read().await;
+            store.list()
+        };
+
+        // Update nginx backends map
+        let changed = nginx_conf::write_backends_map(
+            &users,
+            &domain,
+            &state.config.nginx_map_path,
+        );
+        if changed {
+            nginx_conf::reload_nginx(&state.config.ingress_container_name);
+        }
+
+        // Periodically sync DNS records
+        dns_tick += 1;
+        if dns_tick >= DNS_SYNC_INTERVAL {
+            dns_tick = 0;
+            if let (Some(ref dns), Some(ref app_id)) = (&state.dns, &state.config.dstack_app_id) {
+                let user_ids: Vec<String> = users.iter().map(|u| u.user_id.clone()).collect();
+                if let Err(e) = dns.sync_all_records(&user_ids, &domain, app_id, 443).await {
+                    tracing::warn!("DNS sync failed: {}", e);
+                }
+            }
+        }
+    }
 }
