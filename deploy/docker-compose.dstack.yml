@@ -1,4 +1,11 @@
 services:
+  cert-init:
+    image: alpine:3
+    volumes:
+      - cert-data:/etc/letsencrypt
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /etc/letsencrypt/live && ln -sfn ${OPENCLAW_DOMAIN} '/etc/letsencrypt/live/*.${OPENCLAW_DOMAIN}'"]
+    restart: "no"
+
   dstack-ingress:
     image: dstacktee/dstack-ingress:20250929
     container_name: dstack-ingress
@@ -17,10 +24,14 @@ services:
     configs:
       - source: openclaw_nginx
         target: /etc/nginx/conf.d/openclaw.conf
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   compose-api:
     image: openclaw-compose-api:local
+    network_mode: host
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/run/dstack.sock:/var/run/dstack.sock
@@ -61,6 +72,22 @@ configs:
               proxy_http_version 1.1;
               proxy_set_header Upgrade $$http_upgrade;
               proxy_set_header Connection "upgrade";
+              proxy_set_header Host $$host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $$scheme;
+          }
+      }
+
+      server {
+          listen 443 ssl;
+          server_name api.${OPENCLAW_DOMAIN};
+
+          ssl_certificate /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/privkey.pem;
+
+          location / {
+              proxy_pass http://127.0.0.1:8080;
               proxy_set_header Host $$host;
               proxy_set_header X-Real-IP $$remote_addr;
               proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;

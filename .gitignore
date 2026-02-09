@@ -12,3 +12,6 @@ compose-api/target/
 
 # Runtime data
 compose-api/data/
+
+# Reference repos
+dstack/

@@ -256,6 +256,11 @@ async fn create_user(
         return Err(ApiError::BadRequest("Invalid user_id: must be 1-32 alphanumeric characters".into()));
     }
 
+    const RESERVED_SUBDOMAINS: &[&str] = &["api", "www", "mail", "admin", "gateway"];
+    if RESERVED_SUBDOMAINS.contains(&user_id.as_str()) {
+        return Err(ApiError::BadRequest(format!("'{}' is a reserved name", user_id)));
+    }
+
     if req.nearai_api_key.is_empty() {
         return Err(ApiError::BadRequest("nearai_api_key is required".into()));
     }

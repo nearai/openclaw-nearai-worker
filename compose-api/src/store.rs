@@ -6,6 +6,10 @@ use std::path::Path;
 
 use crate::error::ApiError;
 
+fn default_active() -> bool {
+    true
+}
+
 const BASE_PORT: u16 = 19001;
 const MAX_PORT: u16 = 19999;
 // Each user gets 2 consecutive ports: gateway_port and gateway_port+1 (SSH)
@@ -24,6 +28,7 @@ pub struct User {
     #[serde(default)]
     pub nearai_api_key: String,
     /// Whether the instance is currently active (running).
+    #[serde(default = "default_active")]
     pub active: bool,
 }
 
