@@ -17,6 +17,8 @@ use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use utoipa::OpenApi;
+use utoipa_scalar::{Scalar, Servable};
 
 mod compose;
 mod dns;
@@ -29,6 +31,55 @@ use compose::ComposeManager;
 use dns::CloudflareDns;
 use error::ApiError;
 use store::{Instance, InstanceStore};
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "OpenClaw Instance Management API",
+        description = "Multi-tenant management API for OpenClaw NEAR AI worker instances.\n\nAll `/instances` endpoints require a Bearer token via the `Authorization` header.\n\nLifecycle operations (create, start, stop, restart) return Server-Sent Event (SSE) streams with real-time progress updates.",
+        version = "1.0.0",
+    ),
+    paths(
+        health_check,
+        version,
+        list_instances,
+        create_instance,
+        get_instance,
+        delete_instance,
+        restart_instance,
+        stop_instance,
+        start_instance,
+        instance_events,
+    ),
+    components(schemas(
+        CreateInstanceRequest,
+        InstanceInfo,
+        InstanceResponse,
+        InstancesListResponse,
+        SseEvent,
+        ErrorResponse,
+    )),
+    security(("bearer_auth" = [])),
+    modifiers(&SecurityAddon),
+)]
+struct ApiDoc;
+
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer_auth",
+                utoipa::openapi::security::SecurityScheme::Http(
+                    utoipa::openapi::security::Http::new(
+                        utoipa::openapi::security::HttpAuthScheme::Bearer,
+                    ),
+                ),
+            );
+        }
+    }
+}
 
 const ADMIN_TOKEN_HEX_LEN: usize = 32;
 
@@ -196,7 +247,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/{name}/events", get(instance_events))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state)
+        .merge(Scalar::with_url("/docs", ApiDoc::openapi()));
 
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -207,26 +259,35 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[utoipa::path(get, path = "/health", tag = "System",
+    responses((status = 200, description = "Service is healthy", body = String))
+)]
 async fn health_check() -> &'static str {
     "OK"
 }
 
+#[utoipa::path(get, path = "/version", tag = "System",
+    responses((status = 200, description = "API version string", body = String))
+)]
 async fn version() -> &'static str {
     "instance_v1"
 }
 
 // ── Request / Response types ─────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct CreateInstanceRequest {
+    /// NEAR AI API key for the instance
     nearai_api_key: String,
+    /// Optional SSH public key for direct SSH access
     #[serde(default)]
     ssh_pubkey: Option<String>,
+    /// Optional instance name (auto-generated if omitted, 1-32 alphanumeric/hyphen chars)
     #[serde(default)]
     name: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct InstanceInfo {
     name: String,
     token: String,
@@ -237,7 +298,7 @@ struct InstanceInfo {
     ssh_command: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct InstanceResponse {
     name: String,
     token: String,
@@ -250,9 +311,28 @@ struct InstanceResponse {
     created_at: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct InstancesListResponse {
     instances: Vec<InstanceResponse>,
+}
+
+/// SSE event payload for lifecycle streaming responses
+#[derive(Serialize, utoipa::ToSchema)]
+struct SseEvent {
+    /// Current stage (e.g. "created", "container_starting", "healthy", "ready", "error")
+    stage: String,
+    /// Human-readable description of the current stage
+    message: String,
+    /// Instance info (only present in "created" stage)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance: Option<InstanceInfo>,
+}
+
+/// Error response body
+#[derive(Serialize, utoipa::ToSchema)]
+struct ErrorResponse {
+    /// Error message
+    error: String,
 }
 
 /// Generate URL and dashboard_url based on config
@@ -363,6 +443,16 @@ async fn poll_health_to_ready(
 
 // ── Handlers ─────────────────────────────────────────────────────────
 
+#[utoipa::path(post, path = "/instances", tag = "Instances",
+    request_body = CreateInstanceRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "SSE stream of lifecycle events", content_type = "text/event-stream", body = SseEvent),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 409, description = "Instance name already exists", body = ErrorResponse),
+    )
+)]
 async fn create_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -479,6 +569,15 @@ async fn create_instance(
     Ok(unbuffered_sse(stream))
 }
 
+#[utoipa::path(get, path = "/instances/{name}", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Instance details", body = InstanceResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+    )
+)]
 async fn get_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -510,6 +609,13 @@ async fn get_instance(
     }
 }
 
+#[utoipa::path(get, path = "/instances", tag = "Instances",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "List of all instances", body = InstancesListResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
 async fn list_instances(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -541,6 +647,15 @@ async fn list_instances(
     Ok(Json(InstancesListResponse { instances: responses }))
 }
 
+#[utoipa::path(delete, path = "/instances/{name}", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Instance deleted"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+    )
+)]
 async fn delete_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -574,6 +689,15 @@ async fn delete_instance(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(post, path = "/instances/{name}/restart", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "SSE stream of restart progress", content_type = "text/event-stream", body = SseEvent),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+    )
+)]
 async fn restart_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -609,6 +733,15 @@ async fn restart_instance(
     Ok(unbuffered_sse(stream))
 }
 
+#[utoipa::path(post, path = "/instances/{name}/stop", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "SSE stream of stop progress", content_type = "text/event-stream", body = SseEvent),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+    )
+)]
 async fn stop_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -645,6 +778,15 @@ async fn stop_instance(
     Ok(unbuffered_sse(stream))
 }
 
+#[utoipa::path(post, path = "/instances/{name}/start", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "SSE stream of start progress", content_type = "text/event-stream", body = SseEvent),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+    )
+)]
 async fn start_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -692,6 +834,15 @@ async fn start_instance(
     Ok(unbuffered_sse(stream))
 }
 
+#[utoipa::path(get, path = "/instances/{name}/events", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "SSE stream of container health events", content_type = "text/event-stream", body = SseEvent),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+    )
+)]
 async fn instance_events(
     _auth: AdminAuth,
     State(state): State<AppState>,

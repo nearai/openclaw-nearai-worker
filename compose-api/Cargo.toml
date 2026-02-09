@@ -30,6 +30,10 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 async-stream = "0.3"
 
+# OpenAPI docs
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
 # Logging
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
