@@ -168,6 +168,9 @@ async fn main() -> anyhow::Result<()> {
         dns,
     };
 
+    // Write initial nginx map at startup so pre-existing users are routable immediately
+    update_nginx_now(&state).await;
+
     // Spawn background sync loop for nginx map + DNS reconciliation
     if state.config.openclaw_domain.is_some() {
         let sync_state = state.clone();
@@ -293,12 +296,16 @@ async fn create_user(
         created_at: chrono::Utc::now(),
         ssh_pubkey: req.ssh_pubkey.clone(),
         nearai_api_key: req.nearai_api_key.clone(),
+        active: true,
     };
 
     {
         let mut store = state.store.write().await;
         store.add(user)?;
     }
+
+    // Update nginx map immediately so the instance is routable right away
+    update_nginx_now(&state).await;
 
     // Create DNS TXT record immediately so routing works right away
     if let (Some(ref dns), Some(ref domain), Some(ref app_id)) =
@@ -439,6 +446,9 @@ async fn delete_user(
                 store.remove(&user_id)?;
             }
 
+            // Update nginx map immediately to stop routing to deleted instance
+            update_nginx_now(&state).await;
+
             tracing::info!("Deleted user container: {}", user_id);
             Ok(StatusCode::NO_CONTENT)
         }
@@ -479,6 +489,11 @@ async fn stop_user(
     match user {
         Some(_user) => {
             state.compose.stop(&user_id)?;
+            {
+                let mut store = state.store.write().await;
+                store.set_active(&user_id, false)?;
+            }
+            update_nginx_now(&state).await;
             tracing::info!("Stopped user container: {}", user_id);
             Ok(Json(serde_json::json!({"status": "stopped"})))
         }
@@ -499,10 +514,29 @@ async fn start_user(
     match user {
         Some(_user) => {
             state.compose.start(&user_id)?;
+            {
+                let mut store = state.store.write().await;
+                store.set_active(&user_id, true)?;
+            }
+            update_nginx_now(&state).await;
             tracing::info!("Started user container: {}", user_id);
             Ok(Json(serde_json::json!({"status": "started"})))
         }
         None => Err(ApiError::NotFound(format!("User {} not found", user_id))),
+    }
+}
+
+/// Immediately write the nginx backends map and reload if changed.
+async fn update_nginx_now(state: &AppState) {
+    if let Some(ref domain) = state.config.openclaw_domain {
+        let users = {
+            let store = state.store.read().await;
+            store.list()
+        };
+        let changed = nginx_conf::write_backends_map(&users, domain, &state.config.nginx_map_path);
+        if changed {
+            nginx_conf::reload_nginx(&state.config.ingress_container_name);
+        }
     }
 }
 

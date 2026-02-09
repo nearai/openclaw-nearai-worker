@@ -13,6 +13,7 @@ use crate::store::User;
 pub fn write_backends_map(users: &[User], domain: &str, map_path: &Path) -> bool {
     let mut lines: Vec<String> = users
         .iter()
+        .filter(|u| u.active)
         .map(|u| {
             format!(
                 "{}.{} http://127.0.0.1:{};",

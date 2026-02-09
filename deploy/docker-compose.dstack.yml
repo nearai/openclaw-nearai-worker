@@ -1,10 +1,14 @@
 services:
   dstack-ingress:
     image: dstacktee/dstack-ingress:20250929
+    container_name: dstack-ingress
     network_mode: host
     environment:
       - DOMAINS=*.${OPENCLAW_DOMAIN}
       - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+      - DNS_PROVIDER=cloudflare
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - /var/run/tappd.sock:/var/run/tappd.sock
@@ -45,6 +49,7 @@ configs:
       }
 
       server {
+          listen 80 default_server;
           listen 443 ssl;
           server_name *.${OPENCLAW_DOMAIN};
 

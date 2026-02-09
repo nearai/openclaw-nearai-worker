@@ -23,6 +23,8 @@ pub struct User {
     /// User's NEAR AI API key (stored for container recreation)
     #[serde(default)]
     pub nearai_api_key: String,
+    /// Whether the instance is currently active (running).
+    pub active: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,6 +81,15 @@ impl UserStore {
 
     pub fn get(&self, user_id: &str) -> Option<&User> {
         self.users.get(user_id)
+    }
+
+    pub fn set_active(&mut self, user_id: &str, active: bool) -> Result<(), ApiError> {
+        if let Some(user) = self.users.get_mut(user_id) {
+            user.active = active;
+            self.save()
+        } else {
+            Err(ApiError::NotFound(format!("User {} not found", user_id)))
+        }
     }
 
     pub fn list(&self) -> Vec<User> {

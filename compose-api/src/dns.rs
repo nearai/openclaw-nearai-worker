@@ -159,8 +159,12 @@ impl CloudflareDns {
             }
         }
 
-        // Remove orphaned records
+        // Remove orphaned records (skip wildcard record managed by dstack-ingress)
+        let wildcard_name = format!("_dstack-app-address.*.{}", domain);
         for record in &existing_records {
+            if record.name == wildcard_name {
+                continue;
+            }
             if !desired.contains(&record.name) {
                 tracing::info!("Removing orphaned DNS record: {}", record.name);
                 let resp = self
