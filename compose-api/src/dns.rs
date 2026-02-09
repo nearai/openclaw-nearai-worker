@@ -45,15 +45,15 @@ impl CloudflareDns {
         }
     }
 
-    /// Creates or updates a TXT record: `_dstack-app-address.{user_id}.{domain}` → `{app_id}:{port}`
+    /// Creates or updates a TXT record: `_dstack-app-address.{name}.{domain}` → `{app_id}:{port}`
     pub async fn ensure_txt_record(
         &self,
-        user_id: &str,
+        name: &str,
         domain: &str,
         app_id: &str,
         port: u16,
     ) -> anyhow::Result<()> {
-        let record_name = format!("_dstack-app-address.{}.{}", user_id, domain);
+        let record_name = format!("_dstack-app-address.{}.{}", name, domain);
         let content = format!("{}:{}", app_id, port);
 
         // Check if record already exists
@@ -103,9 +103,9 @@ impl CloudflareDns {
         Ok(())
     }
 
-    /// Deletes the TXT record for a user.
-    pub async fn delete_txt_record(&self, user_id: &str, domain: &str) -> anyhow::Result<()> {
-        let record_name = format!("_dstack-app-address.{}.{}", user_id, domain);
+    /// Deletes the TXT record for an instance.
+    pub async fn delete_txt_record(&self, name: &str, domain: &str) -> anyhow::Result<()> {
+        let record_name = format!("_dstack-app-address.{}.{}", name, domain);
 
         if let Some(record_id) = self.find_txt_record(&record_name).await? {
             let resp = self
@@ -130,7 +130,7 @@ impl CloudflareDns {
     /// Syncs all TXT records: creates missing ones, removes orphaned ones.
     pub async fn sync_all_records(
         &self,
-        user_ids: &[String],
+        names: &[String],
         domain: &str,
         app_id: &str,
         port: u16,
@@ -141,28 +141,29 @@ impl CloudflareDns {
         // List all existing _dstack-app-address.*.domain TXT records
         let existing_records = self.list_txt_records(&prefix, &suffix).await?;
 
-        let desired: HashSet<String> = user_ids
+        let desired: HashSet<String> = names
             .iter()
-            .map(|uid| format!("_dstack-app-address.{}.{}", uid, domain))
+            .map(|n| format!("_dstack-app-address.{}.{}", n, domain))
             .collect();
 
         let existing_names: HashSet<String> =
             existing_records.iter().map(|r| r.name.clone()).collect();
 
         // Create missing records
-        for uid in user_ids {
-            let name = format!("_dstack-app-address.{}.{}", uid, domain);
-            if !existing_names.contains(&name) {
-                if let Err(e) = self.ensure_txt_record(uid, domain, app_id, port).await {
-                    tracing::warn!("Failed to create DNS record for {}: {}", uid, e);
+        for n in names {
+            let record_name = format!("_dstack-app-address.{}.{}", n, domain);
+            if !existing_names.contains(&record_name) {
+                if let Err(e) = self.ensure_txt_record(n, domain, app_id, port).await {
+                    tracing::warn!("Failed to create DNS record for {}: {}", n, e);
                 }
             }
         }
 
-        // Remove orphaned records (skip wildcard record managed by dstack-ingress)
+        // Remove orphaned records (skip wildcard + api records not managed by us)
         let wildcard_name = format!("_dstack-app-address.*.{}", domain);
+        let api_name = format!("_dstack-app-address.api.{}", domain);
         for record in &existing_records {
-            if record.name == wildcard_name {
+            if record.name == wildcard_name || record.name == api_name {
                 continue;
             }
             if !desired.contains(&record.name) {

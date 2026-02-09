@@ -1,11 +1,16 @@
 use axum::{
     extract::{FromRequestParts, Path, State},
     http::{request::Parts, StatusCode},
-    response::IntoResponse,
+    response::{
+        sse::{Event, Sse},
+        IntoResponse,
+    },
     routing::{delete, get, post},
     Json, Router,
 };
+use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -16,20 +21,21 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod compose;
 mod dns;
 mod error;
+mod names;
 mod nginx_conf;
 mod store;
 
 use compose::ComposeManager;
 use dns::CloudflareDns;
 use error::ApiError;
-use store::{User, UserStore};
+use store::{Instance, InstanceStore};
 
 const ADMIN_TOKEN_HEX_LEN: usize = 32;
 
 #[derive(Clone)]
 struct AppState {
     compose: Arc<ComposeManager>,
-    store: Arc<RwLock<UserStore>>,
+    store: Arc<RwLock<InstanceStore>>,
     config: AppConfig,
     dns: Option<Arc<CloudflareDns>>,
 }
@@ -38,7 +44,7 @@ struct AppState {
 struct AppConfig {
     admin_token: String,
     host_address: String,
-    openclaw_domain: Option<String>,  // Used for generating HTTPS URLs
+    openclaw_domain: Option<String>,
     openclaw_image: String,
     compose_file: std::path::PathBuf,
     dstack_app_id: Option<String>,
@@ -65,7 +71,6 @@ impl FromRequestParts<AppState> for AdminAuth {
             .ok_or_else(|| ApiError::Unauthorized("Invalid Authorization header format. Expected: Bearer <token>".into()))?
             .trim();
 
-        // Normalize to hex-only to ignore trailing newline/\r/null from env or header
         let token_hex: String = token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
         let expected_hex: String = state.config.admin_token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
         if token_hex != expected_hex || token_hex.len() != 32 {
@@ -77,7 +82,6 @@ impl FromRequestParts<AppState> for AdminAuth {
 }
 
 fn validate_admin_token(token: &str) -> anyhow::Result<()> {
-    // Token should be 32 hex characters (16 bytes)
     if token.len() != ADMIN_TOKEN_HEX_LEN {
         anyhow::bail!(
             "ADMIN_TOKEN must be exactly {} hex characters, got {} characters",
@@ -93,7 +97,6 @@ fn validate_admin_token(token: &str) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -101,16 +104,13 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load and validate admin token; normalize to hex-only (ignores trailing newline/\r from env)
     let admin_token_raw = std::env::var("ADMIN_TOKEN").expect("ADMIN_TOKEN must be set");
     let admin_token: String = admin_token_raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     validate_admin_token(&admin_token)?;
-    
-    // Load configuration from environment
+
     let compose_file = std::env::var("COMPOSE_FILE")
         .unwrap_or_else(|_| "/app/docker-compose.worker.yml".to_string());
 
-    // Fetch APP_ID from dstack.sock if available
     let dstack_app_id = fetch_dstack_app_id().await;
     if let Some(ref app_id) = dstack_app_id {
         tracing::info!("dstack APP_ID: {}", app_id);
@@ -132,7 +132,6 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "dstack-ingress".to_string()),
     };
 
-    // Initialize Cloudflare DNS client if configured
     let dns = match (
         std::env::var("CLOUDFLARE_API_TOKEN").ok(),
         std::env::var("CLOUDFLARE_ZONE_ID").ok(),
@@ -147,18 +146,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Initialize Compose manager (creates env dir, validates compose file)
     let compose = Arc::new(ComposeManager::new(
         config.compose_file.clone(),
         std::path::PathBuf::from("data/envs"),
         config.openclaw_image.clone(),
     )?);
 
-    // Load or create user store
-    let store = Arc::new(RwLock::new(UserStore::load_or_create("data/users.json")?));
+    let store = Arc::new(RwLock::new(InstanceStore::load_or_create("data/users.json")?));
 
     if let Some(ref domain) = config.openclaw_domain {
-        tracing::info!("OPENCLAW_DOMAIN set: user URLs will use https://{{user}}.{}", domain);
+        tracing::info!("OPENCLAW_DOMAIN set: instance URLs will use https://{{name}}.{}", domain);
     }
 
     let state = AppState {
@@ -168,10 +165,17 @@ async fn main() -> anyhow::Result<()> {
         dns,
     };
 
-    // Write initial nginx map at startup so pre-existing users are routable immediately
     update_nginx_now(&state).await;
 
-    // Spawn background sync loop for nginx map + DNS reconciliation
+    // Ensure the "api" subdomain DNS record exists so the dstack gateway routes to us
+    if let (Some(ref dns), Some(ref domain), Some(ref app_id)) =
+        (&state.dns, &state.config.openclaw_domain, &state.config.dstack_app_id)
+    {
+        if let Err(e) = dns.ensure_txt_record("api", domain, app_id, 443).await {
+            tracing::warn!("Failed to create DNS record for api.{}: {}", domain, e);
+        }
+    }
+
     if state.config.openclaw_domain.is_some() {
         let sync_state = state.clone();
         tokio::spawn(async move {
@@ -179,24 +183,24 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Build router
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/version", get(version))
-        .route("/users", get(list_users))
-        .route("/users", post(create_user))
-        .route("/users/{user_id}", get(get_user))
-        .route("/users/{user_id}", delete(delete_user))
-        .route("/users/{user_id}/restart", post(restart_user))
-        .route("/users/{user_id}/stop", post(stop_user))
-        .route("/users/{user_id}/start", post(start_user))
+        .route("/instances", get(list_instances))
+        .route("/instances", post(create_instance))
+        .route("/instances/{name}", get(get_instance))
+        .route("/instances/{name}", delete(delete_instance))
+        .route("/instances/{name}/restart", post(restart_instance))
+        .route("/instances/{name}/stop", post(stop_instance))
+        .route("/instances/{name}/start", post(start_instance))
+        .route("/instances/{name}/events", get(instance_events))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    
+
     tracing::info!("Management API listening on {}", addr);
     axum::serve(listener, app).await?;
 
@@ -208,142 +212,34 @@ async fn health_check() -> &'static str {
 }
 
 async fn version() -> &'static str {
-    "hex_norm_v1"
+    "instance_v1"
 }
 
+// ── Request / Response types ─────────────────────────────────────────
+
 #[derive(Deserialize)]
-struct CreateUserRequest {
-    user_id: String,
+struct CreateInstanceRequest {
     nearai_api_key: String,
     #[serde(default)]
     ssh_pubkey: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Serialize)]
-struct CreateUserResponse {
-    user_id: String,
+struct InstanceInfo {
+    name: String,
     token: String,
     gateway_port: u16,
     ssh_port: u16,
     url: String,
     dashboard_url: String,
     ssh_command: String,
-    status: String,
-}
-
-/// Generate URL and dashboard_url based on config
-fn generate_urls(config: &AppConfig, user_id: &str, gateway_port: u16, token: &str) -> (String, String) {
-    match &config.openclaw_domain {
-        Some(domain) => {
-            let base = format!("https://{}.{}", user_id, domain);
-            (base.clone(), format!("{}/?token={}", base, token))
-        }
-        None => {
-            let base = format!("http://{}:{}", config.host_address, gateway_port);
-            (base.clone(), format!("{}/?token={}", base, token))
-        }
-    }
-}
-
-async fn create_user(
-    _auth: AdminAuth,
-    State(state): State<AppState>,
-    Json(req): Json<CreateUserRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    let user_id = req.user_id.to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', "");
-    
-    if user_id.is_empty() || user_id.len() > 32 {
-        return Err(ApiError::BadRequest("Invalid user_id: must be 1-32 alphanumeric characters".into()));
-    }
-
-    const RESERVED_SUBDOMAINS: &[&str] = &["api", "www", "mail", "admin", "gateway"];
-    if RESERVED_SUBDOMAINS.contains(&user_id.as_str()) {
-        return Err(ApiError::BadRequest(format!("'{}' is a reserved name", user_id)));
-    }
-
-    if req.nearai_api_key.is_empty() {
-        return Err(ApiError::BadRequest("nearai_api_key is required".into()));
-    }
-
-    // Check if user already exists
-    {
-        let store = state.store.read().await;
-        if store.get(&user_id).is_some() {
-            return Err(ApiError::Conflict(format!("User {} already exists", user_id)));
-        }
-    }
-
-    // Generate unique token
-    let token = generate_token();
-    
-    // Allocate ports (gateway + SSH)
-    let (gateway_port, ssh_port) = {
-        let store = state.store.read().await;
-        store.next_available_ports()
-    };
-
-    // Spin up the worker compose project
-    state.compose.up(
-        &user_id,
-        &req.nearai_api_key,
-        &token,
-        gateway_port,
-        ssh_port,
-        req.ssh_pubkey.as_deref(),
-    )?;
-
-    // Store user info
-    let user = User {
-        user_id: user_id.clone(),
-        token: token.clone(),
-        gateway_port,
-        ssh_port,
-        created_at: chrono::Utc::now(),
-        ssh_pubkey: req.ssh_pubkey.clone(),
-        nearai_api_key: req.nearai_api_key.clone(),
-        active: true,
-    };
-
-    {
-        let mut store = state.store.write().await;
-        store.add(user)?;
-    }
-
-    // Update nginx map immediately so the instance is routable right away
-    update_nginx_now(&state).await;
-
-    // Create DNS TXT record immediately so routing works right away
-    if let (Some(ref dns), Some(ref domain), Some(ref app_id)) =
-        (&state.dns, &state.config.openclaw_domain, &state.config.dstack_app_id)
-    {
-        if let Err(e) = dns.ensure_txt_record(&user_id, domain, app_id, 443).await {
-            tracing::warn!("Failed to create DNS record for {}: {}", user_id, e);
-        }
-    }
-
-    tracing::info!("Created user container: {} (gateway:{}, ssh:{})", user_id, gateway_port, ssh_port);
-
-    let (url, dashboard_url) = generate_urls(&state.config, &user_id, gateway_port, &token);
-    let ssh_command = format!("ssh -p {} agent@{}", ssh_port, state.config.host_address);
-    
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateUserResponse {
-            user_id,
-            token,
-            gateway_port,
-            ssh_port,
-            url,
-            dashboard_url,
-            ssh_command,
-            status: "running".to_string(),
-        }),
-    ))
 }
 
 #[derive(Serialize)]
-struct UserResponse {
-    user_id: String,
+struct InstanceResponse {
+    name: String,
     token: String,
     url: String,
     dashboard_url: String,
@@ -354,191 +250,485 @@ struct UserResponse {
     created_at: String,
 }
 
-async fn get_user(
-    _auth: AdminAuth,
-    State(state): State<AppState>,
-    Path(user_id): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
-    let user = {
-        let store = state.store.read().await;
-        store.get(&user_id).cloned()
-    };
+#[derive(Serialize)]
+struct InstancesListResponse {
+    instances: Vec<InstanceResponse>,
+}
 
-    match user {
-        Some(user) => {
-            let status = state.compose.status(&user.user_id)?;
-            let (url, dashboard_url) = generate_urls(&state.config, &user.user_id, user.gateway_port, &user.token);
-            let ssh_command = format!("ssh -p {} agent@{}", user.ssh_port, state.config.host_address);
-            Ok(Json(UserResponse {
-                user_id: user.user_id,
-                token: user.token,
-                url,
-                dashboard_url,
-                gateway_port: user.gateway_port,
-                ssh_port: user.ssh_port,
-                ssh_command,
-                status,
-                created_at: user.created_at.to_rfc3339(),
-            }))
+/// Generate URL and dashboard_url based on config
+fn generate_urls(config: &AppConfig, name: &str, gateway_port: u16, token: &str) -> (String, String) {
+    match &config.openclaw_domain {
+        Some(domain) => {
+            let base = format!("https://{}.{}", name, domain);
+            (base.clone(), format!("{}/?token={}", base, token))
         }
-        None => Err(ApiError::NotFound(format!("User {} not found", user_id))),
+        None => {
+            let base = format!("http://{}:{}", config.host_address, gateway_port);
+            (base.clone(), format!("{}/?token={}", base, token))
+        }
     }
 }
 
-#[derive(Serialize)]
-struct UsersListResponse {
-    users: Vec<UserResponse>,
+// ── SSE helpers ──────────────────────────────────────────────────────
+
+/// Wrap an SSE stream with headers that disable proxy buffering (nginx, etc.)
+fn unbuffered_sse(
+    stream: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
+) -> impl IntoResponse {
+    let headers = [
+        ("X-Accel-Buffering", "no"),
+        ("Cache-Control", "no-cache"),
+    ];
+    let sse = Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    );
+    (headers, sse)
 }
 
-async fn list_users(
+fn sse_stage(stage: &str, message: &str) -> Event {
+    Event::default()
+        .json_data(serde_json::json!({"stage": stage, "message": message}))
+        .unwrap()
+}
+
+fn sse_error(message: &str) -> Event {
+    Event::default()
+        .json_data(serde_json::json!({"stage": "error", "message": message}))
+        .unwrap()
+}
+
+fn sse_created(info: &InstanceInfo) -> Event {
+    Event::default()
+        .json_data(serde_json::json!({
+            "stage": "created",
+            "message": format!("Instance '{}' created, ports {}-{} allocated", info.name, info.gateway_port, info.ssh_port),
+            "instance": info,
+        }))
+        .unwrap()
+}
+
+// ── Health polling loop (shared by create/start/restart SSE streams) ─
+
+async fn poll_health_to_ready(
+    state: &AppState,
+    name: &str,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut last_stage = String::new();
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            let _ = tx.send(sse_error("timeout waiting for container to become ready")).await;
+            return;
+        }
+
+        let health = state.compose.container_health(name);
+        let (stage, msg, done) = match health {
+            Ok(h) => match (h.state.as_str(), h.health.as_str()) {
+                ("not_found", _) => ("container_starting", "Waiting for container to appear...", false),
+                ("running", "starting") => ("healthcheck_starting", "Container running, waiting for health check...", false),
+                ("running", "healthy") => ("healthy", "Health check passed", false),
+                ("running", "none") | ("running", "") => ("container_running", "Container is running, health check not yet configured", false),
+                ("exited", _) | ("dead", _) => ("error", "Container exited unexpectedly", true),
+                (_, "unhealthy") => ("error", "Container health check failed", true),
+                _ => ("container_starting", "Waiting for container...", false),
+            },
+            Err(e) => {
+                let leaked: &str = e.to_string().leak();
+                ("error", leaked, true)
+            }
+        };
+
+        if stage != last_stage {
+            last_stage = stage.to_string();
+            if done {
+                let _ = tx.send(sse_error(msg)).await;
+                return;
+            }
+
+            let _ = tx.send(sse_stage(stage, msg)).await;
+
+            if stage == "healthy" {
+                let _ = tx.send(sse_stage("ready", &format!("Instance '{}' is ready", name))).await;
+                return;
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
+// ── Handlers ─────────────────────────────────────────────────────────
+
+async fn create_instance(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Json(req): Json<CreateInstanceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if req.nearai_api_key.is_empty() {
+        return Err(ApiError::BadRequest("nearai_api_key is required".into()));
+    }
+
+    // Resolve instance name
+    let name = if let Some(provided) = &req.name {
+        let sanitized = provided.to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', "");
+        if sanitized.is_empty() || sanitized.len() > 32 {
+            return Err(ApiError::BadRequest("Invalid name: must be 1-32 alphanumeric/hyphen characters".into()));
+        }
+        const RESERVED: &[&str] = &["api", "www", "mail", "admin", "gateway"];
+        if RESERVED.contains(&sanitized.as_str()) {
+            return Err(ApiError::BadRequest(format!("'{}' is a reserved name", sanitized)));
+        }
+        let store = state.store.read().await;
+        if store.exists(&sanitized) {
+            return Err(ApiError::Conflict(format!("Instance '{}' already exists", sanitized)));
+        }
+        sanitized
+    } else {
+        let store = state.store.read().await;
+        names::generate_name(|n| store.exists(n))
+            .ok_or_else(|| ApiError::Internal("Failed to generate unique name".into()))?
+    };
+
+    let token = generate_token();
+    let (gateway_port, ssh_port) = {
+        let store = state.store.read().await;
+        store.next_available_ports()
+    };
+
+    let (url, dashboard_url) = generate_urls(&state.config, &name, gateway_port, &token);
+    let ssh_command = format!("ssh -p {} agent@{}", ssh_port, state.config.host_address);
+
+    let info = InstanceInfo {
+        name: name.clone(),
+        token: token.clone(),
+        gateway_port,
+        ssh_port,
+        url,
+        dashboard_url,
+        ssh_command,
+    };
+
+    let instance = Instance {
+        name: name.clone(),
+        token: token.clone(),
+        gateway_port,
+        ssh_port,
+        created_at: chrono::Utc::now(),
+        ssh_pubkey: req.ssh_pubkey.clone(),
+        nearai_api_key: req.nearai_api_key.clone(),
+        active: true,
+    };
+
+    // Save to store before streaming so it's persisted immediately
+    {
+        let mut store = state.store.write().await;
+        store.add(instance)?;
+    }
+
+    let nearai_api_key = req.nearai_api_key.clone();
+    let ssh_pubkey = req.ssh_pubkey.clone();
+
+    let stream = async_stream::stream! {
+        yield Ok(sse_created(&info));
+
+        yield Ok(sse_stage("container_starting", "Pulling image and starting container..."));
+
+        if let Err(e) = state.compose.up(
+            &name,
+            &nearai_api_key,
+            &token,
+            gateway_port,
+            ssh_port,
+            ssh_pubkey.as_deref(),
+        ) {
+            yield Ok(sse_error(&format!("Failed to start container: {}", e)));
+            return;
+        }
+
+        yield Ok(sse_stage("configuring_routing", "Updating nginx routing table..."));
+        update_nginx_now(&state).await;
+
+        yield Ok(sse_stage("updating_dns", "Creating DNS record for subdomain..."));
+        if let (Some(ref dns), Some(ref domain), Some(ref app_id)) =
+            (&state.dns, &state.config.openclaw_domain, &state.config.dstack_app_id)
+        {
+            if let Err(e) = dns.ensure_txt_record(&name, domain, app_id, 443).await {
+                tracing::warn!("Failed to create DNS record for {}: {}", name, e);
+            }
+        }
+
+        tracing::info!("Created instance: {} (gateway:{}, ssh:{})", name, gateway_port, ssh_port);
+
+        // Poll health until ready
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let poll_state = state.clone();
+        let poll_name = name.clone();
+        tokio::spawn(async move {
+            poll_health_to_ready(&poll_state, &poll_name, &tx).await;
+        });
+
+        while let Some(event) = rx.recv().await {
+            yield Ok(event);
+        }
+    };
+
+    Ok(unbuffered_sse(stream))
+}
+
+async fn get_instance(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let instance = {
+        let store = state.store.read().await;
+        store.get(&name).cloned()
+    };
+
+    match instance {
+        Some(inst) => {
+            let status = state.compose.status(&inst.name)?;
+            let (url, dashboard_url) = generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
+            let ssh_command = format!("ssh -p {} agent@{}", inst.ssh_port, state.config.host_address);
+            Ok(Json(InstanceResponse {
+                name: inst.name,
+                token: inst.token,
+                url,
+                dashboard_url,
+                gateway_port: inst.gateway_port,
+                ssh_port: inst.ssh_port,
+                ssh_command,
+                status,
+                created_at: inst.created_at.to_rfc3339(),
+            }))
+        }
+        None => Err(ApiError::NotFound(format!("Instance '{}' not found", name))),
+    }
+}
+
+async fn list_instances(
     _auth: AdminAuth,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let users = {
+    let instances = {
         let store = state.store.read().await;
-        store.list().to_vec()
+        store.list()
     };
 
     let mut responses = Vec::new();
-    for user in users {
-        let status = state.compose.status(&user.user_id)
+    for inst in instances {
+        let status = state.compose.status(&inst.name)
             .unwrap_or_else(|_| "unknown".to_string());
-        let (url, dashboard_url) = generate_urls(&state.config, &user.user_id, user.gateway_port, &user.token);
-        let ssh_command = format!("ssh -p {} agent@{}", user.ssh_port, state.config.host_address);
-        responses.push(UserResponse {
-            user_id: user.user_id.clone(),
-            token: user.token.clone(),
+        let (url, dashboard_url) = generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
+        let ssh_command = format!("ssh -p {} agent@{}", inst.ssh_port, state.config.host_address);
+        responses.push(InstanceResponse {
+            name: inst.name,
+            token: inst.token,
             url,
             dashboard_url,
-            gateway_port: user.gateway_port,
-            ssh_port: user.ssh_port,
+            gateway_port: inst.gateway_port,
+            ssh_port: inst.ssh_port,
             ssh_command,
             status,
-            created_at: user.created_at.to_rfc3339(),
+            created_at: inst.created_at.to_rfc3339(),
         });
     }
 
-    Ok(Json(UsersListResponse { users: responses }))
+    Ok(Json(InstancesListResponse { instances: responses }))
 }
 
-async fn delete_user(
+async fn delete_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Path(user_id): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = {
+    {
         let store = state.store.read().await;
-        store.get(&user_id).cloned()
-    };
-
-    match user {
-        Some(_user) => {
-            // Tear down the compose project (removes containers + volumes)
-            state.compose.down(&user_id)?;
-
-            // Delete DNS TXT record immediately
-            if let (Some(ref dns), Some(ref domain)) =
-                (&state.dns, &state.config.openclaw_domain)
-            {
-                if let Err(e) = dns.delete_txt_record(&user_id, domain).await {
-                    tracing::warn!("Failed to delete DNS record for {}: {}", user_id, e);
-                }
-            }
-
-            // Remove from store
-            {
-                let mut store = state.store.write().await;
-                store.remove(&user_id)?;
-            }
-
-            // Update nginx map immediately to stop routing to deleted instance
-            update_nginx_now(&state).await;
-
-            tracing::info!("Deleted user container: {}", user_id);
-            Ok(StatusCode::NO_CONTENT)
+        if store.get(&name).is_none() {
+            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
         }
-        None => Err(ApiError::NotFound(format!("User {} not found", user_id))),
     }
+
+    state.compose.down(&name)?;
+
+    if let (Some(ref dns), Some(ref domain)) =
+        (&state.dns, &state.config.openclaw_domain)
+    {
+        if let Err(e) = dns.delete_txt_record(&name, domain).await {
+            tracing::warn!("Failed to delete DNS record for {}: {}", name, e);
+        }
+    }
+
+    {
+        let mut store = state.store.write().await;
+        store.remove(&name)?;
+    }
+
+    update_nginx_now(&state).await;
+
+    tracing::info!("Deleted instance: {}", name);
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn restart_user(
+async fn restart_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Path(user_id): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = {
+    {
         let store = state.store.read().await;
-        store.get(&user_id).cloned()
+        if store.get(&name).is_none() {
+            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
+        }
+    }
+
+    let stream = async_stream::stream! {
+        yield Ok(sse_stage("container_starting", "Restarting container..."));
+
+        if let Err(e) = state.compose.restart(&name) {
+            yield Ok(sse_error(&format!("Failed to restart container: {}", e)));
+            return;
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let poll_state = state.clone();
+        let poll_name = name.clone();
+        tokio::spawn(async move {
+            poll_health_to_ready(&poll_state, &poll_name, &tx).await;
+        });
+
+        while let Some(event) = rx.recv().await {
+            yield Ok(event);
+        }
     };
 
-    match user {
-        Some(_user) => {
-            state.compose.restart(&user_id)?;
-            tracing::info!("Restarted user container: {}", user_id);
-            Ok(Json(serde_json::json!({"status": "restarted"})))
-        }
-        None => Err(ApiError::NotFound(format!("User {} not found", user_id))),
-    }
+    Ok(unbuffered_sse(stream))
 }
 
-async fn stop_user(
+async fn stop_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Path(user_id): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = {
+    {
         let store = state.store.read().await;
-        store.get(&user_id).cloned()
+        if store.get(&name).is_none() {
+            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
+        }
+    }
+
+    let stream = async_stream::stream! {
+        yield Ok(sse_stage("stopping", "Stopping container..."));
+
+        if let Err(e) = state.compose.stop(&name) {
+            yield Ok(sse_error(&format!("Failed to stop container: {}", e)));
+            return;
+        }
+
+        {
+            let mut store = state.store.write().await;
+            if let Err(e) = store.set_active(&name, false) {
+                tracing::warn!("Failed to mark instance inactive: {}", e);
+            }
+        }
+
+        update_nginx_now(&state).await;
+        tracing::info!("Stopped instance: {}", name);
+
+        yield Ok(sse_stage("stopped", "Instance stopped, routing removed"));
     };
 
-    match user {
-        Some(_user) => {
-            state.compose.stop(&user_id)?;
-            {
-                let mut store = state.store.write().await;
-                store.set_active(&user_id, false)?;
-            }
-            update_nginx_now(&state).await;
-            tracing::info!("Stopped user container: {}", user_id);
-            Ok(Json(serde_json::json!({"status": "stopped"})))
-        }
-        None => Err(ApiError::NotFound(format!("User {} not found", user_id))),
-    }
+    Ok(unbuffered_sse(stream))
 }
 
-async fn start_user(
+async fn start_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Path(user_id): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = {
+    {
         let store = state.store.read().await;
-        store.get(&user_id).cloned()
+        if store.get(&name).is_none() {
+            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
+        }
+    }
+
+    let stream = async_stream::stream! {
+        yield Ok(sse_stage("container_starting", "Starting container..."));
+
+        if let Err(e) = state.compose.start(&name) {
+            yield Ok(sse_error(&format!("Failed to start container: {}", e)));
+            return;
+        }
+
+        yield Ok(sse_stage("configuring_routing", "Restoring routing..."));
+
+        {
+            let mut store = state.store.write().await;
+            if let Err(e) = store.set_active(&name, true) {
+                tracing::warn!("Failed to mark instance active: {}", e);
+            }
+        }
+
+        update_nginx_now(&state).await;
+        tracing::info!("Started instance: {}", name);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let poll_state = state.clone();
+        let poll_name = name.clone();
+        tokio::spawn(async move {
+            poll_health_to_ready(&poll_state, &poll_name, &tx).await;
+        });
+
+        while let Some(event) = rx.recv().await {
+            yield Ok(event);
+        }
     };
 
-    match user {
-        Some(_user) => {
-            state.compose.start(&user_id)?;
-            {
-                let mut store = state.store.write().await;
-                store.set_active(&user_id, true)?;
-            }
-            update_nginx_now(&state).await;
-            tracing::info!("Started user container: {}", user_id);
-            Ok(Json(serde_json::json!({"status": "started"})))
-        }
-        None => Err(ApiError::NotFound(format!("User {} not found", user_id))),
-    }
+    Ok(unbuffered_sse(stream))
 }
 
-/// Immediately write the nginx backends map and reload if changed.
+async fn instance_events(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    {
+        let store = state.store.read().await;
+        if store.get(&name).is_none() {
+            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
+        }
+    }
+
+    let stream = async_stream::stream! {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let poll_state = state.clone();
+        let poll_name = name.clone();
+        tokio::spawn(async move {
+            poll_health_to_ready(&poll_state, &poll_name, &tx).await;
+        });
+
+        while let Some(event) = rx.recv().await {
+            yield Ok(event);
+        }
+    };
+
+    Ok(unbuffered_sse(stream))
+}
+
+// ── Utilities ────────────────────────────────────────────────────────
+
 async fn update_nginx_now(state: &AppState) {
     if let Some(ref domain) = state.config.openclaw_domain {
-        let users = {
+        let instances = {
             let store = state.store.read().await;
             store.list()
         };
-        let changed = nginx_conf::write_backends_map(&users, domain, &state.config.nginx_map_path);
+        let changed = nginx_conf::write_backends_map(&instances, domain, &state.config.nginx_map_path);
         if changed {
             nginx_conf::reload_nginx(&state.config.ingress_container_name);
         }
@@ -552,8 +742,6 @@ fn generate_token() -> String {
     hex::encode(bytes)
 }
 
-/// Fetches the APP_ID from dstack.sock (GET http://localhost/Info via unix socket).
-/// Returns None if dstack.sock is not available.
 async fn fetch_dstack_app_id() -> Option<String> {
     let sock_path = "/var/run/dstack.sock";
     if !std::path::Path::new(sock_path).exists() {
@@ -561,7 +749,6 @@ async fn fetch_dstack_app_id() -> Option<String> {
         return None;
     }
 
-    // Shell out to curl for simplicity — avoids pulling in hyper unix socket deps
     let output = std::process::Command::new("curl")
         .args(["--unix-socket", sock_path, "-s", "http://localhost/Info"])
         .output();
@@ -569,7 +756,6 @@ async fn fetch_dstack_app_id() -> Option<String> {
     match output {
         Ok(o) if o.status.success() => {
             let body = String::from_utf8_lossy(&o.stdout);
-            // Parse JSON and extract app_id
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                 if let Some(app_id) = v.get("app_id").and_then(|v| v.as_str()) {
                     return Some(app_id.to_string());
@@ -590,7 +776,6 @@ async fn fetch_dstack_app_id() -> Option<String> {
     }
 }
 
-/// Background loop that syncs the nginx backends map and DNS TXT records.
 async fn background_sync_loop(state: AppState) {
     let domain = match &state.config.openclaw_domain {
         Some(d) => d.clone(),
@@ -598,22 +783,20 @@ async fn background_sync_loop(state: AppState) {
     };
 
     let mut dns_tick: u32 = 0;
-    const DNS_SYNC_INTERVAL: u32 = 12; // Every 12 * 5s = 60s
+    const DNS_SYNC_INTERVAL: u32 = 12;
 
     tracing::info!("Background sync loop started (domain: {})", domain);
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        // Read current users
-        let users = {
+        let instances = {
             let store = state.store.read().await;
             store.list()
         };
 
-        // Update nginx backends map
         let changed = nginx_conf::write_backends_map(
-            &users,
+            &instances,
             &domain,
             &state.config.nginx_map_path,
         );
@@ -621,13 +804,12 @@ async fn background_sync_loop(state: AppState) {
             nginx_conf::reload_nginx(&state.config.ingress_container_name);
         }
 
-        // Periodically sync DNS records
         dns_tick += 1;
         if dns_tick >= DNS_SYNC_INTERVAL {
             dns_tick = 0;
             if let (Some(ref dns), Some(ref app_id)) = (&state.dns, &state.config.dstack_app_id) {
-                let user_ids: Vec<String> = users.iter().map(|u| u.user_id.clone()).collect();
-                if let Err(e) = dns.sync_all_records(&user_ids, &domain, app_id, 443).await {
+                let names: Vec<String> = instances.iter().map(|i| i.name.clone()).collect();
+                if let Err(e) = dns.sync_all_records(&names, &domain, app_id, 443).await {
                     tracing::warn!("DNS sync failed: {}", e);
                 }
             }
