@@ -57,29 +57,16 @@ RUN curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.s
 
 # Switch back to root for remaining setup
 USER root
-SHELL ["/bin/sh", "-c"]
 
 # Configure SSH server, directories, brew, pnpm home, and npm for agent user
 RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/openclaw /home/agent/.npm-global /home/agent/.local/share/pnpm && \
-    # Set ownership immediately after creating directories so agent user can write to them
-    chown -R agent:agent /home/agent && \
     ssh-keygen -t ed25519 -f /home/agent/ssh/ssh_host_ed25519_key -N "" && \
     chmod 700 /home/agent/.ssh && \
-    chown -R agent:agent /home/agent/.ssh /home/agent/ssh && \
-    # Ensure login shell (e.g. SSH) sources .bashrc so brew/pnpm/bun PATH and brew shellenv are set
     printf '%s\n' '[ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"' > /home/agent/.profile && \
-    chown agent:agent /home/agent/.profile && \
-    # Configure brew environment in .bashrc (PATH already in ENV, but shellenv sets additional variables)
     echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/agent/.bashrc && \
-    # Configure npm to use local directory for global packages (prevents permission errors as non-root)
-    # Ownership is already set above, so agent user can write npm config
-    su - agent -c 'npm config set prefix "/home/agent/.npm-global"' && \
-    # Add npm-global to PATH in .bashrc (pnpm home is added by pnpm setup below)
     echo 'export PATH="/home/agent/.npm-global/bin:${PATH}"' >> /home/agent/.bashrc && \
-    # Create symlink for easy brew access
     ln -s /home/linuxbrew/.linuxbrew/bin/brew /usr/local/bin/brew && \
     chmod +x /usr/local/bin/brew && \
-    # Ensure all files created above are owned by agent user
     chown -R agent:agent /home/agent
 
 # Install pnpm, bun, and OpenClaw as agent user so they go to /home/agent/.npm-global/bin
@@ -91,7 +78,6 @@ RUN npm config set prefix "/home/agent/.npm-global" && \
 
 # Switch back to root for final setup
 USER root
-SHELL ["/bin/sh", "-c"]
 
 # Copy entrypoint script and template
 COPY entrypoint.sh /app/entrypoint.sh
