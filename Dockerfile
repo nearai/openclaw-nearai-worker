@@ -73,7 +73,7 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/
 # This ensures they are in the agent user's PATH (npm config is set in the same RUN instruction below)
 USER agent
 RUN npm config set prefix "/home/agent/.npm-global" && \
-    npm install -g pnpm bun openclaw@2026.2.9 && \
+    npm install -g pnpm bun openclaw@2026.2.1 && \
     /home/agent/.npm-global/bin/pnpm setup
 
 # Switch back to root for final setup
