@@ -293,9 +293,8 @@ async fn version() -> &'static str {
 struct CreateInstanceRequest {
     /// NEAR AI API key for the instance
     nearai_api_key: String,
-    /// Optional SSH public key for direct SSH access
-    #[serde(default)]
-    ssh_pubkey: Option<String>,
+    /// SSH public key for direct SSH access
+    ssh_pubkey: String,
     /// Optional instance name (auto-generated if omitted, 1-32 alphanumeric/hyphen chars)
     #[serde(default)]
     name: Option<String>,
@@ -527,6 +526,9 @@ async fn create_instance(
     if req.nearai_api_key.is_empty() {
         return Err(ApiError::BadRequest("nearai_api_key is required".into()));
     }
+    if req.ssh_pubkey.is_empty() {
+        return Err(ApiError::BadRequest("ssh_pubkey is required".into()));
+    }
 
     // Resolve image
     let image = match &req.image {
@@ -612,7 +614,7 @@ async fn create_instance(
             &token,
             gateway_port,
             ssh_port,
-            ssh_pubkey.as_deref(),
+            &ssh_pubkey,
             &image,
         ) {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
@@ -829,7 +831,7 @@ async fn restart_instance(
                 &inst.token,
                 inst.gateway_port,
                 inst.ssh_port,
-                inst.ssh_pubkey.as_deref(),
+                &inst.ssh_pubkey,
                 image,
             ) {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));

@@ -10,6 +10,7 @@ fn default_active() -> bool {
     true
 }
 
+
 const BASE_PORT: u16 = 19001;
 const MAX_PORT: u16 = 19999;
 // Each instance gets 2 consecutive ports: gateway_port and gateway_port+1 (SSH)
@@ -22,8 +23,7 @@ pub struct Instance {
     pub gateway_port: u16,
     pub ssh_port: u16,
     pub created_at: DateTime<Utc>,
-    #[serde(default)]
-    pub ssh_pubkey: Option<String>,
+    pub ssh_pubkey: String,
     #[serde(default)]
     pub nearai_api_key: String,
     #[serde(default = "default_active")]

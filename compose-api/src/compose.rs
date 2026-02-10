@@ -75,7 +75,7 @@ impl ComposeManager {
         token: &str,
         gateway_port: u16,
         ssh_port: u16,
-        ssh_pubkey: Option<&str>,
+        ssh_pubkey: &str,
         image: &str,
     ) -> Result<(), ApiError> {
         let mut vars = HashMap::new();
@@ -84,9 +84,7 @@ impl ComposeManager {
         vars.insert("GATEWAY_PORT".into(), gateway_port.to_string());
         vars.insert("SSH_PORT".into(), ssh_port.to_string());
         vars.insert("OPENCLAW_IMAGE".into(), image.to_string());
-        if let Some(pk) = ssh_pubkey {
-            vars.insert("SSH_PUBKEY".into(), pk.into());
-        }
+        vars.insert("SSH_PUBKEY".into(), ssh_pubkey.into());
         let env_path = self.write_env_file(name, &vars)?;
 
         // Only pull from registry for digest-pinned images; local images use --pull never
