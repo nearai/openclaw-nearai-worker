@@ -139,6 +139,7 @@ RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
 
 while true; do
   echo "Starting: $*"
+  # The -p flag preserves environment variables (including PATH set in Dockerfile)
   runuser -p -u agent -- "$@" || true
   EXIT_CODE=$?
   echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."

@@ -25,7 +25,7 @@
           {
             "id": "deepseek-ai/DeepSeek-V3.1",
             "name": "DeepSeek V3.1",
-            "reasoning": true,
+            "reasoning": false,
             "input": ["text"],
             "cost": {
               "input": 1.05,

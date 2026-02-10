@@ -20,7 +20,7 @@ services:
       - "18789:18789"
       - "18790:18790"
       # SSH (port 2222)
-      - 2222:2222"
+      - "2222:2222"
     init: true
     restart: unless-stopped
     healthcheck:
