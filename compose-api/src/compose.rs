@@ -89,7 +89,9 @@ impl ComposeManager {
         }
         let env_path = self.write_env_file(name, &vars)?;
 
-        self.compose_cmd(name, &env_path, &["up", "-d", "--pull", "always"])
+        // Only pull from registry for digest-pinned images; local images use --pull never
+        let pull_policy = if image.contains("@sha256:") { "always" } else { "never" };
+        self.compose_cmd(name, &env_path, &["up", "-d", "--pull", pull_policy])
     }
 
     /// `docker compose -p openclaw-{name} down -v` (removes volumes too)

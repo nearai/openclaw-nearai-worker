@@ -36,7 +36,7 @@ use store::{Instance, InstanceStore};
 #[openapi(
     info(
         title = "OpenClaw Instance Management API",
-        description = "Multi-tenant management API for OpenClaw NEAR AI worker instances.\n\nAll `/instances` endpoints require a Bearer token via the `Authorization` header.\n\nLifecycle operations (create, start, stop, restart) return Server-Sent Event (SSE) streams with real-time progress updates.",
+        description = "Multi-tenant management API for OpenClaw NEAR AI worker instances.\n\nInstance management endpoints require a Bearer token via the `Authorization` header. Attestation endpoints are public.\n\nLifecycle operations (create, start, stop, restart) return Server-Sent Event (SSE) streams with real-time progress updates.",
         version = "1.0.0",
     ),
     paths(
@@ -102,6 +102,7 @@ struct AppConfig {
     openclaw_image: String,
     compose_file: std::path::PathBuf,
     dstack_app_id: Option<String>,
+    dstack_gateway_base: Option<String>,
     nginx_map_path: PathBuf,
     ingress_container_name: String,
 }
@@ -170,6 +171,13 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("dstack APP_ID: {}", app_id);
     }
 
+    let dstack_gateway_base = std::env::var("GATEWAY_DOMAIN")
+        .ok()
+        .and_then(|d| d.split_once('.').map(|(_, base)| base.to_string()));
+    if let Some(ref base) = dstack_gateway_base {
+        tracing::info!("dstack gateway base: {}", base);
+    }
+
     let config = AppConfig {
         admin_token,
         host_address: std::env::var("OPENCLAW_HOST_ADDRESS")
@@ -179,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "openclaw-nearai-worker:local".to_string()),
         compose_file: std::path::PathBuf::from(compose_file),
         dstack_app_id,
+        dstack_gateway_base,
         nginx_map_path: PathBuf::from(
             std::env::var("NGINX_MAP_PATH").unwrap_or_else(|_| "/data/nginx/backends.map".to_string()),
         ),
@@ -263,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[utoipa::path(get, path = "/health", tag = "System",
+    security(),
     responses((status = 200, description = "Service is healthy", body = String))
 )]
 async fn health_check() -> &'static str {
@@ -270,6 +280,7 @@ async fn health_check() -> &'static str {
 }
 
 #[utoipa::path(get, path = "/version", tag = "System",
+    security(),
     responses((status = 200, description = "API version string", body = String))
 )]
 async fn version() -> &'static str {
@@ -389,6 +400,18 @@ fn generate_urls(config: &AppConfig, name: &str, gateway_port: u16, token: &str)
             let base = format!("http://{}:{}", config.host_address, gateway_port);
             (base.clone(), format!("{}/?token={}", base, token))
         }
+    }
+}
+
+/// Generate SSH command — uses TLS-tunneled proxy through dstack gateway when available,
+/// otherwise falls back to direct SSH.
+fn generate_ssh_command(config: &AppConfig, ssh_port: u16) -> String {
+    match (&config.dstack_app_id, &config.dstack_gateway_base) {
+        (Some(app_id), Some(base)) => format!(
+            "ssh -o ProxyCommand=\"openssl s_client -quiet -connect %h:443 -servername %h\" agent@{}-{}.{}",
+            app_id, ssh_port, base
+        ),
+        _ => format!("ssh -p {} agent@{}", ssh_port, config.host_address),
     }
 }
 
@@ -542,7 +565,7 @@ async fn create_instance(
     };
 
     let (url, dashboard_url) = generate_urls(&state.config, &name, gateway_port, &token);
-    let ssh_command = format!("ssh -p {} agent@{}", ssh_port, state.config.host_address);
+    let ssh_command = generate_ssh_command(&state.config, ssh_port);
 
     let info = InstanceInfo {
         name: name.clone(),
@@ -659,7 +682,7 @@ async fn get_instance(
         Some(inst) => {
             let status = state.compose.status(&inst.name)?;
             let (url, dashboard_url) = generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
-            let ssh_command = format!("ssh -p {} agent@{}", inst.ssh_port, state.config.host_address);
+            let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
             let image = inst.image.clone().unwrap_or_else(|| state.config.openclaw_image.clone());
             Ok(Json(InstanceResponse {
                 name: inst.name,
@@ -700,7 +723,7 @@ async fn list_instances(
         let status = state.compose.status(&inst.name)
             .unwrap_or_else(|_| "unknown".to_string());
         let (url, dashboard_url) = generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
-        let ssh_command = format!("ssh -p {} agent@{}", inst.ssh_port, state.config.host_address);
+        let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
         let image = inst.image.clone().unwrap_or_else(|| state.config.openclaw_image.clone());
         responses.push(InstanceResponse {
             name: inst.name,
@@ -764,7 +787,7 @@ async fn delete_instance(
 
 #[utoipa::path(post, path = "/instances/{name}/restart", tag = "Instances",
     params(("name" = String, Path, description = "Instance name")),
-    request_body(content = Option<RestartInstanceRequest>, description = "Optional: provide image to switch to a different image on restart"),
+    request_body(content = inline(Option<RestartInstanceRequest>), description = "Optional: provide image to switch to a different image on restart"),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "SSE stream of restart progress", content_type = "text/event-stream", body = SseEvent),
@@ -987,6 +1010,7 @@ async fn instance_events(
 
 #[utoipa::path(get, path = "/instances/{name}/attestation", tag = "Attestation",
     params(("name" = String, Path, description = "Instance name")),
+    security(),
     responses(
         (status = 200, description = "Public attestation info for the instance", body = AttestationResponse),
         (status = 404, description = "Instance not found", body = ErrorResponse),
