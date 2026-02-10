@@ -89,30 +89,30 @@ impl ComposeManager {
 
         // Only pull from registry for digest-pinned images; local images use --pull never
         let pull_policy = if image.contains("@sha256:") { "always" } else { "never" };
-        self.compose_cmd(name, &env_path, &["up", "-d", "--pull", pull_policy])
+        self.compose_cmd(name, &env_path, &["up", "-d", "--pull", pull_policy], Some(&vars))
     }
 
     /// `docker compose -p openclaw-{name} down -v` (removes volumes too)
     pub fn down(&self, name: &str) -> Result<(), ApiError> {
         let env_path = self.env_dir.join(format!("{}.env", name));
-        self.compose_cmd(name, &env_path, &["down", "-v"])?;
+        self.compose_cmd(name, &env_path, &["down", "-v"], None)?;
         self.remove_env_file(name);
         Ok(())
     }
 
     pub fn stop(&self, name: &str) -> Result<(), ApiError> {
         let env_path = self.env_dir.join(format!("{}.env", name));
-        self.compose_cmd(name, &env_path, &["stop"])
+        self.compose_cmd(name, &env_path, &["stop"], None)
     }
 
     pub fn start(&self, name: &str) -> Result<(), ApiError> {
         let env_path = self.env_dir.join(format!("{}.env", name));
-        self.compose_cmd(name, &env_path, &["start"])
+        self.compose_cmd(name, &env_path, &["start"], None)
     }
 
     pub fn restart(&self, name: &str) -> Result<(), ApiError> {
         let env_path = self.env_dir.join(format!("{}.env", name));
-        self.compose_cmd(name, &env_path, &["restart"])
+        self.compose_cmd(name, &env_path, &["restart"], None)
     }
 
     /// Returns the output of `docker compose ps --format json`.
@@ -219,7 +219,13 @@ impl ComposeManager {
 
     // ── internal ──────────────────────────────────────────────────────
 
-    fn compose_cmd(&self, name: &str, env_path: &Path, args: &[&str]) -> Result<(), ApiError> {
+    fn compose_cmd(
+        &self,
+        name: &str,
+        env_path: &Path,
+        args: &[&str],
+        env_vars: Option<&HashMap<String, String>>,
+    ) -> Result<(), ApiError> {
         let project = format!("openclaw-{}", name);
 
         let mut cmd = Command::new("docker");
@@ -233,6 +239,9 @@ impl ComposeManager {
             env_path.to_str().unwrap(),
         ]);
         cmd.args(args);
+        if let Some(vars) = env_vars {
+            cmd.envs(vars);
+        }
 
         let output = cmd
             .output()
