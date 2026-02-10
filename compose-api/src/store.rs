@@ -28,6 +28,10 @@ pub struct Instance {
     pub nearai_api_key: String,
     #[serde(default = "default_active")]
     pub active: bool,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub image_digest: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +97,16 @@ impl InstanceStore {
     pub fn set_active(&mut self, name: &str, active: bool) -> Result<(), ApiError> {
         if let Some(instance) = self.instances.get_mut(name) {
             instance.active = active;
+            self.save()
+        } else {
+            Err(ApiError::NotFound(format!("Instance {} not found", name)))
+        }
+    }
+
+    pub fn set_image(&mut self, name: &str, image: Option<String>, image_digest: Option<String>) -> Result<(), ApiError> {
+        if let Some(instance) = self.instances.get_mut(name) {
+            instance.image = image;
+            instance.image_digest = image_digest;
             self.save()
         } else {
             Err(ApiError::NotFound(format!("Instance {} not found", name)))

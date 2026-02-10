@@ -50,12 +50,15 @@ use store::{Instance, InstanceStore};
         stop_instance,
         start_instance,
         instance_events,
+        instance_attestation,
     ),
     components(schemas(
         CreateInstanceRequest,
+        RestartInstanceRequest,
         InstanceInfo,
         InstanceResponse,
         InstancesListResponse,
+        AttestationResponse,
         SseEvent,
         ErrorResponse,
     )),
@@ -200,7 +203,6 @@ async fn main() -> anyhow::Result<()> {
     let compose = Arc::new(ComposeManager::new(
         config.compose_file.clone(),
         std::path::PathBuf::from("data/envs"),
-        config.openclaw_image.clone(),
     )?);
 
     let store = Arc::new(RwLock::new(InstanceStore::load_or_create("data/users.json")?));
@@ -245,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
         .route("/instances/{name}/events", get(instance_events))
+        .route("/instances/{name}/attestation", get(instance_attestation))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -285,6 +288,16 @@ struct CreateInstanceRequest {
     /// Optional instance name (auto-generated if omitted, 1-32 alphanumeric/hyphen chars)
     #[serde(default)]
     name: Option<String>,
+    /// Optional Docker image reference (defaults to server-configured image)
+    #[serde(default)]
+    image: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct RestartInstanceRequest {
+    /// Optional Docker image to switch to on restart (triggers full recreate)
+    #[serde(default)]
+    image: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -296,6 +309,9 @@ struct InstanceInfo {
     url: String,
     dashboard_url: String,
     ssh_command: String,
+    image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_digest: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -307,6 +323,8 @@ struct InstanceResponse {
     gateway_port: u16,
     ssh_port: u16,
     ssh_command: String,
+    image: String,
+    image_digest: Option<String>,
     status: String,
     created_at: String,
 }
@@ -328,11 +346,36 @@ struct SseEvent {
     instance: Option<InstanceInfo>,
 }
 
+/// Public attestation info for an instance (no auth required)
+#[derive(Serialize, utoipa::ToSchema)]
+struct AttestationResponse {
+    /// Instance name
+    name: String,
+    /// Docker image digest reference (e.g. docker.io/org/image@sha256:abc...)
+    image_digest: Option<String>,
+}
+
 /// Error response body
 #[derive(Serialize, utoipa::ToSchema)]
 struct ErrorResponse {
     /// Error message
     error: String,
+}
+
+fn validate_image(image: &str) -> Result<(), ApiError> {
+    let trimmed = image.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest("image must not be empty".into()));
+    }
+    if trimmed.len() > 256 {
+        return Err(ApiError::BadRequest("image must not exceed 256 characters".into()));
+    }
+    if !trimmed.contains("@sha256:") {
+        return Err(ApiError::BadRequest(
+            "image must be a digest reference (e.g. docker.io/org/image@sha256:abc...), tags are not accepted".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Generate URL and dashboard_url based on config
@@ -462,6 +505,15 @@ async fn create_instance(
         return Err(ApiError::BadRequest("nearai_api_key is required".into()));
     }
 
+    // Resolve image
+    let image = match &req.image {
+        Some(img) => {
+            validate_image(img)?;
+            img.trim().to_string()
+        }
+        None => state.config.openclaw_image.clone(),
+    };
+
     // Resolve instance name
     let name = if let Some(provided) = &req.name {
         let sanitized = provided.to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', "");
@@ -500,6 +552,8 @@ async fn create_instance(
         url,
         dashboard_url,
         ssh_command,
+        image: image.clone(),
+        image_digest: None,
     };
 
     let instance = Instance {
@@ -511,6 +565,8 @@ async fn create_instance(
         ssh_pubkey: req.ssh_pubkey.clone(),
         nearai_api_key: req.nearai_api_key.clone(),
         active: true,
+        image: Some(image.clone()),
+        image_digest: None,
     };
 
     // Save to store before streaming so it's persisted immediately
@@ -534,6 +590,7 @@ async fn create_instance(
             gateway_port,
             ssh_port,
             ssh_pubkey.as_deref(),
+            &image,
         ) {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
@@ -549,6 +606,16 @@ async fn create_instance(
             if let Err(e) = dns.ensure_txt_record(&name, domain, app_id, 443).await {
                 tracing::warn!("Failed to create DNS record for {}: {}", name, e);
             }
+        }
+
+        // Resolve the image digest now that the container is running
+        let image_digest = state.compose.resolve_image_digest(&name);
+        if let Some(ref digest) = image_digest {
+            yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
+        }
+        {
+            let mut store = state.store.write().await;
+            let _ = store.set_image(&name, Some(image.clone()), image_digest);
         }
 
         tracing::info!("Created instance: {} (gateway:{}, ssh:{})", name, gateway_port, ssh_port);
@@ -593,6 +660,7 @@ async fn get_instance(
             let status = state.compose.status(&inst.name)?;
             let (url, dashboard_url) = generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = format!("ssh -p {} agent@{}", inst.ssh_port, state.config.host_address);
+            let image = inst.image.clone().unwrap_or_else(|| state.config.openclaw_image.clone());
             Ok(Json(InstanceResponse {
                 name: inst.name,
                 token: inst.token,
@@ -601,6 +669,8 @@ async fn get_instance(
                 gateway_port: inst.gateway_port,
                 ssh_port: inst.ssh_port,
                 ssh_command,
+                image,
+                image_digest: inst.image_digest.clone(),
                 status,
                 created_at: inst.created_at.to_rfc3339(),
             }))
@@ -631,6 +701,7 @@ async fn list_instances(
             .unwrap_or_else(|_| "unknown".to_string());
         let (url, dashboard_url) = generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
         let ssh_command = format!("ssh -p {} agent@{}", inst.ssh_port, state.config.host_address);
+        let image = inst.image.clone().unwrap_or_else(|| state.config.openclaw_image.clone());
         responses.push(InstanceResponse {
             name: inst.name,
             token: inst.token,
@@ -639,6 +710,8 @@ async fn list_instances(
             gateway_port: inst.gateway_port,
             ssh_port: inst.ssh_port,
             ssh_command,
+            image,
+            image_digest: inst.image_digest.clone(),
             status,
             created_at: inst.created_at.to_rfc3339(),
         });
@@ -691,6 +764,7 @@ async fn delete_instance(
 
 #[utoipa::path(post, path = "/instances/{name}/restart", tag = "Instances",
     params(("name" = String, Path, description = "Instance name")),
+    request_body(content = Option<RestartInstanceRequest>, description = "Optional: provide image to switch to a different image on restart"),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "SSE stream of restart progress", content_type = "text/event-stream", body = SseEvent),
@@ -702,20 +776,60 @@ async fn restart_instance(
     _auth: AdminAuth,
     State(state): State<AppState>,
     Path(name): Path<String>,
+    body: Option<Json<RestartInstanceRequest>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    {
+    let new_image = match &body {
+        Some(Json(req)) => match &req.image {
+            Some(img) => {
+                validate_image(img)?;
+                Some(img.trim().to_string())
+            }
+            None => None,
+        },
+        None => None,
+    };
+
+    let inst = {
         let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
+        store.get(&name).cloned()
+    };
+    let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
     let stream = async_stream::stream! {
-        yield Ok(sse_stage("container_starting", "Restarting container..."));
+        if let Some(ref image) = new_image {
+            // Full recreate with new image
+            yield Ok(sse_stage("container_starting", &format!("Recreating container with image {}...", image)));
 
-        if let Err(e) = state.compose.restart(&name) {
-            yield Ok(sse_error(&format!("Failed to restart container: {}", e)));
-            return;
+            if let Err(e) = state.compose.up(
+                &name,
+                &inst.nearai_api_key,
+                &inst.token,
+                inst.gateway_port,
+                inst.ssh_port,
+                inst.ssh_pubkey.as_deref(),
+                image,
+            ) {
+                yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
+                return;
+            }
+
+            // Resolve new digest
+            let image_digest = state.compose.resolve_image_digest(&name);
+            if let Some(ref digest) = image_digest {
+                yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
+            }
+            {
+                let mut store = state.store.write().await;
+                let _ = store.set_image(&name, Some(image.clone()), image_digest);
+            }
+        } else {
+            // Simple restart
+            yield Ok(sse_stage("container_starting", "Restarting container..."));
+
+            if let Err(e) = state.compose.restart(&name) {
+                yield Ok(sse_error(&format!("Failed to restart container: {}", e)));
+                return;
+            }
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
@@ -869,6 +983,26 @@ async fn instance_events(
     };
 
     Ok(unbuffered_sse(stream))
+}
+
+#[utoipa::path(get, path = "/instances/{name}/attestation", tag = "Attestation",
+    params(("name" = String, Path, description = "Instance name")),
+    responses(
+        (status = 200, description = "Public attestation info for the instance", body = AttestationResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+    )
+)]
+async fn instance_attestation(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let store = state.store.read().await;
+    let inst = store.get(&name)
+        .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
+    Ok(Json(AttestationResponse {
+        name: inst.name.clone(),
+        image_digest: inst.image_digest.clone(),
+    }))
 }
 
 // ── Utilities ────────────────────────────────────────────────────────

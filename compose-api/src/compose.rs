@@ -15,15 +15,12 @@ pub struct ComposeManager {
     compose_file: PathBuf,
     /// Directory where per-instance .env files are written (e.g. data/envs/).
     env_dir: PathBuf,
-    /// Default OpenClaw image to pass as OPENCLAW_IMAGE.
-    default_image: String,
 }
 
 impl ComposeManager {
     pub fn new(
         compose_file: PathBuf,
         env_dir: PathBuf,
-        default_image: String,
     ) -> Result<Self, ApiError> {
         // Ensure the env directory exists
         std::fs::create_dir_all(&env_dir)
@@ -40,7 +37,6 @@ impl ComposeManager {
         Ok(Self {
             compose_file,
             env_dir,
-            default_image,
         })
     }
 
@@ -71,7 +67,7 @@ impl ComposeManager {
 
     // ── compose lifecycle ─────────────────────────────────────────────
 
-    /// `docker compose -p openclaw-{name} up -d`
+    /// `docker compose -p openclaw-{name} up -d --pull always`
     pub fn up(
         &self,
         name: &str,
@@ -80,19 +76,20 @@ impl ComposeManager {
         gateway_port: u16,
         ssh_port: u16,
         ssh_pubkey: Option<&str>,
+        image: &str,
     ) -> Result<(), ApiError> {
         let mut vars = HashMap::new();
         vars.insert("NEARAI_API_KEY".into(), nearai_api_key.into());
         vars.insert("OPENCLAW_GATEWAY_TOKEN".into(), token.into());
         vars.insert("GATEWAY_PORT".into(), gateway_port.to_string());
         vars.insert("SSH_PORT".into(), ssh_port.to_string());
-        vars.insert("OPENCLAW_IMAGE".into(), self.default_image.clone());
+        vars.insert("OPENCLAW_IMAGE".into(), image.to_string());
         if let Some(pk) = ssh_pubkey {
             vars.insert("SSH_PUBKEY".into(), pk.into());
         }
         let env_path = self.write_env_file(name, &vars)?;
 
-        self.compose_cmd(name, &env_path, &["up", "-d"])
+        self.compose_cmd(name, &env_path, &["up", "-d", "--pull", "always"])
     }
 
     /// `docker compose -p openclaw-{name} down -v` (removes volumes too)
@@ -187,6 +184,37 @@ impl ComposeManager {
             state: parts.first().unwrap_or(&"unknown").to_string(),
             health: parts.get(1).unwrap_or(&"none").to_string(),
         })
+    }
+
+    /// Resolve the registry digest for an instance's gateway container image.
+    /// Returns e.g. `docker.io/openclaw/worker@sha256:abcdef...` or `None` for local-only images.
+    pub fn resolve_image_digest(&self, name: &str) -> Option<String> {
+        let container = format!("openclaw-{}-gateway-1", name);
+
+        // Get the image ID from the running container
+        let output = Command::new("docker")
+            .args(["inspect", &container, "--format", "{{.Image}}"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let image_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if image_id.is_empty() {
+            return None;
+        }
+
+        // Get the RepoDigests from the image
+        let output = Command::new("docker")
+            .args(["inspect", &image_id, "--format", "{{json .RepoDigests}}"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let digests: Vec<String> = serde_json::from_str(&stdout).ok()?;
+        digests.into_iter().next()
     }
 
     // ── internal ──────────────────────────────────────────────────────
