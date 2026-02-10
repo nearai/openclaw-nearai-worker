@@ -70,7 +70,7 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/
     chown -R agent:agent /home/agent
 
 # Install pnpm, bun, and OpenClaw as agent user so they go to /home/agent/.npm-global/bin
-# This ensures they are in the agent user's PATH (npm config was already set above)
+# This ensures they are in the agent user's PATH (npm config is set in the same RUN instruction below)
 USER agent
 RUN npm config set prefix "/home/agent/.npm-global" && \
     npm install -g pnpm bun openclaw@2026.2.1 && \
