@@ -11,7 +11,7 @@
           {
             "id": "zai-org/GLM-4.7",
             "name": "GLM-4.7",
-            "reasoning": true,
+            "reasoning": false,
             "input": ["text"],
             "cost": {
               "input": 0.85,
