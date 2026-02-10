@@ -39,7 +39,10 @@ RUN apt-get update && \
 
 # Create non-root user for OpenClaw agents
 # Use UID 1001 to avoid conflict with default UID 1000
-RUN useradd -m -u 1001 agent
+RUN useradd -m -u 1001 -s /bin/bash agent
+
+# Global shell for the image (matches agent login shell; used by pnpm setup etc.)
+ENV SHELL=/bin/bash
 
 # Install Homebrew as the agent user (non-interactive mode)
 # Create the Homebrew directory structure and set ownership before installation
@@ -56,22 +59,22 @@ RUN curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.s
 USER root
 SHELL ["/bin/sh", "-c"]
 
-# Install pnpm and bun globally via npm (as root, available system-wide)
-RUN npm install -g pnpm bun
-
-# Configure SSH server, directories, brew, and npm for agent user
-RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/openclaw /home/agent/.npm-global && \
+# Configure SSH server, directories, brew, pnpm home, and npm for agent user
+RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/openclaw /home/agent/.npm-global /home/agent/.local/share/pnpm && \
     # Set ownership immediately after creating directories so agent user can write to them
     chown -R agent:agent /home/agent && \
     ssh-keygen -t ed25519 -f /home/agent/ssh/ssh_host_ed25519_key -N "" && \
     chmod 700 /home/agent/.ssh && \
     chown -R agent:agent /home/agent/.ssh /home/agent/ssh && \
+    # Ensure login shell (e.g. SSH) sources .bashrc so brew/pnpm/bun PATH and brew shellenv are set
+    printf '%s\n' '[ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"' > /home/agent/.profile && \
+    chown agent:agent /home/agent/.profile && \
     # Configure brew environment in .bashrc (PATH already in ENV, but shellenv sets additional variables)
     echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/agent/.bashrc && \
     # Configure npm to use local directory for global packages (prevents permission errors as non-root)
     # Ownership is already set above, so agent user can write npm config
     su - agent -c 'npm config set prefix "/home/agent/.npm-global"' && \
-    # Add npm-global to PATH in .bashrc (PATH already in ENV, but this ensures it's in shell sessions)
+    # Add npm-global to PATH in .bashrc (pnpm home is added by pnpm setup below)
     echo 'export PATH="/home/agent/.npm-global/bin:${PATH}"' >> /home/agent/.bashrc && \
     # Create symlink for easy brew access
     ln -s /home/linuxbrew/.linuxbrew/bin/brew /usr/local/bin/brew && \
@@ -79,10 +82,12 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/
     # Ensure all files created above are owned by agent user
     chown -R agent:agent /home/agent
 
-# Install OpenClaw as agent user so it goes to /home/agent/.npm-global/bin
-# This ensures it's in the agent user's PATH (npm config was already set above)
+# Install pnpm, bun, and OpenClaw as agent user so they go to /home/agent/.npm-global/bin
+# This ensures they are in the agent user's PATH (npm config was already set above)
 USER agent
-RUN npm install -g openclaw@2026.2.1
+RUN npm config set prefix "/home/agent/.npm-global" && \
+    npm install -g pnpm bun openclaw@2026.2.1 && \
+    /home/agent/.npm-global/bin/pnpm setup
 
 # Switch back to root for final setup
 USER root
@@ -94,7 +99,8 @@ COPY openclaw.json.template /app/openclaw.json.template
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production
-ENV PATH="/home/agent/.npm-global/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+ENV PNPM_HOME="/home/agent/.local/share/pnpm"
+ENV PATH="/home/agent/.npm-global/bin:/home/agent/.local/share/pnpm:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
 # Run entrypoint as root so it can fix volume ownership; main process drops to agent via runuser
 WORKDIR /home/agent
 
