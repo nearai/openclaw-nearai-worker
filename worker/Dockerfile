@@ -32,13 +32,15 @@ RUN apt-get update && \
       lsof \
       rsync \
       less \
-      nano && \
+      nano \
+      sudo && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Create non-root user for OpenClaw agents
 # Use UID 1001 to avoid conflict with default UID 1000
-RUN useradd -m -u 1001 agent
+RUN useradd -m -u 1001 agent && \
+    echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
 
 # Configure SSH server to run on non-privileged port 2222
 RUN mkdir -p /home/agent/.ssh /home/agent/ssh && \
