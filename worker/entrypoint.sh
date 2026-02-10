@@ -99,8 +99,6 @@ FORCE_REGEN="${OPENCLAW_FORCE_CONFIG_REGEN:-0}"
 if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; then
   if [ "${FORCE_REGEN}" = "1" ]; then
     echo "Force regenerating config from template (OPENCLAW_FORCE_CONFIG_REGEN=1)..."
-    # Also reset the device approval flag so auto-approve can run again
-    rm -f /home/agent/.openclaw/.device_approved 2>/dev/null || true
   else
     echo "Generating config from template..."
   fi
@@ -159,14 +157,14 @@ start_auto_approve_daemon() {
         fi
         
         # Get pending device requests
-        PENDING=$(su -s /bin/bash -c "openclaw devices list --json 2>/dev/null" agent || echo '{"pending":[]}')
+        PENDING=$(runuser -p -u agent -- openclaw devices list --json 2>/dev/null || echo '{"pending":[]}')
         
         # Get the first pending request ID only
         FIRST_REQUEST_ID=$(echo "$PENDING" | jq -r '.pending[0]?.requestId // empty' 2>/dev/null)
         
         if [ -n "$FIRST_REQUEST_ID" ]; then
           echo "Auto-approving first device pairing request: $FIRST_REQUEST_ID"
-          if su -s /bin/bash -c "openclaw devices approve '$FIRST_REQUEST_ID'" agent 2>/dev/null; then
+          if runuser -p -u agent -- openclaw devices approve "$FIRST_REQUEST_ID" 2>/dev/null; then
             # Mark that we've approved a device
             touch "$AUTO_APPROVE_FLAG"
             chown agent:agent "$AUTO_APPROVE_FLAG" 2>/dev/null || true
@@ -192,7 +190,8 @@ RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
 
 while true; do
   echo "Starting: $*"
-  su -s /bin/bash -c "$*" agent || true
+  # The -p flag preserves environment variables (including PATH set in Dockerfile)
+  runuser -p -u agent -- "$@" || true
   EXIT_CODE=$?
   echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."
   sleep "$RESTART_DELAY"

@@ -33,27 +33,53 @@ RUN apt-get update && \
       rsync \
       less \
       nano \
+      file \
       sudo && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Create non-root user for OpenClaw agents
 # Use UID 1001 to avoid conflict with default UID 1000
-RUN useradd -m -u 1001 agent && \
+RUN useradd -m -u 1001 -s /bin/bash agent && \
     echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
 
-# Configure SSH server to run on non-privileged port 2222
-RUN mkdir -p /home/agent/.ssh /home/agent/ssh && \
+# Global shell for the image (matches agent login shell; used by pnpm setup etc.)
+ENV SHELL=/bin/bash
+
+# Install Homebrew as the agent user (non-interactive mode)
+# Create the Homebrew directory structure and set ownership before installation
+USER root
+RUN mkdir -p /home/linuxbrew/.linuxbrew && \
+    chown -R agent:agent /home/linuxbrew
+
+# Switch to agent user and install Homebrew
+# The installer detects Docker environment and runs non-interactively
+USER agent
+RUN curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | bash
+
+# Switch back to root for remaining setup
+USER root
+
+# Configure SSH server, directories, brew, pnpm home, and npm for agent user
+RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/openclaw /home/agent/.npm-global /home/agent/.local/share/pnpm && \
     ssh-keygen -t ed25519 -f /home/agent/ssh/ssh_host_ed25519_key -N "" && \
     chmod 700 /home/agent/.ssh && \
-    chown -R agent:agent /home/agent/.ssh /home/agent/ssh
-
-# Install OpenClaw globally from npm
-RUN npm install -g openclaw@2026.2.1
-
-# Create directories for config and workspace
-RUN mkdir -p /home/agent/.openclaw /home/agent/openclaw && \
+    printf '%s\n' '[ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"' > /home/agent/.profile && \
+    echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/agent/.bashrc && \
+    echo 'export PATH="/home/agent/.npm-global/bin:${PATH}"' >> /home/agent/.bashrc && \
+    ln -s /home/linuxbrew/.linuxbrew/bin/brew /usr/local/bin/brew && \
+    chmod +x /usr/local/bin/brew && \
     chown -R agent:agent /home/agent
+
+# Install pnpm, bun, and OpenClaw as agent user so they go to /home/agent/.npm-global/bin
+# This ensures they are in the agent user's PATH (npm config is set in the same RUN instruction below)
+USER agent
+RUN npm config set prefix "/home/agent/.npm-global" && \
+    npm install -g pnpm bun openclaw@2026.2.1 && \
+    /home/agent/.npm-global/bin/pnpm setup
+
+# Switch back to root for final setup
+USER root
 
 # Copy entrypoint script and template
 COPY entrypoint.sh /app/entrypoint.sh
@@ -61,6 +87,8 @@ COPY openclaw.json.template /app/openclaw.json.template
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production
+ENV PNPM_HOME="/home/agent/.local/share/pnpm"
+ENV PATH="/home/agent/.npm-global/bin:/home/agent/.local/share/pnpm:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
 # Run entrypoint as root so it can fix volume ownership; main process drops to agent via runuser
 WORKDIR /home/agent
 

@@ -32,7 +32,7 @@ Deploy all local changes to the TDX CVM dev environment.
 
 5. **Rebuild worker** if any `worker/` files changed:
    ```
-   ssh tdx "cd /home/root/openclaw/worker && docker build --build-arg CACHEBUST=$(date +%s) -t openclaw-worker:local ."
+   ssh tdx "cd /home/root/openclaw/worker && docker build --build-arg CACHEBUST=$(date +%s) -t openclaw-nearai-worker:local ."
    ```
 
 6. **Redeploy** containers:
