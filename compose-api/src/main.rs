@@ -58,6 +58,7 @@ use store::{Instance, InstanceStore};
         download_backup_endpoint,
     ),
     components(schemas(
+        VersionResponse,
         CreateInstanceRequest,
         RestartInstanceRequest,
         InstanceInfo,
@@ -306,12 +307,23 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+struct VersionResponse {
+    version: &'static str,
+    git_commit: &'static str,
+    build_time: &'static str,
+}
+
 #[utoipa::path(get, path = "/version", tag = "System",
     security(),
-    responses((status = 200, description = "API version string", body = String))
+    responses((status = 200, description = "API version info", body = VersionResponse))
 )]
-async fn version() -> &'static str {
-    "instance_v1"
+async fn version() -> Json<VersionResponse> {
+    Json(VersionResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        git_commit: env!("GIT_COMMIT"),
+        build_time: env!("BUILD_TIME"),
+    })
 }
 
 // ── Request / Response types ─────────────────────────────────────────

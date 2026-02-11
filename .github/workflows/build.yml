@@ -9,17 +9,31 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/${{ github.event.repository.name }}
 
 jobs:
-  reproducible-docker-image:
-    name: Reproducible Docker Image
+  build:
+    name: Build ${{ matrix.name }}
     permissions:
       contents: read
       packages: write
       attestations: write
       id-token: write
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: openclaw-nearai-worker
+            context: worker
+            dockerfile: worker/Dockerfile
+            build_script: true
+          - name: openclaw-compose-api
+            context: compose-api
+            dockerfile: compose-api/Dockerfile
+            build_script: false
+          - name: openclaw-updater
+            context: updater
+            dockerfile: updater/Dockerfile
+            build_script: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,6 +44,9 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.DOCKER_REGISTRY_USER }}
           password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Set image repository
+        run: echo "IMAGE_REPOSITORY=${{ vars.DOCKER_REGISTRY_USER }}/${{ matrix.name }}" >> "$GITHUB_ENV"
 
       - name: Extract image tag from GitHub ref (branch or tag)
         run: |
@@ -48,18 +65,22 @@ jobs:
             echo "Unable to parse image tag from ${GITHUB_REF_TYPE}: ${GITHUB_REF_NAME}" >&2
             exit 1
           fi
-          echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${IMAGE_REPOSITORY}:${TAG}" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
+        if: matrix.build_script
         run: |
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
+      # Reproducible build path (worker only — uses build-image.sh)
       - name: Build and push reproducible image
+        if: matrix.build_script
         run: |
           ./deploy/build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
 
-      - name: Get image digest
+      - name: Get image digest (reproducible)
+        if: matrix.build_script
         run: |
           DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
           if [ -z "${DIGEST}" ]; then
@@ -67,6 +88,21 @@ jobs:
             exit 1
           fi
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+
+      # Standard Docker build path (compose-api, updater)
+      - name: Build and push image
+        if: ${{ !matrix.build_script }}
+        uses: docker/build-push-action@v6
+        id: docker_build
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ env.IMAGE_REFERENCE }}
+
+      - name: Get image digest (standard)
+        if: ${{ !matrix.build_script }}
+        run: echo "IMAGE_DIGEST=${{ steps.docker_build.outputs.digest }}" >> "$GITHUB_ENV"
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3

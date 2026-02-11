@@ -30,7 +30,7 @@ services:
     restart: unless-stopped
 
   compose-api:
-    image: openclaw-compose-api:local
+    image: ${COMPOSE_API_IMAGE:-openclaw-compose-api:local}
     network_mode: host
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -55,6 +55,30 @@ services:
     restart: unless-stopped
     depends_on:
       - dstack-ingress
+
+  openclaw-updater:
+    image: ${UPDATER_IMAGE:-openclaw-updater:local}
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - management-data:/app/data
+      - ${DEPLOY_DIR:-.}:/app/deploy:ro
+    environment:
+      - UPDATER_COMPOSE_API_IMAGE=${COMPOSE_API_IMAGE_REPO:-}
+      - UPDATER_WORKER_IMAGE=${WORKER_IMAGE_REPO:-}
+      - UPDATER_SELF_IMAGE=${UPDATER_IMAGE_REPO:-}
+      - UPDATER_CHANNEL=${UPDATER_CHANNEL:-latest}
+      - UPDATER_POLL_INTERVAL=${UPDATER_POLL_INTERVAL:-300}
+      - UPDATER_COMPOSE_FILE=/app/deploy/docker-compose.dstack.yml
+      - UPDATER_ENV_FILE=/app/deploy/.env
+      - UPDATER_COSIGN_IDENTITY_REGEXP=${UPDATER_COSIGN_IDENTITY:-}
+      - UPDATER_COSIGN_ISSUER=https://token.actions.githubusercontent.com
+      - UPDATER_HEALTH_URL=http://127.0.0.1:8080/health
+      - UPDATER_HEALTH_TIMEOUT=60
+      - UPDATER_STATE_FILE=/app/data/updater-state.json
+    restart: unless-stopped
+    depends_on:
+      - compose-api
 
 configs:
   openclaw_nginx:
