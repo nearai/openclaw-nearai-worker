@@ -34,6 +34,7 @@ RUN apt-get update && \
       less \
       nano \
       file \
+      login \
       sudo && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*

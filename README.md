@@ -219,8 +219,8 @@ The worker is preconfigured with the following models from NEAR AI Cloud. You ca
 
 | Model | ID | Context | Reasoning | Description |
 |-------|-----|---------|-----------|-------------|
-| **GLM-4.7** (default) | `nearai/zai-org/GLM-4.7` | 200K tokens | No | Z.ai GLM 4.7 — strong agentic coding, tool use, and reasoning. Default primary model. |
-| **DeepSeek V3.1** | `nearai/deepseek-ai/DeepSeek-V3.1` | 128K tokens | Yes | Hybrid model with thinking and non-thinking modes. Good for complex reasoning and tool use. |
+| **GLM-4.7** (default) | `nearai/zai-org/GLM-4.7` | 200K tokens | Yes | Z.ai GLM 4.7 — strong agentic coding, tool use, and reasoning. Default primary model. |
+| **DeepSeek V3.1** | `nearai/deepseek-ai/DeepSeek-V3.1` | 128K tokens | No | Hybrid model with thinking and non-thinking modes. Good for complex reasoning and tool use. |
 | **Qwen3 30B A3B Instruct** | `nearai/Qwen/Qwen3-30B-A3B-Instruct-2507` | 262K tokens | No | MoE model with long context. Efficient for instruction following and multilingual tasks. |
 
 **Using a specific model**
@@ -286,6 +286,11 @@ The gateway bind setting controls which network interfaces the gateway listens o
 - **`lan`** (default): Listens on all interfaces (0.0.0.0). The gateway is reachable from any device on the local network (and from the internet if the host is exposed).
 - **`loopback`**: Listens only on localhost (127.0.0.1). Access is limited to the same host. Use this when only local processes or port-forwarding need the gateway.
 
+## Built-in tools (su, sudo)
+
+- **su**: The `su` command is available (`login` package installed), but the `root` account is password-locked by default, so `su -` to root will typically **not** work unless you explicitly set a root password or adjust PAM policy.
+- **sudo**: The `agent` user has passwordless `sudo` enabled unconditionally (via `/etc/sudoers.d/agent`). Use `sudo su -` to become root, or `sudo <command>` for one-off elevation.
+
 ## Troubleshooting
 
 ### Check Container Status
@@ -349,7 +354,6 @@ Multi-tenant (Compose API + per-user workers):
 - `docker exec openclaw-gateway openclaw config` - Show config
 - `docker exec openclaw-gateway openclaw sysinfo` - Show system info
 - `docker exec -it openclaw-gateway /bin/bash` - Open shell in container
-
 
 ## License
 
