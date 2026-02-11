@@ -108,6 +108,8 @@ jobs:
           file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ env.IMAGE_REFERENCE }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
 
       - name: Get image digest (standard)
         if: ${{ !matrix.build_script }}

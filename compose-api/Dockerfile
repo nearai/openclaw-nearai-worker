@@ -3,8 +3,8 @@ FROM rust:1.93-bookworm AS builder
 
 WORKDIR /app
 
-# Copy manifests
-COPY Cargo.toml Cargo.lock* ./
+# Copy manifests and build script
+COPY Cargo.toml Cargo.lock* build.rs ./
 
 # Create dummy main.rs to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
@@ -15,6 +15,10 @@ RUN cargo build --release && rm -rf src
 # Bust cache so COPY src gets fresh code (pass --build-arg CACHEBUST=$(date +%s) for local dev)
 ARG CACHEBUST=0
 RUN echo "cachebust=$CACHEBUST"
+
+# Git commit for build metadata (git not available in Docker context)
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
 
 # Copy actual source code
 COPY src ./src
