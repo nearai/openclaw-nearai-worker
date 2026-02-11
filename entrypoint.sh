@@ -69,6 +69,18 @@ setup_ssh() {
 setup_ssh
 
 # ============================================
+# Optional sudo configuration for agent user
+# ============================================
+if [ "${ALLOW_AGENT_SUDO:-0}" = "1" ]; then
+  echo "Enabling passwordless sudo for agent (ALLOW_AGENT_SUDO=1)..."
+  echo "agent ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/agent-nopasswd
+  chmod 440 /etc/sudoers.d/agent-nopasswd
+else
+  # Keep restarts idempotent: remove drop-in if flag is not enabled
+  rm -f /etc/sudoers.d/agent-nopasswd
+fi
+
+# ============================================
 # OpenClaw Configuration
 # ============================================
 

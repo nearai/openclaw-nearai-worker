@@ -33,7 +33,9 @@ RUN apt-get update && \
       rsync \
       less \
       nano \
-      file && \
+      file \
+      login \
+      sudo && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
