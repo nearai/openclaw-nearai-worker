@@ -111,17 +111,16 @@ fetch_remote_digest() {
 
 verify_attestation() {
     local image_ref="$1"
-    log "Verifying SLSA provenance for ${image_ref}..."
+    log "Verifying cosign signature for ${image_ref}..."
 
-    if cosign verify-attestation \
-        --type slsaprovenance \
+    if cosign verify \
         --certificate-identity-regexp="$COSIGN_IDENTITY" \
         --certificate-oidc-issuer="$COSIGN_ISSUER" \
         "$image_ref" > /dev/null 2>&1; then
-        log "Attestation verified successfully"
+        log "Signature verified successfully"
         return 0
     else
-        log_error "Attestation verification FAILED for ${image_ref}"
+        log_error "Signature verification FAILED for ${image_ref}"
         return 1
     fi
 }

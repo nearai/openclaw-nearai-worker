@@ -115,12 +115,19 @@ jobs:
         if: ${{ !matrix.build_script }}
         run: echo "IMAGE_DIGEST=${{ steps.docker_build.outputs.digest }}" >> "$GITHUB_ENV"
 
-      - name: Generate artifact attestation
+      - name: Generate artifact attestation (GitHub)
         uses: actions/attest-build-provenance@v3
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
           push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
 
       - name: Generate build summary
         run: |
