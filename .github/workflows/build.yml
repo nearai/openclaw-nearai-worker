@@ -1,6 +1,11 @@
 name: Build & Deploy
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag override (default: branch-based)'
+        required: false
+        type: string
   push:
     branches:
       - main
@@ -50,7 +55,11 @@ jobs:
 
       - name: Extract image tag from GitHub ref (branch or tag)
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
+          # Use manual input tag if provided via workflow_dispatch
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+            echo "Using '${TAG}' image tag from workflow_dispatch input"
+          elif [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
             TAG=${GITHUB_REF_NAME#v}
             echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} tag"
           elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
