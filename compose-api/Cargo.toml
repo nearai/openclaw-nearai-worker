@@ -34,6 +34,12 @@ async-stream = "0.3"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
+# Backup: encryption + S3 storage
+age = { version = "0.11", features = ["ssh"] }
+flate2 = "1"
+aws-sdk-s3 = "1"
+aws-config = "1"
+
 # Logging
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

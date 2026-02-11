@@ -20,6 +20,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
+mod backup;
 mod compose;
 mod dns;
 mod error;
@@ -27,6 +28,7 @@ mod names;
 mod nginx_conf;
 mod store;
 
+use backup::BackupManager;
 use compose::ComposeManager;
 use dns::CloudflareDns;
 use error::ApiError;
@@ -51,6 +53,9 @@ use store::{Instance, InstanceStore};
         start_instance,
         instance_events,
         instance_attestation,
+        create_backup_endpoint,
+        list_backups_endpoint,
+        download_backup_endpoint,
     ),
     components(schemas(
         CreateInstanceRequest,
@@ -59,6 +64,9 @@ use store::{Instance, InstanceStore};
         InstanceResponse,
         InstancesListResponse,
         AttestationResponse,
+        BackupInfoResponse,
+        BackupListResponse,
+        BackupDownloadResponse,
         SseEvent,
         ErrorResponse,
     )),
@@ -92,6 +100,7 @@ struct AppState {
     store: Arc<RwLock<InstanceStore>>,
     config: AppConfig,
     dns: Option<Arc<CloudflareDns>>,
+    backup: Option<Arc<BackupManager>>,
 }
 
 #[derive(Clone)]
@@ -216,6 +225,14 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(RwLock::new(InstanceStore::load_or_create("data/users.json")?));
 
+    let backup = match BackupManager::from_env().await {
+        Some(bm) => Some(Arc::new(bm)),
+        None => {
+            tracing::info!("Backup not configured (BACKUP_S3_BUCKET not set)");
+            None
+        }
+    };
+
     if let Some(ref domain) = config.openclaw_domain {
         tracing::info!("OPENCLAW_DOMAIN set: instance URLs will use https://{{name}}.{}", domain);
     }
@@ -225,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         config,
         dns,
+        backup,
     };
 
     update_nginx_now(&state).await;
@@ -245,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health_check))
         .route("/version", get(version))
         .route("/instances", get(list_instances))
@@ -256,7 +274,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
         .route("/instances/{name}/events", get(instance_events))
-        .route("/instances/{name}/attestation", get(instance_attestation))
+        .route("/instances/{name}/attestation", get(instance_attestation));
+
+    if state.backup.is_some() {
+        app = app
+            .route("/instances/{name}/backup", post(create_backup_endpoint))
+            .route("/instances/{name}/backups", get(list_backups_endpoint))
+            .route("/instances/{name}/backups/{id}", get(download_backup_endpoint));
+    }
+
+    let app = app
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -370,6 +397,27 @@ struct AttestationResponse {
 struct ErrorResponse {
     /// Error message
     error: String,
+}
+
+/// Single backup info
+#[derive(Serialize, utoipa::ToSchema)]
+struct BackupInfoResponse {
+    id: String,
+    timestamp: String,
+    size_bytes: i64,
+}
+
+/// List of backups
+#[derive(Serialize, utoipa::ToSchema)]
+struct BackupListResponse {
+    backups: Vec<BackupInfoResponse>,
+}
+
+/// Presigned download URL for a backup
+#[derive(Serialize, utoipa::ToSchema)]
+struct BackupDownloadResponse {
+    url: String,
+    expires_in_seconds: u64,
 }
 
 fn validate_image(image: &str) -> Result<(), ApiError> {
@@ -1031,6 +1079,147 @@ async fn instance_attestation(
     }))
 }
 
+// ── Backup handlers ──────────────────────────────────────────────────
+
+#[utoipa::path(post, path = "/instances/{name}/backup", tag = "Backups",
+    params(("name" = String, Path, description = "Instance name")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "SSE stream of backup progress", content_type = "text/event-stream", body = SseEvent),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+        (status = 501, description = "Backups not configured", body = ErrorResponse),
+    )
+)]
+async fn create_backup_endpoint(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let backup_mgr = state
+        .backup
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("Backup not configured".into()))?
+        .clone();
+
+    let inst = {
+        let store = state.store.read().await;
+        store.get(&name).cloned()
+    };
+    let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
+
+    let stream = async_stream::stream! {
+        yield Ok(sse_stage("encrypting", "Exporting and encrypting workspace..."));
+
+        let result = backup_mgr
+            .create_backup(&name, &inst.ssh_pubkey, &state.compose)
+            .await;
+
+        match result {
+            Ok(info) => {
+                yield Ok(sse_stage("uploading", "Encrypted backup uploaded to S3"));
+                yield Ok(Event::default()
+                    .json_data(serde_json::json!({
+                        "stage": "complete",
+                        "message": format!("Backup complete: {}", info.id),
+                        "backup": {
+                            "id": info.id,
+                            "timestamp": info.timestamp.to_rfc3339(),
+                            "size_bytes": info.size_bytes,
+                        }
+                    }))
+                    .unwrap());
+            }
+            Err(e) => {
+                yield Ok(sse_error(&format!("Backup failed: {}", e)));
+            }
+        }
+    };
+
+    Ok(unbuffered_sse(stream))
+}
+
+#[utoipa::path(get, path = "/instances/{name}/backups", tag = "Backups",
+    params(("name" = String, Path, description = "Instance name")),
+    security(),
+    responses(
+        (status = 200, description = "List of available backups", body = BackupListResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+        (status = 501, description = "Backups not configured", body = ErrorResponse),
+    )
+)]
+async fn list_backups_endpoint(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let backup_mgr = state
+        .backup
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("Backup not configured".into()))?;
+
+    {
+        let store = state.store.read().await;
+        if store.get(&name).is_none() {
+            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
+        }
+    }
+
+    let backups = backup_mgr
+        .list_backups(&name)
+        .await
+        .map_err(|e| ApiError::Internal(e))?;
+
+    let items: Vec<BackupInfoResponse> = backups
+        .into_iter()
+        .map(|b| BackupInfoResponse {
+            id: b.id,
+            timestamp: b.timestamp.to_rfc3339(),
+            size_bytes: b.size_bytes,
+        })
+        .collect();
+
+    Ok(Json(BackupListResponse { backups: items }))
+}
+
+#[utoipa::path(get, path = "/instances/{name}/backups/{id}", tag = "Backups",
+    params(
+        ("name" = String, Path, description = "Instance name"),
+        ("id" = String, Path, description = "Backup ID (timestamp)"),
+    ),
+    security(),
+    responses(
+        (status = 200, description = "Presigned download URL", body = BackupDownloadResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+        (status = 501, description = "Backups not configured", body = ErrorResponse),
+    )
+)]
+async fn download_backup_endpoint(
+    State(state): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let backup_mgr = state
+        .backup
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("Backup not configured".into()))?;
+
+    {
+        let store = state.store.read().await;
+        if store.get(&name).is_none() {
+            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
+        }
+    }
+
+    let url = backup_mgr
+        .download_url(&name, &id)
+        .await
+        .map_err(|e| ApiError::Internal(e))?;
+
+    Ok(Json(BackupDownloadResponse {
+        url,
+        expires_in_seconds: 3600,
+    }))
+}
+
 // ── Utilities ────────────────────────────────────────────────────────
 
 async fn update_nginx_now(state: &AppState) {
@@ -1096,6 +1285,10 @@ async fn background_sync_loop(state: AppState) {
     let mut dns_tick: u32 = 0;
     const DNS_SYNC_INTERVAL: u32 = 12;
 
+    // Scheduled backups every 6 hours (6 * 60 * 60 / 5 = 4320 ticks at 5s interval)
+    let mut backup_tick: u32 = 0;
+    const BACKUP_INTERVAL: u32 = 4320;
+
     tracing::info!("Background sync loop started (domain: {})", domain);
 
     loop {
@@ -1122,6 +1315,35 @@ async fn background_sync_loop(state: AppState) {
                 let names: Vec<String> = instances.iter().map(|i| i.name.clone()).collect();
                 if let Err(e) = dns.sync_all_records(&names, &domain, app_id, 443).await {
                     tracing::warn!("DNS sync failed: {}", e);
+                }
+            }
+        }
+
+        backup_tick += 1;
+        if backup_tick >= BACKUP_INTERVAL {
+            backup_tick = 0;
+            if let Some(ref backup_mgr) = state.backup {
+                for inst in &instances {
+                    if !inst.active {
+                        continue;
+                    }
+                    tracing::info!("Scheduled backup for instance: {}", inst.name);
+                    match backup_mgr
+                        .create_backup(&inst.name, &inst.ssh_pubkey, &state.compose)
+                        .await
+                    {
+                        Ok(info) => {
+                            tracing::info!(
+                                "Scheduled backup complete for {}: {} ({} bytes)",
+                                inst.name,
+                                info.id,
+                                info.size_bytes
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Scheduled backup failed for {}: {}", inst.name, e);
+                        }
+                    }
                 }
             }
         }
