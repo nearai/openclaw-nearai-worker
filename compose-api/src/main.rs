@@ -51,7 +51,6 @@ use store::{Instance, InstanceStore};
         restart_instance,
         stop_instance,
         start_instance,
-        instance_events,
         instance_attestation,
         create_backup_endpoint,
         list_backups_endpoint,
@@ -274,7 +273,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/{name}/restart", post(restart_instance))
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
-        .route("/instances/{name}/events", get(instance_events))
         .route("/instances/{name}/attestation", get(instance_attestation));
 
     if state.backup.is_some() {
@@ -1018,43 +1016,6 @@ async fn start_instance(
         update_nginx_now(&state).await;
         tracing::info!("Started instance: {}", name);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
-        let poll_state = state.clone();
-        let poll_name = name.clone();
-        tokio::spawn(async move {
-            poll_health_to_ready(&poll_state, &poll_name, &tx).await;
-        });
-
-        while let Some(event) = rx.recv().await {
-            yield Ok(event);
-        }
-    };
-
-    Ok(unbuffered_sse(stream))
-}
-
-#[utoipa::path(get, path = "/instances/{name}/events", tag = "Instances",
-    params(("name" = String, Path, description = "Instance name")),
-    security(("bearer_auth" = [])),
-    responses(
-        (status = 200, description = "SSE stream of container health events", content_type = "text/event-stream", body = SseEvent),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Instance not found", body = ErrorResponse),
-    )
-)]
-async fn instance_events(
-    _auth: AdminAuth,
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
-    {
-        let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
-
-    let stream = async_stream::stream! {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
         let poll_state = state.clone();
         let poll_name = name.clone();
