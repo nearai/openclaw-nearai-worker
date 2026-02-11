@@ -42,12 +42,6 @@ setup_ssh() {
     # Unlock agent account to allow SSH key-based login (account may be locked by default)
     passwd -d agent 2>/dev/null || usermod -U agent 2>/dev/null || true
 
-    # Optional: allow agent to use sudo (e.g. su to root) without password
-    if [ "${ALLOW_AGENT_SUDO:-0}" = "1" ]; then
-      echo "agent ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/agent-nopasswd
-      chmod 440 /etc/sudoers.d/agent-nopasswd
-    fi
-
     # Start SSH daemon on port 2222 (non-privileged); listen on all interfaces for external access
     echo "Starting SSH daemon on port 2222..."
     SSHD_OUTPUT=$(/usr/sbin/sshd -f /dev/null \
@@ -73,6 +67,18 @@ setup_ssh() {
 }
 
 setup_ssh
+
+# ============================================
+# Optional sudo configuration for agent user
+# ============================================
+if [ "${ALLOW_AGENT_SUDO:-0}" = "1" ]; then
+  echo "Enabling passwordless sudo for agent (ALLOW_AGENT_SUDO=1)..."
+  echo "agent ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/agent-nopasswd
+  chmod 440 /etc/sudoers.d/agent-nopasswd
+else
+  # Keep restarts idempotent: remove drop-in if flag is not enabled
+  rm -f /etc/sudoers.d/agent-nopasswd
+fi
 
 # ============================================
 # OpenClaw Configuration

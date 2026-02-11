@@ -141,8 +141,8 @@ The gateway bind setting controls which network interfaces the gateway listens o
 
 ## Built-in tools (su, sudo)
 
-- **su**: The `su` command is available. When SSH'd in as `agent`, you can run `su -` to switch to root (root password required unless you set `ALLOW_AGENT_SUDO=1`).
-- **sudo**: Installed; use `ALLOW_AGENT_SUDO=1` to allow the `agent` user to run any command as root without a password (e.g. `sudo su -`).
+- **su**: The `su` command is available, but in most container images the `root` account is password-locked by default, so `su -` to root will typically **not** work unless you explicitly set a root password or adjust PAM policy.
+- **sudo**: Installed; setting `ALLOW_AGENT_SUDO=1` enables passwordless `sudo` for the `agent` user (e.g. `sudo su -` to become root, or `sudo <command>` for one-off elevation). This flag does **not** change how `su -` authenticates.
 
 ## Troubleshooting
 
