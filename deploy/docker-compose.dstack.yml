@@ -70,7 +70,7 @@ services:
       - UPDATER_CHANNEL=${UPDATER_CHANNEL:-latest}
       - UPDATER_POLL_INTERVAL=${UPDATER_POLL_INTERVAL:-300}
       - UPDATER_COMPOSE_FILE=/app/deploy/docker-compose.dstack.yml
-      - UPDATER_ENV_FILE=/app/deploy/.env
+      - UPDATER_ENV_FILE=/app/deploy/.env.dstack
       - UPDATER_COSIGN_IDENTITY_REGEXP=${UPDATER_COSIGN_IDENTITY:-}
       - UPDATER_COSIGN_ISSUER=https://token.actions.githubusercontent.com
       - UPDATER_HEALTH_URL=http://127.0.0.1:8080/health
