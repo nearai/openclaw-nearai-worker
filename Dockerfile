@@ -35,9 +35,7 @@ RUN apt-get update && \
       nano \
       file \
       login \
-      sudo \
-      systemd \
-      systemd-sysv && \
+      sudo && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
