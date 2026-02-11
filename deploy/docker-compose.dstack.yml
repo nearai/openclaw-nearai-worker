@@ -48,6 +48,10 @@ services:
       - INGRESS_CONTAINER_NAME=dstack-ingress
       - COMPOSE_FILE=/app/docker-compose.worker.yml
       - LISTEN_ADDR=0.0.0.0:8080
+      - BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
+      - BACKUP_S3_REGION=${BACKUP_S3_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
     restart: unless-stopped
     depends_on:
       - dstack-ingress
