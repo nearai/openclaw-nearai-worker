@@ -62,7 +62,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - management-data:/app/data
-      - ${DEPLOY_DIR:-.}:/app/deploy:ro
+      - ${DEPLOY_DIR:-.}:/app/deploy
     environment:
       - UPDATER_COMPOSE_API_IMAGE=${COMPOSE_API_IMAGE_REPO:-}
       - UPDATER_WORKER_IMAGE=${WORKER_IMAGE_REPO:-}
