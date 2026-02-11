@@ -33,7 +33,11 @@ RUN apt-get update && \
       rsync \
       less \
       nano \
-      file && \
+      file \
+      login \
+      sudo \
+      systemd \
+      systemd-sysv && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 

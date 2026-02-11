@@ -12,6 +12,8 @@ services:
       OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
       # Optional: SSH public key for key-based login (enables SSH server on port 2222; required for external SSH).
       SSH_PUBKEY: ${SSH_PUBKEY:-}
+      # Optional: allow agent to run sudo without password (e.g. su to root). Set to "1" to enable.
+      ALLOW_AGENT_SUDO: ${ALLOW_AGENT_SUDO:-0}
     volumes:
       - openclaw-config:/home/agent/.openclaw
       - openclaw-workspace:/home/agent/openclaw

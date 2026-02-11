@@ -30,6 +30,7 @@ Optional variables:
 - `OPENCLAW_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
 - `OPENCLAW_GATEWAY_BIND`: Gateway bind address — `lan` (default) or `loopback`. See [Gateway binding and security](#gateway-binding-and-security).
 - `SSH_PUBKEY`: Your SSH public key (e.g. contents of `~/.ssh/id_ed25519.pub`). When set, enables SSH server on port 2222 for key-based login as user `agent`. See [SSH access](#ssh-access).
+- `ALLOW_AGENT_SUDO`: Set to `1` to allow the `agent` user to run `sudo` without password (e.g. `sudo su -` to become root). Useful for debugging; leave unset or `0` in production.
 
 ### Running
 
@@ -138,6 +139,12 @@ The gateway bind setting controls which network interfaces the gateway listens o
 - **`lan`** (default): Listens on all interfaces (0.0.0.0). The gateway is reachable from any device on the local network (and from the internet if the host is exposed).
 - **`loopback`**: Listens only on localhost (127.0.0.1). Access is limited to the same host. Use this when only local processes or port-forwarding need the gateway.
 
+## Built-in tools (su, sudo, systemd)
+
+- **su**: The `su` command is available. When SSH'd in as `agent`, you can run `su -` to switch to root (root password required unless you set `ALLOW_AGENT_SUDO=1`).
+- **sudo**: Installed; use `ALLOW_AGENT_SUDO=1` to allow the `agent` user to run any command as root without a password (e.g. `sudo su -`).
+- **systemd**: The `systemd` package is installed so that `systemctl`, `journalctl`, `hostnamectl`, etc. are available. The container does **not** run systemd as PID 1; the entrypoint runs the OpenClaw gateway directly. Service units will not start unless you run an init that starts systemd.
+
 ## Troubleshooting
 
 ### Check Container Status
@@ -194,7 +201,6 @@ docker compose exec openclaw-gateway openclaw models list
 - `docker exec openclaw-gateway openclaw config` - Show config
 - `docker exec openclaw-gateway openclaw sysinfo` - Show system info
 - `docker exec -it openclaw-gateway /bin/bash` - Open shell in container
-
 
 ## License
 
