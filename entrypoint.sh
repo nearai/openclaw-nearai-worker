@@ -145,6 +145,24 @@ fi
 mkdir -p /home/agent/openclaw
 chmod 700 /home/agent/openclaw 2>/dev/null || true
 
+# Copy workspace bootstrap files (SOUL.md, TOOLS.md, etc.) if they don't already exist
+# These are injected into the system prompt by OpenClaw automatically
+if [ -d /app/workspace ]; then
+  for f in /app/workspace/*.md; do
+    [ -f "$f" ] || continue
+    fname=$(basename "$f")
+    if [ ! -f "/home/agent/openclaw/$fname" ]; then
+      cp "$f" "/home/agent/openclaw/$fname"
+      chown agent:agent "/home/agent/openclaw/$fname"
+      echo "Bootstrap file $fname installed to workspace"
+    fi
+  done
+fi
+
+# Final ownership fix: ensure everything is owned by agent before dropping privileges
+# (config generation and bootstrap above may have created files as root)
+chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
+
 # Execute the command with automatic restart (openclaw is installed globally)
 # The loop keeps the container alive and restarts the gateway if it exits
 RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
