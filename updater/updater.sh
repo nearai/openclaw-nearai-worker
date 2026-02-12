@@ -3,14 +3,33 @@ set -euo pipefail
 
 # ── Configuration (all from environment) ──────────────────────────────
 
-COMPOSE_API_IMAGE="${UPDATER_COMPOSE_API_IMAGE:?UPDATER_COMPOSE_API_IMAGE is required}"
+# Soft defaults — allow empty during chicken-and-egg transition
+COMPOSE_API_IMAGE="${UPDATER_COMPOSE_API_IMAGE:-}"
 WORKER_IMAGE="${UPDATER_WORKER_IMAGE:-}"
 CHANNEL="${UPDATER_CHANNEL:-latest}"
 POLL_INTERVAL="${UPDATER_POLL_INTERVAL:-300}"
 COMPOSE_FILE="${UPDATER_COMPOSE_FILE:?UPDATER_COMPOSE_FILE is required}"
 ENV_FILE="${UPDATER_ENV_FILE:?UPDATER_ENV_FILE is required}"
 BASE_ENV_FILE="${UPDATER_BASE_ENV_FILE:-}"
-COSIGN_IDENTITY="${UPDATER_COSIGN_IDENTITY_REGEXP:?UPDATER_COSIGN_IDENTITY_REGEXP is required}"
+COSIGN_IDENTITY="${UPDATER_COSIGN_IDENTITY_REGEXP:-}"
+
+# Auto-detect dstack mode by checking well-known path
+DSTACK_ENV_PATH="/app/deploy/.host-shared/.decrypted-env"
+if [ -z "$BASE_ENV_FILE" ] && [ -f "$DSTACK_ENV_PATH" ]; then
+    BASE_ENV_FILE="$DSTACK_ENV_PATH"
+fi
+
+# Fill missing required vars from base env (chicken-and-egg fix)
+if [ -n "$BASE_ENV_FILE" ] && [ -f "$BASE_ENV_FILE" ]; then
+    _read_base() { grep "^${1}=" "$BASE_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-; }
+    [ -z "$COMPOSE_API_IMAGE" ] && COMPOSE_API_IMAGE="$(_read_base COMPOSE_API_IMAGE_REPO)"
+    [ -z "$COSIGN_IDENTITY" ]   && COSIGN_IDENTITY="$(_read_base UPDATER_COSIGN_IDENTITY)"
+    unset -f _read_base
+fi
+
+# Validate required configuration
+[ -z "$COMPOSE_API_IMAGE" ] && { echo "FATAL: UPDATER_COMPOSE_API_IMAGE is required" >&2; exit 1; }
+[ -z "$COSIGN_IDENTITY" ]   && { echo "FATAL: UPDATER_COSIGN_IDENTITY_REGEXP is required" >&2; exit 1; }
 COSIGN_ISSUER="${UPDATER_COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
 HEALTH_URL="${UPDATER_HEALTH_URL:-http://127.0.0.1:8080/health}"
 HEALTH_TIMEOUT="${UPDATER_HEALTH_TIMEOUT:-60}"
@@ -398,6 +417,9 @@ main() {
             log "Seeded compose-api digest from running container: ${current}"
         fi
     fi
+
+    # Self-update first, before touching any other services
+    update_self || true
 
     local self_check_counter=0
 
