@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# Run from repo root so worker/ is the build context
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
 # Parse command line arguments
 PUSH=false
 REPO=""
@@ -45,9 +50,10 @@ git rev-parse HEAD > .GIT_REV
 
 TEMP_TAG="openclaw-nearai-worker-temp:$(date +%s)"
 docker buildx build --builder buildkit_20 --no-cache --platform linux/amd64 \
+    -f worker/Dockerfile \
     --build-arg SOURCE_DATE_EPOCH="0" \
     --output type=oci,dest=./oci.tar,rewrite-timestamp=true \
-    --output type=docker,name="$TEMP_TAG",rewrite-timestamp=true .
+    --output type=docker,name="$TEMP_TAG",rewrite-timestamp=true ./worker
 
 if [ "$?" -ne 0 ]; then
     echo "Build failed"

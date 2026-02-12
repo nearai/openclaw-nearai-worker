@@ -1,0 +1,39 @@
+# Multi-Tenant OpenClaw with host nginx + certbot (HTTPS)
+#
+# Use this when nginx and certbot run on the host. No reverse proxy in Docker.
+#
+# 1. Set OPENCLAW_DOMAIN in deploy/.env.prod (e.g. openclaw.example.com).
+# 2. Build first: cd compose-api && docker build --build-arg CACHEBUST=$(date +%s) -t openclaw-compose-api:local .
+# 3. Deploy: docker compose -f deploy/docker-compose.nginx.yml --env-file deploy/.env.prod up -d
+# 4. Configure nginx: copy deploy/nginx-openclaw.conf, replace OPENCLAW_DOMAIN, enable site, reload nginx.
+# 5. Get certs: sudo certbot --nginx -d OPENCLAW_DOMAIN -d "*.OPENCLAW_DOMAIN"
+#
+# Compose API is published on 47392 so host nginx can proxy to 127.0.0.1:47392.
+
+services:
+  compose-api:
+    image: openclaw-compose-api:local
+    container_name: openclaw-compose-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LISTEN_PORT:-47392}:${LISTEN_PORT:-47392}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - management-data:/app/data
+    environment:
+      - RUST_LOG=info
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - OPENCLAW_DOMAIN=${OPENCLAW_DOMAIN:-}
+      - OPENCLAW_HOST_ADDRESS=${OPENCLAW_DOMAIN:-localhost}
+      - OPENCLAW_IMAGE=${OPENCLAW_IMAGE:-openclaw-nearai-worker:local}
+      - COMPOSE_FILE=${COMPOSE_FILE:-/app/docker-compose.worker.yml}
+      - LISTEN_ADDR=0.0.0.0:${LISTEN_PORT:-47392}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${LISTEN_PORT:-47392}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  management-data:

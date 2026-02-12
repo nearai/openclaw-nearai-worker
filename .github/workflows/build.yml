@@ -1,6 +1,11 @@
 name: Build & Deploy
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag override (default: branch-based)'
+        required: false
+        type: string
   push:
     branches:
       - main
@@ -9,17 +14,31 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/${{ github.event.repository.name }}
 
 jobs:
-  reproducible-docker-image:
-    name: Reproducible Docker Image
+  build:
+    name: Build ${{ matrix.name }}
     permissions:
       contents: read
       packages: write
       attestations: write
       id-token: write
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: openclaw-nearai-worker
+            context: worker
+            dockerfile: worker/Dockerfile
+            build_script: true
+          - name: openclaw-compose-api
+            context: compose-api
+            dockerfile: compose-api/Dockerfile
+            build_script: false
+          - name: openclaw-updater
+            context: updater
+            dockerfile: updater/Dockerfile
+            build_script: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,9 +50,16 @@ jobs:
           username: ${{ vars.DOCKER_REGISTRY_USER }}
           password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
 
+      - name: Set image repository
+        run: echo "IMAGE_REPOSITORY=${{ vars.DOCKER_REGISTRY_USER }}/${{ matrix.name }}" >> "$GITHUB_ENV"
+
       - name: Extract image tag from GitHub ref (branch or tag)
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
+          # Use manual input tag if provided via workflow_dispatch
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+            echo "Using '${TAG}' image tag from workflow_dispatch input"
+          elif [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
             TAG=${GITHUB_REF_NAME#v}
             echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} tag"
           elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
@@ -48,18 +74,22 @@ jobs:
             echo "Unable to parse image tag from ${GITHUB_REF_TYPE}: ${GITHUB_REF_NAME}" >&2
             exit 1
           fi
-          echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${IMAGE_REPOSITORY}:${TAG}" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
+        if: matrix.build_script
         run: |
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
+      # Reproducible build path (worker only — uses build-image.sh)
       - name: Build and push reproducible image
+        if: matrix.build_script
         run: |
-          ./build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
+          ./deploy/build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
 
-      - name: Get image digest
+      - name: Get image digest (reproducible)
+        if: matrix.build_script
         run: |
           DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
           if [ -z "${DIGEST}" ]; then
@@ -68,12 +98,36 @@ jobs:
           fi
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
 
-      - name: Generate artifact attestation
+      # Standard Docker build path (compose-api, updater)
+      - name: Build and push image
+        if: ${{ !matrix.build_script }}
+        uses: docker/build-push-action@v6
+        id: docker_build
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ env.IMAGE_REFERENCE }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Get image digest (standard)
+        if: ${{ !matrix.build_script }}
+        run: echo "IMAGE_DIGEST=${{ steps.docker_build.outputs.digest }}" >> "$GITHUB_ENV"
+
+      - name: Generate artifact attestation (GitHub)
         uses: actions/attest-build-provenance@v3
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
           push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
 
       - name: Generate build summary
         run: |

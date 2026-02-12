@@ -1,0 +1,45 @@
+[package]
+name = "openclaw-compose-api"
+version = "0.1.0"
+edition = "2021"
+description = "Compose API for multi-tenant OpenClaw deployment"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1.44", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
+
+# Utilities
+uuid = { version = "1.12", features = ["v4"] }
+rand = "0.9"
+hex = "0.4.3"
+chrono = { version = "0.4.39", features = ["serde"] }
+thiserror = "2"
+anyhow = "1.0.95"
+
+# HTTP client (Cloudflare API)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# SSE streaming
+tokio-stream = "0.1"
+futures-util = "0.3"
+async-stream = "0.3"
+
+# OpenAPI docs
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+# Backup: encryption + S3 storage
+age = { version = "0.11", features = ["ssh"] }
+flate2 = "1"
+aws-sdk-s3 = "1"
+aws-config = "1"
+
+# Logging
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

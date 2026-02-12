@@ -41,7 +41,8 @@ RUN apt-get update && \
 
 # Create non-root user for OpenClaw agents
 # Use UID 1001 to avoid conflict with default UID 1000
-RUN useradd -m -u 1001 -s /bin/bash agent
+RUN useradd -m -u 1001 -s /bin/bash agent && \
+    echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
 
 # Global shell for the image (matches agent login shell; used by pnpm setup etc.)
 ENV SHELL=/bin/bash

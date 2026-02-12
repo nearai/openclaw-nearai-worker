@@ -69,18 +69,6 @@ setup_ssh() {
 setup_ssh
 
 # ============================================
-# Optional sudo configuration for agent user
-# ============================================
-if [ "${ALLOW_AGENT_SUDO:-0}" = "1" ]; then
-  echo "Enabling passwordless sudo for agent (ALLOW_AGENT_SUDO=1)..."
-  echo "agent ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/agent-nopasswd
-  chmod 440 /etc/sudoers.d/agent-nopasswd
-else
-  # Keep restarts idempotent: remove drop-in if flag is not enabled
-  rm -f /etc/sudoers.d/agent-nopasswd
-fi
-
-# ============================================
 # OpenClaw Configuration
 # ============================================
 
@@ -159,9 +147,60 @@ if [ -d /app/workspace ]; then
   done
 fi
 
+# ============================================
+# Auto-approve Device Pairing (for multi-tenant deployment)
+# ============================================
+# When OPENCLAW_AUTO_APPROVE_DEVICES=1, automatically approve the FIRST device pairing request only.
+# Subsequent devices require manual approval for security.
+# This is useful for headless/automated deployments where initial setup needs automation.
+AUTO_APPROVE_DEVICES="${OPENCLAW_AUTO_APPROVE_DEVICES:-0}"
+AUTO_APPROVE_FLAG="/home/agent/.openclaw/.device_approved"
+
+start_auto_approve_daemon() {
+  if [ "$AUTO_APPROVE_DEVICES" = "1" ]; then
+    echo "Starting auto-approve daemon for first device pairing..."
+    (
+      # Wait for gateway to start
+      sleep 10
+
+      while true; do
+        # Check if we already approved a device - if so, exit daemon
+        if [ -f "$AUTO_APPROVE_FLAG" ]; then
+          echo "First device already approved. Auto-approve daemon exiting."
+          exit 0
+        fi
+
+        # Get pending device requests
+        PENDING=$(runuser -p -u agent -- openclaw devices list --json 2>/dev/null || echo '{"pending":[]}')
+
+        # Get the first pending request ID only
+        FIRST_REQUEST_ID=$(echo "$PENDING" | jq -r '.pending[0]?.requestId // empty' 2>/dev/null)
+
+        if [ -n "$FIRST_REQUEST_ID" ]; then
+          echo "Auto-approving first device pairing request: $FIRST_REQUEST_ID"
+          if runuser -p -u agent -- openclaw devices approve "$FIRST_REQUEST_ID" 2>/dev/null; then
+            # Mark that we've approved a device
+            touch "$AUTO_APPROVE_FLAG"
+            chown agent:agent "$AUTO_APPROVE_FLAG" 2>/dev/null || true
+            echo "First device approved. Subsequent devices require manual approval."
+            echo "Auto-approve daemon exiting."
+            exit 0
+          fi
+        fi
+
+        # Check every 5 seconds
+        sleep 5
+      done
+    ) &
+    echo "Auto-approve daemon started (will approve first device only)"
+  fi
+}
+
 # Final ownership fix: ensure everything is owned by agent before dropping privileges
 # (config generation and bootstrap above may have created files as root)
 chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
+
+start_auto_approve_daemon
 
 # Execute the command with automatic restart (openclaw is installed globally)
 # The loop keeps the container alive and restarts the gateway if it exits

@@ -1,6 +1,17 @@
 .env
 .env.*
 !.env.example
+!.env.dstack.example
+!env.prod.example
 .build/
 *.log
 node_modules/
+
+# Rust build artifacts
+compose-api/target/
+
+# Runtime data
+compose-api/data/
+
+# Reference repos
+dstack/

@@ -1,0 +1,131 @@
+services:
+  cert-init:
+    image: alpine:3
+    volumes:
+      - cert-data:/etc/letsencrypt
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /etc/letsencrypt/live && ln -sfn ${OPENCLAW_DOMAIN} '/etc/letsencrypt/live/*.${OPENCLAW_DOMAIN}'"]
+    restart: "no"
+
+  dstack-ingress:
+    image: dstacktee/dstack-ingress:20250929
+    container_name: dstack-ingress
+    network_mode: host
+    environment:
+      - DOMAINS=*.${OPENCLAW_DOMAIN}
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+      - DNS_PROVIDER=cloudflare
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - /var/run/tappd.sock:/var/run/tappd.sock
+      - cert-data:/etc/letsencrypt
+      - nginx-dynamic:/data/nginx
+    configs:
+      - source: openclaw_nginx
+        target: /etc/nginx/conf.d/openclaw.conf
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  compose-api:
+    image: ${COMPOSE_API_IMAGE:-openclaw-compose-api:local}
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - management-data:/app/data
+      - nginx-dynamic:/data/nginx
+    environment:
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - OPENCLAW_DOMAIN=${OPENCLAW_DOMAIN}
+      - OPENCLAW_IMAGE=${OPENCLAW_IMAGE}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
+      - NGINX_MAP_PATH=/data/nginx/backends.map
+      - INGRESS_CONTAINER_NAME=dstack-ingress
+      - COMPOSE_FILE=/app/docker-compose.worker.yml
+      - LISTEN_ADDR=0.0.0.0:8080
+      - BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
+      - BACKUP_S3_REGION=${BACKUP_S3_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+    restart: unless-stopped
+    depends_on:
+      - dstack-ingress
+
+  openclaw-updater:
+    image: ${UPDATER_IMAGE:-openclaw-updater:local}
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - management-data:/app/data
+      - ${DEPLOY_DIR:-.}:/app/deploy
+    environment:
+      - UPDATER_COMPOSE_API_IMAGE=${COMPOSE_API_IMAGE_REPO:-}
+      - UPDATER_WORKER_IMAGE=${WORKER_IMAGE_REPO:-}
+      - UPDATER_SELF_IMAGE=${UPDATER_IMAGE_REPO:-}
+      - UPDATER_CHANNEL=${UPDATER_CHANNEL:-latest}
+      - UPDATER_POLL_INTERVAL=${UPDATER_POLL_INTERVAL:-300}
+      - UPDATER_COMPOSE_FILE=${UPDATER_COMPOSE_FILE:-/app/deploy/docker-compose.dstack.yml}
+      - UPDATER_ENV_FILE=${UPDATER_ENV_FILE:-/app/deploy/.env.dstack}
+      - UPDATER_BASE_ENV_FILE=${UPDATER_BASE_ENV_FILE:-}
+      - UPDATER_COMPOSE_PROJECT=${UPDATER_COMPOSE_PROJECT:-}
+      - UPDATER_COSIGN_IDENTITY_REGEXP=${UPDATER_COSIGN_IDENTITY:-}
+      - UPDATER_COSIGN_ISSUER=https://token.actions.githubusercontent.com
+      - UPDATER_HEALTH_URL=http://127.0.0.1:8080/health
+      - UPDATER_HEALTH_TIMEOUT=60
+      - UPDATER_STATE_FILE=/app/data/updater-state.json
+    restart: unless-stopped
+    depends_on:
+      - compose-api
+
+configs:
+  openclaw_nginx:
+    content: |
+      map $$host $$openclaw_backend {
+          include /data/nginx/backends.map;
+      }
+
+      server {
+          listen 80 default_server;
+          listen 443 ssl;
+          server_name *.${OPENCLAW_DOMAIN};
+
+          ssl_certificate /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/privkey.pem;
+
+          location / {
+              proxy_pass $$openclaw_backend;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $$http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $$host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $$scheme;
+          }
+      }
+
+      server {
+          listen 443 ssl;
+          server_name api.${OPENCLAW_DOMAIN};
+
+          ssl_certificate /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/privkey.pem;
+
+          location / {
+              proxy_pass http://127.0.0.1:8080;
+              proxy_set_header Host $$host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $$scheme;
+          }
+      }
+
+volumes:
+  cert-data:
+  nginx-dynamic:
+  management-data:
