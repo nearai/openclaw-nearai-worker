@@ -87,8 +87,13 @@ impl ComposeManager {
         vars.insert("SSH_PUBKEY".into(), ssh_pubkey.into());
         let env_path = self.write_env_file(name, &vars)?;
 
-        // Only pull from registry for digest-pinned images; local images use --pull never
-        let pull_policy = if image.contains("@sha256:") { "always" } else { "never" };
+        // Pull from registry for remote images (contain '/') or digest-pinned references;
+        // local-only images (no '/') use --pull never
+        let pull_policy = if image.contains('/') || image.contains("@sha256:") {
+            "always"
+        } else {
+            "never"
+        };
         self.compose_cmd(name, &env_path, &["up", "-d", "--pull", pull_policy], Some(&vars))
     }
 
