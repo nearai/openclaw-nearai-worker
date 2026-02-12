@@ -19,7 +19,7 @@
               "cacheRead": 0,
               "cacheWrite": 0
             },
-            "contextWindow": 128000,
+            "contextWindow": 115200,
             "maxTokens": 8192
           },
           {
@@ -33,7 +33,7 @@
               "cacheRead": 0,
               "cacheWrite": 0
             },
-            "contextWindow": 128000,
+            "contextWindow": 115200,
             "maxTokens": 8192
           },
           {
@@ -47,7 +47,7 @@
               "cacheRead": 0,
               "cacheWrite": 0
             },
-            "contextWindow": 262144,
+            "contextWindow": 235900,
             "maxTokens": 8192
           }
         ]
@@ -68,7 +68,8 @@
       "maxConcurrent": 4,
       "subagents": {
         "maxConcurrent": 8
-      }
+      },
+      "bootstrapMaxChars": 48000
     }
   },
   "gateway": {
