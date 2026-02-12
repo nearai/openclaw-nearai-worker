@@ -217,20 +217,24 @@ impl ComposeManager {
         digests.into_iter().next()
     }
 
-    // ── workspace export ──────────────────────────────────────────────
+    // ── instance data export ────────────────────────────────────────────
 
-    /// Export the workspace directory from an instance's gateway container as a tar archive.
-    /// Uses `docker cp` to stream the contents of `/home/agent/openclaw/`.
-    pub fn export_workspace(&self, name: &str) -> Result<Vec<u8>, ApiError> {
+    /// Export both the config volume (`.openclaw/`) and workspace volume (`openclaw/`)
+    /// from an instance's gateway container as a single tar archive.
+    /// Uses `docker exec tar` to capture both directories relative to `/home/agent/`.
+    pub fn export_instance_data(&self, name: &str) -> Result<Vec<u8>, ApiError> {
         let container = format!("openclaw-{}-gateway-1", name);
         let output = Command::new("docker")
-            .args(["cp", &format!("{}:/home/agent/openclaw/.", container), "-"])
+            .args([
+                "exec", &container,
+                "tar", "cf", "-", "-C", "/home/agent", ".openclaw", "openclaw",
+            ])
             .output()
-            .map_err(|e| ApiError::Internal(format!("Failed to run docker cp: {}", e)))?;
+            .map_err(|e| ApiError::Internal(format!("Failed to run docker exec tar: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ApiError::Internal(format!("docker cp failed: {}", stderr)));
+            return Err(ApiError::Internal(format!("docker exec tar failed: {}", stderr)));
         }
 
         Ok(output.stdout)

@@ -117,6 +117,12 @@ impl InstanceStore {
         self.instances.values().cloned().collect()
     }
 
+    /// Serialize the store to JSON bytes for backup.
+    pub fn to_json(&self) -> Result<Vec<u8>, ApiError> {
+        serde_json::to_vec_pretty(&self)
+            .map_err(|e| ApiError::Internal(format!("Failed to serialize store: {}", e)))
+    }
+
     /// Returns (gateway_port, ssh_port) - two consecutive ports
     pub fn next_available_ports(&self) -> (u16, u16) {
         let used_ports: std::collections::HashSet<u16> = self.instances.values()

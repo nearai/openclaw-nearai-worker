@@ -1318,6 +1318,22 @@ async fn background_sync_loop(state: AppState) {
                         }
                     }
                 }
+
+                // Backup instance metadata (users.json) after instance backups
+                let metadata_json = {
+                    let store = state.store.read().await;
+                    store.to_json()
+                };
+                match metadata_json {
+                    Ok(data) => {
+                        if let Err(e) = backup_mgr.backup_metadata(&data).await {
+                            tracing::warn!("Metadata backup failed: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to serialize metadata for backup: {}", e);
+                    }
+                }
             }
         }
     }

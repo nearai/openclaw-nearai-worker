@@ -44,21 +44,21 @@ impl BackupManager {
         Some(Self { s3, bucket })
     }
 
-    /// Create an encrypted backup of an instance's workspace.
-    /// Exports workspace → gzip → age-encrypt with SSH pubkey → upload to S3.
+    /// Create an encrypted backup of an instance's config and workspace volumes.
+    /// Exports both .openclaw/ and openclaw/ → gzip → age-encrypt with SSH pubkey → upload to S3.
     pub async fn create_backup(
         &self,
         instance_name: &str,
         ssh_pubkey: &str,
         compose: &ComposeManager,
     ) -> Result<BackupInfo, String> {
-        // Export workspace tar from container
+        // Export both config + workspace as a single tar from container
         let tar_bytes = compose
-            .export_workspace(instance_name)
+            .export_instance_data(instance_name)
             .map_err(|e| format!("export failed: {}", e))?;
 
         if tar_bytes.is_empty() {
-            return Err("workspace export returned empty data".into());
+            return Err("instance data export returned empty data".into());
         }
 
         // Gzip compress
@@ -135,6 +135,25 @@ impl BackupManager {
 
         backups.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         Ok(backups)
+    }
+
+    /// Upload a snapshot of the instance metadata (users.json) to S3.
+    /// Overwrites the same key each time — not versioned.
+    pub async fn backup_metadata(&self, data: &[u8]) -> Result<(), String> {
+        let key = "metadata/users.json";
+
+        self.s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(data.to_vec().into())
+            .content_type("application/json")
+            .send()
+            .await
+            .map_err(|e| format!("S3 metadata upload failed: {}", e))?;
+
+        tracing::info!("Metadata backup uploaded ({} bytes)", data.len());
+        Ok(())
     }
 
     /// Generate a presigned download URL for a backup (~1h expiry).
