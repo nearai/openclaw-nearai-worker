@@ -11,12 +11,16 @@ POLL_INTERVAL="${UPDATER_POLL_INTERVAL:-300}"
 COMPOSE_FILE="${UPDATER_COMPOSE_FILE:?UPDATER_COMPOSE_FILE is required}"
 ENV_FILE="${UPDATER_ENV_FILE:?UPDATER_ENV_FILE is required}"
 BASE_ENV_FILE="${UPDATER_BASE_ENV_FILE:-}"
+COMPOSE_PROJECT="${UPDATER_COMPOSE_PROJECT:-}"
 COSIGN_IDENTITY="${UPDATER_COSIGN_IDENTITY_REGEXP:-}"
 
 # Auto-detect dstack mode by checking well-known path
 DSTACK_ENV_PATH="/app/deploy/.host-shared/.decrypted-env"
 if [ -z "$BASE_ENV_FILE" ] && [ -f "$DSTACK_ENV_PATH" ]; then
     BASE_ENV_FILE="$DSTACK_ENV_PATH"
+fi
+if [ -z "$COMPOSE_PROJECT" ] && [ -n "$BASE_ENV_FILE" ]; then
+    COMPOSE_PROJECT="dstack"
 fi
 
 # Fill missing required vars from base env (chicken-and-egg fix)
@@ -173,13 +177,18 @@ wait_for_healthy() {
 # In dstack mode (BASE_ENV_FILE set), passes both base and overrides
 # so that overrides win. In standalone mode, passes only ENV_FILE.
 compose_up() {
+    local project_flag=()
+    if [ -n "$COMPOSE_PROJECT" ]; then
+        project_flag=(-p "$COMPOSE_PROJECT")
+    fi
+
     if [ -n "$BASE_ENV_FILE" ]; then
-        docker compose -f "$COMPOSE_FILE" \
+        docker compose "${project_flag[@]}" -f "$COMPOSE_FILE" \
             --env-file "$BASE_ENV_FILE" \
             --env-file "$ENV_FILE" \
             up "$@"
     else
-        docker compose -f "$COMPOSE_FILE" \
+        docker compose "${project_flag[@]}" -f "$COMPOSE_FILE" \
             --env-file "$ENV_FILE" \
             up "$@"
     fi
@@ -400,6 +409,7 @@ main() {
         log "  mode:              standalone"
         log "  env file:          ${ENV_FILE}"
     fi
+    log "  compose project:   ${COMPOSE_PROJECT:-<auto>}"
     log "  compose-api image: ${COMPOSE_API_IMAGE}"
     log "  worker image:      ${WORKER_IMAGE:-<not configured>}"
     log "  channel:           ${CHANNEL}"

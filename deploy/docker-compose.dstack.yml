@@ -72,6 +72,7 @@ services:
       - UPDATER_COMPOSE_FILE=${UPDATER_COMPOSE_FILE:-/app/deploy/docker-compose.dstack.yml}
       - UPDATER_ENV_FILE=${UPDATER_ENV_FILE:-/app/deploy/.env.dstack}
       - UPDATER_BASE_ENV_FILE=${UPDATER_BASE_ENV_FILE:-}
+      - UPDATER_COMPOSE_PROJECT=${UPDATER_COMPOSE_PROJECT:-}
       - UPDATER_COSIGN_IDENTITY_REGEXP=${UPDATER_COSIGN_IDENTITY:-}
       - UPDATER_COSIGN_ISSUER=https://token.actions.githubusercontent.com
       - UPDATER_HEALTH_URL=http://127.0.0.1:8080/health
