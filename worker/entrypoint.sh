@@ -133,6 +133,20 @@ fi
 mkdir -p /home/agent/openclaw
 chmod 700 /home/agent/openclaw 2>/dev/null || true
 
+# Copy workspace bootstrap files (SOUL.md, TOOLS.md, etc.) if they don't already exist
+# These are injected into the system prompt by OpenClaw automatically
+if [ -d /app/workspace ]; then
+  for f in /app/workspace/*.md; do
+    [ -f "$f" ] || continue
+    fname=$(basename "$f")
+    if [ ! -f "/home/agent/openclaw/$fname" ]; then
+      cp "$f" "/home/agent/openclaw/$fname"
+      chown agent:agent "/home/agent/openclaw/$fname"
+      echo "Bootstrap file $fname installed to workspace"
+    fi
+  done
+fi
+
 # ============================================
 # Auto-approve Device Pairing (for multi-tenant deployment)
 # ============================================
@@ -148,20 +162,20 @@ start_auto_approve_daemon() {
     (
       # Wait for gateway to start
       sleep 10
-      
+
       while true; do
         # Check if we already approved a device - if so, exit daemon
         if [ -f "$AUTO_APPROVE_FLAG" ]; then
           echo "First device already approved. Auto-approve daemon exiting."
           exit 0
         fi
-        
+
         # Get pending device requests
         PENDING=$(runuser -p -u agent -- openclaw devices list --json 2>/dev/null || echo '{"pending":[]}')
-        
+
         # Get the first pending request ID only
         FIRST_REQUEST_ID=$(echo "$PENDING" | jq -r '.pending[0]?.requestId // empty' 2>/dev/null)
-        
+
         if [ -n "$FIRST_REQUEST_ID" ]; then
           echo "Auto-approving first device pairing request: $FIRST_REQUEST_ID"
           if runuser -p -u agent -- openclaw devices approve "$FIRST_REQUEST_ID" 2>/dev/null; then
@@ -173,7 +187,7 @@ start_auto_approve_daemon() {
             exit 0
           fi
         fi
-        
+
         # Check every 5 seconds
         sleep 5
       done
@@ -181,6 +195,10 @@ start_auto_approve_daemon() {
     echo "Auto-approve daemon started (will approve first device only)"
   fi
 }
+
+# Final ownership fix: ensure everything is owned by agent before dropping privileges
+# (config generation and bootstrap above may have created files as root)
+chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
 
 start_auto_approve_daemon
 

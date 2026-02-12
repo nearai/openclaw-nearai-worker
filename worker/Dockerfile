@@ -82,9 +82,10 @@ RUN npm config set prefix "/home/agent/.npm-global" && \
 # Switch back to root for final setup
 USER root
 
-# Copy entrypoint script and template
+# Copy entrypoint script, config template, and workspace bootstrap files
 COPY entrypoint.sh /app/entrypoint.sh
 COPY openclaw.json.template /app/openclaw.json.template
+COPY workspace/ /app/workspace/
 RUN chmod +x /app/entrypoint.sh
 
 ENV NODE_ENV=production

@@ -2,8 +2,11 @@ node_modules
 dist
 .git
 .github
-*.md
-!README.md
+CLAUDE.md
+CONTRIBUTING.md
+LICENSE.md
+CHANGELOG.md
+LOCAL_TESTING.md
 .env
 .env.*
 *.log
