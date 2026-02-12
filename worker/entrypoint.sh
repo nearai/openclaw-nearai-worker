@@ -145,6 +145,20 @@ if [ -d /app/workspace ]; then
       echo "Bootstrap file $fname installed to workspace"
     fi
   done
+
+  # Copy pre-installed skills to managed location (shared across all agents)
+  if [ -d /app/workspace/skills ]; then
+    mkdir -p /home/agent/.openclaw/skills
+    for skill_dir in /app/workspace/skills/*/; do
+      [ -d "$skill_dir" ] || continue
+      skill_name=$(basename "$skill_dir")
+      if [ ! -d "/home/agent/.openclaw/skills/$skill_name" ]; then
+        cp -r "$skill_dir" "/home/agent/.openclaw/skills/$skill_name"
+        echo "Skill '$skill_name' installed to managed skills"
+      fi
+    done
+    chown -R agent:agent /home/agent/.openclaw/skills
+  fi
 fi
 
 # ============================================
