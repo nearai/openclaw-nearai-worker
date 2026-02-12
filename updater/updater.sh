@@ -9,6 +9,7 @@ CHANNEL="${UPDATER_CHANNEL:-latest}"
 POLL_INTERVAL="${UPDATER_POLL_INTERVAL:-300}"
 COMPOSE_FILE="${UPDATER_COMPOSE_FILE:?UPDATER_COMPOSE_FILE is required}"
 ENV_FILE="${UPDATER_ENV_FILE:?UPDATER_ENV_FILE is required}"
+BASE_ENV_FILE="${UPDATER_BASE_ENV_FILE:-}"
 COSIGN_IDENTITY="${UPDATER_COSIGN_IDENTITY_REGEXP:?UPDATER_COSIGN_IDENTITY_REGEXP is required}"
 COSIGN_ISSUER="${UPDATER_COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
 HEALTH_URL="${UPDATER_HEALTH_URL:-http://127.0.0.1:8080/health}"
@@ -147,19 +148,45 @@ wait_for_healthy() {
     return 1
 }
 
-# ── Env file helpers ─────────────────────────────────────────────────
+# ── Compose helper ───────────────────────────────────────────────────
 
-# Read a value from the env file
-read_env_var() {
-    local key="$1"
-    if [ -f "$ENV_FILE" ]; then
-        grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-
+# Run docker compose up with the correct env-file flags.
+# In dstack mode (BASE_ENV_FILE set), passes both base and overrides
+# so that overrides win. In standalone mode, passes only ENV_FILE.
+compose_up() {
+    if [ -n "$BASE_ENV_FILE" ]; then
+        docker compose -f "$COMPOSE_FILE" \
+            --env-file "$BASE_ENV_FILE" \
+            --env-file "$ENV_FILE" \
+            up "$@"
+    else
+        docker compose -f "$COMPOSE_FILE" \
+            --env-file "$ENV_FILE" \
+            up "$@"
     fi
 }
 
-# Set a value in the env file (add or replace)
+# ── Env file helpers ─────────────────────────────────────────────────
+
+# Read a value: check overrides first, fall back to base env
+read_env_var() {
+    local key="$1"
+    local val=""
+    # Check overrides file first
+    if [ -f "$ENV_FILE" ]; then
+        val="$(grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-)"
+    fi
+    # Fall back to base env if set and no override found
+    if [ -z "$val" ] && [ -n "$BASE_ENV_FILE" ] && [ -f "$BASE_ENV_FILE" ]; then
+        val="$(grep "^${key}=" "$BASE_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-)"
+    fi
+    echo "$val"
+}
+
+# Set a value in the overrides env file (add or replace)
 write_env_var() {
     local key="$1" value="$2"
+    touch "$ENV_FILE"
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
         local tmp="${ENV_FILE}.tmp"
         sed "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
@@ -217,7 +244,7 @@ update_compose_api() {
 
     # 8. Apply update
     log "Applying compose-api update..."
-    if ! docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --no-deps compose-api; then
+    if ! compose_up -d --no-deps compose-api; then
         log_error "docker compose up failed, attempting rollback..."
         rollback_compose_api "$old_image" "$old_digest"
         return 1
@@ -244,7 +271,7 @@ rollback_compose_api() {
     fi
 
     log "Rolling back compose-api..."
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --no-deps compose-api || true
+    compose_up -d --no-deps compose-api || true
 
     if wait_for_healthy "$HEALTH_TIMEOUT"; then
         log "Rollback successful"
@@ -294,7 +321,7 @@ update_worker_image() {
 
     # Restart compose-api so it picks up the new default image
     log "Restarting compose-api to pick up new worker image..."
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --no-deps compose-api
+    compose_up -d --no-deps compose-api
 
     if wait_for_healthy "$HEALTH_TIMEOUT"; then
         log "compose-api restarted with new worker image"
@@ -339,13 +366,21 @@ update_self() {
     log "Self-updating to ${image_ref}..."
 
     # This will replace our own container — Docker handles the transition
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --no-deps openclaw-updater
+    compose_up -d --no-deps openclaw-updater
 }
 
 # ── Main loop ────────────────────────────────────────────────────────
 
 main() {
     log "Starting openclaw-updater"
+    if [ -n "$BASE_ENV_FILE" ]; then
+        log "  mode:              dstack (base + overrides)"
+        log "  base env:          ${BASE_ENV_FILE}"
+        log "  overrides env:     ${ENV_FILE}"
+    else
+        log "  mode:              standalone"
+        log "  env file:          ${ENV_FILE}"
+    fi
     log "  compose-api image: ${COMPOSE_API_IMAGE}"
     log "  worker image:      ${WORKER_IMAGE:-<not configured>}"
     log "  channel:           ${CHANNEL}"
