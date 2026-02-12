@@ -69,7 +69,13 @@
       "subagents": {
         "maxConcurrent": 8
       },
-      "bootstrapMaxChars": 48000
+      "bootstrapMaxChars": 48000,
+      "blockStreamingDefault": "on",
+      "blockStreamingBreak": "text_end",
+      "blockStreamingChunk": { "minChars": 200, "maxChars": 600 },
+      "blockStreamingCoalesce": { "idleMs": 150 },
+      "humanDelay": { "mode": "natural" },
+      "typingMode": "thinking"
     }
   },
   "gateway": {
