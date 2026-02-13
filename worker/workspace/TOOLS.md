@@ -4,7 +4,7 @@ Skills define _how_ tools work. This file is for _your_ specifics — the stuff 
 
 ## Environment
 
-This container includes: python3, node/npm/pnpm/bun, git, brew, curl, wget, jq, and standard Unix tools.
+This container includes: python3/pip, node/npm/pnpm/bun, git, brew, curl, wget, jq, and standard Unix tools.
 
 ## Tool Selection Guide
 
@@ -16,11 +16,11 @@ This container includes: python3, node/npm/pnpm/bun, git, brew, curl, wget, jq, 
 
 ## OpenClaw CLI
 
-Use `openclaw` to manage configuration, channels, skills, cron jobs, and more. Run `openclaw --help` to explore. Prefer the CLI over editing config files directly.
+Use `openclaw` to manage configuration, channels, skills, and more. Run `openclaw --help` to explore.
 
 ## Skills
 
-Skills are bundled, workspace-local, or installed from ClawHub. Eligible skills are auto-discovered and available in your system prompt. Run `openclaw skills` to see what's available and ready.
+Skills extend what you can do. Check available skills with `openclaw skills`. Install more from ClawHub with `clawhub install <name>`. Skills are auto-discovered and loaded when relevant.
 
 ## Evolving Your Toolkit
 

@@ -60,16 +60,22 @@
         "primary": "nearai/zai-org/GLM-4.7"
       },
       "models": {
-        "nearai/zai-org/GLM-4.7": {},
-        "nearai/deepseek-ai/DeepSeek-V3.1": {},
-        "nearai/Qwen/Qwen3-30B-A3B-Instruct-2507": {}
+        "nearai/zai-org/GLM-4.7": { "params": { "temperature": 0.7 } },
+        "nearai/deepseek-ai/DeepSeek-V3.1": { "params": { "temperature": 0.7 } },
+        "nearai/Qwen/Qwen3-30B-A3B-Instruct-2507": { "params": { "temperature": 0.7 } }
       },
       "workspace": "/home/agent/openclaw",
       "maxConcurrent": 4,
       "subagents": {
         "maxConcurrent": 8
       },
-      "bootstrapMaxChars": 48000
+      "bootstrapMaxChars": 48000,
+      "blockStreamingDefault": "on",
+      "blockStreamingBreak": "text_end",
+      "blockStreamingChunk": { "minChars": 200, "maxChars": 600 },
+      "blockStreamingCoalesce": { "idleMs": 150 },
+      "humanDelay": { "mode": "natural" },
+      "typingMode": "thinking"
     }
   },
   "gateway": {

@@ -21,6 +21,7 @@ You wake up fresh each session. Files are your only continuity.
 ### Rules
 
 - If you want to remember something, **write it to a file**. Mental notes don't survive restarts.
+- After meaningful sessions, create or update `MEMORY.md` with key facts, decisions, and context worth keeping.
 - When you learn a lesson — update AGENTS.md, TOOLS.md, or the relevant file.
 - Remove outdated info from MEMORY.md when it's no longer relevant.
 
