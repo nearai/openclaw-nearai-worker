@@ -137,25 +137,6 @@ impl BackupManager {
         Ok(backups)
     }
 
-    /// Upload a snapshot of the instance metadata (users.json) to S3.
-    /// Overwrites the same key each time — not versioned.
-    pub async fn backup_metadata(&self, data: &[u8]) -> Result<(), String> {
-        let key = "metadata/users.json";
-
-        self.s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(data.to_vec().into())
-            .content_type("application/json")
-            .send()
-            .await
-            .map_err(|e| format!("S3 metadata upload failed: {}", e))?;
-
-        tracing::info!("Metadata backup uploaded ({} bytes)", data.len());
-        Ok(())
-    }
-
     /// Generate a presigned download URL for a backup (~1h expiry).
     pub async fn download_url(
         &self,
@@ -188,8 +169,9 @@ fn encrypt_with_ssh_pubkey(data: &[u8], ssh_pubkey: &str) -> Result<Vec<u8>, Str
         .map_err(|e| format!("invalid SSH public key: {:?}", e))?;
 
     let recipient: Box<dyn age::Recipient + Send> = Box::new(recipient);
-    let encryptor = age::Encryptor::with_recipients(std::iter::once(&*recipient as &dyn age::Recipient))
-        .map_err(|e| format!("encryptor init failed: {:?}", e))?;
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(&*recipient as &dyn age::Recipient))
+            .map_err(|e| format!("encryptor init failed: {:?}", e))?;
 
     let mut encrypted = Vec::new();
     let mut writer = encryptor

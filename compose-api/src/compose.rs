@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::ApiError;
+use crate::store::Instance;
 
 pub struct ContainerHealth {
     pub state: String,
@@ -18,10 +19,7 @@ pub struct ComposeManager {
 }
 
 impl ComposeManager {
-    pub fn new(
-        compose_file: PathBuf,
-        env_dir: PathBuf,
-    ) -> Result<Self, ApiError> {
+    pub fn new(compose_file: PathBuf, env_dir: PathBuf) -> Result<Self, ApiError> {
         // Ensure the env directory exists
         std::fs::create_dir_all(&env_dir)
             .map_err(|e| ApiError::Internal(format!("Failed to create env dir: {}", e)))?;
@@ -94,7 +92,12 @@ impl ComposeManager {
         } else {
             "never"
         };
-        self.compose_cmd(name, &env_path, &["up", "-d", "--pull", pull_policy], Some(&vars))
+        self.compose_cmd(
+            name,
+            &env_path,
+            &["up", "-d", "--pull", pull_policy],
+            Some(&vars),
+        )
     }
 
     /// `docker compose -p openclaw-{name} down -v` (removes volumes too)
@@ -180,7 +183,10 @@ impl ComposeManager {
                     health: "none".into(),
                 });
             }
-            return Err(ApiError::Internal(format!("docker inspect failed: {}", stderr)));
+            return Err(ApiError::Internal(format!(
+                "docker inspect failed: {}",
+                stderr
+            )));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -231,18 +237,212 @@ impl ComposeManager {
         let container = format!("openclaw-{}-gateway-1", name);
         let output = Command::new("docker")
             .args([
-                "exec", &container,
-                "tar", "cf", "-", "-C", "/home/agent", ".openclaw", "openclaw",
+                "exec",
+                &container,
+                "tar",
+                "cf",
+                "-",
+                "-C",
+                "/home/agent",
+                ".openclaw",
+                "openclaw",
             ])
             .output()
             .map_err(|e| ApiError::Internal(format!("Failed to run docker exec tar: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ApiError::Internal(format!("docker exec tar failed: {}", stderr)));
+            return Err(ApiError::Internal(format!(
+                "docker exec tar failed: {}",
+                stderr
+            )));
         }
 
         Ok(output.stdout)
+    }
+
+    // ── discovery ─────────────────────────────────────────────────────
+
+    /// Discover all managed instances from Docker containers.
+    /// Uses the `openclaw.managed=true` label to find gateway containers,
+    /// then inspects each to rebuild Instance structs.
+    pub fn discover_instances(&self) -> Result<Vec<Instance>, ApiError> {
+        let output = Command::new("docker")
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                "label=openclaw.managed=true",
+                "--format",
+                "{{.Names}}",
+            ])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("failed to run docker ps: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!("docker ps failed: {}", stderr)));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut instances = Vec::new();
+
+        for line in stdout.lines() {
+            let container_name = line.trim();
+            if container_name.is_empty() {
+                continue;
+            }
+
+            // Match pattern: openclaw-{name}-gateway-1
+            let name = match container_name
+                .strip_prefix("openclaw-")
+                .and_then(|s| s.strip_suffix("-gateway-1"))
+            {
+                Some(n) => n.to_string(),
+                None => {
+                    tracing::debug!("skipping non-gateway container: {}", container_name);
+                    continue;
+                }
+            };
+
+            match self.inspect_container(container_name) {
+                Ok(inst) => instances.push(inst),
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to inspect container {} (instance {}): {}",
+                        container_name,
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(instances)
+    }
+
+    /// Inspect a single container and build an Instance from its metadata.
+    fn inspect_container(&self, container_name: &str) -> Result<Instance, ApiError> {
+        let output = Command::new("docker")
+            .args(["inspect", container_name, "--format", "{{json .}}"])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("failed to run docker inspect: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!(
+                "docker inspect failed: {}",
+                stderr
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|e| {
+            ApiError::Internal(format!("failed to parse docker inspect json: {}", e))
+        })?;
+
+        // Extract instance name from container name: openclaw-{name}-gateway-1
+        let name = container_name
+            .strip_prefix("openclaw-")
+            .and_then(|s| s.strip_suffix("-gateway-1"))
+            .ok_or_else(|| {
+                ApiError::Internal(format!("unexpected container name: {}", container_name))
+            })?
+            .to_string();
+
+        // Parse env vars from .Config.Env (array of "KEY=VALUE" strings)
+        let env_map: HashMap<String, String> = v
+            .pointer("/Config/Env")
+            .and_then(|e| e.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str())
+                    .filter_map(|s| s.split_once('='))
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let token = env_map
+            .get("OPENCLAW_GATEWAY_TOKEN")
+            .cloned()
+            .unwrap_or_default();
+        let ssh_pubkey = env_map.get("SSH_PUBKEY").cloned().unwrap_or_default();
+        let nearai_api_key = env_map.get("NEARAI_API_KEY").cloned().unwrap_or_default();
+        let image_env = env_map.get("OPENCLAW_IMAGE").cloned();
+
+        // Parse port bindings from .HostConfig.PortBindings
+        let port_bindings = v.pointer("/HostConfig/PortBindings");
+        let gateway_port = Self::extract_host_port(port_bindings, "18789/tcp").unwrap_or(0);
+        let ssh_port = Self::extract_host_port(port_bindings, "2222/tcp").unwrap_or(0);
+
+        // Parse created_at from .Created
+        let created_at = v
+            .get("Created")
+            .and_then(|c| c.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(chrono::Utc::now);
+
+        // Determine active state from .State.Status
+        let active = v
+            .pointer("/State/Status")
+            .and_then(|s| s.as_str())
+            .map(|s| s == "running")
+            .unwrap_or(false);
+
+        // Resolve image: prefer env var, fall back to container config
+        let image = image_env.or_else(|| {
+            v.pointer("/Config/Image")
+                .and_then(|i| i.as_str())
+                .map(|s| s.to_string())
+        });
+
+        // Resolve image digest from .Image → RepoDigests
+        let image_digest = self.resolve_image_digest(&name);
+
+        Ok(Instance {
+            name,
+            token,
+            gateway_port,
+            ssh_port,
+            created_at,
+            ssh_pubkey,
+            nearai_api_key,
+            active,
+            image,
+            image_digest,
+        })
+    }
+
+    /// Extract a host port number from PortBindings JSON.
+    fn extract_host_port(
+        port_bindings: Option<&serde_json::Value>,
+        container_port: &str,
+    ) -> Option<u16> {
+        port_bindings?
+            .get(container_port)?
+            .as_array()?
+            .first()?
+            .get("HostPort")?
+            .as_str()?
+            .parse()
+            .ok()
+    }
+
+    /// Reconstruct the env file for a discovered instance so that
+    /// docker compose lifecycle commands (stop/start/restart) continue to work.
+    pub fn ensure_env_file(&self, inst: &Instance) -> Result<PathBuf, ApiError> {
+        let mut vars = HashMap::new();
+        vars.insert("NEARAI_API_KEY".into(), inst.nearai_api_key.clone());
+        vars.insert("OPENCLAW_GATEWAY_TOKEN".into(), inst.token.clone());
+        vars.insert("GATEWAY_PORT".into(), inst.gateway_port.to_string());
+        vars.insert("SSH_PORT".into(), inst.ssh_port.to_string());
+        vars.insert("SSH_PUBKEY".into(), inst.ssh_pubkey.clone());
+        if let Some(ref image) = inst.image {
+            vars.insert("OPENCLAW_IMAGE".into(), image.clone());
+        }
+        self.write_env_file(&inst.name, &vars)
     }
 
     // ── internal ──────────────────────────────────────────────────────
