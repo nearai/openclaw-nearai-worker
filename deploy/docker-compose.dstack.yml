@@ -7,7 +7,7 @@ services:
     restart: "no"
 
   dstack-ingress:
-    image: dstacktee/dstack-ingress:20250929
+    image: dstacktee/dstack-ingress:1.2@sha256:549d6864ccbde3f35622a4bfbbc54911363650de84f37698d72d85ec4714d6fd
     container_name: dstack-ingress
     network_mode: host
     environment:
