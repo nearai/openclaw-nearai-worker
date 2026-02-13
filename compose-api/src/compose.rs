@@ -305,7 +305,7 @@ impl ComposeManager {
                 }
             };
 
-            match self.inspect_container(container_name) {
+            match self.inspect_container(&name, container_name) {
                 Ok(inst) => instances.push(inst),
                 Err(e) => {
                     tracing::warn!(
@@ -322,7 +322,7 @@ impl ComposeManager {
     }
 
     /// Inspect a single container and build an Instance from its metadata.
-    fn inspect_container(&self, container_name: &str) -> Result<Instance, ApiError> {
+    fn inspect_container(&self, name: &str, container_name: &str) -> Result<Instance, ApiError> {
         let output = Command::new("docker")
             .args(["inspect", container_name, "--format", "{{json .}}"])
             .output()
@@ -340,15 +340,6 @@ impl ComposeManager {
         let v: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|e| {
             ApiError::Internal(format!("failed to parse docker inspect json: {}", e))
         })?;
-
-        // Extract instance name from container name: openclaw-{name}-gateway-1
-        let name = container_name
-            .strip_prefix("openclaw-")
-            .and_then(|s| s.strip_suffix("-gateway-1"))
-            .ok_or_else(|| {
-                ApiError::Internal(format!("unexpected container name: {}", container_name))
-            })?
-            .to_string();
 
         // Parse env vars from .Config.Env (array of "KEY=VALUE" strings)
         let env_map: HashMap<String, String> = v
@@ -373,8 +364,12 @@ impl ComposeManager {
 
         // Parse port bindings from .HostConfig.PortBindings
         let port_bindings = v.pointer("/HostConfig/PortBindings");
-        let gateway_port = Self::extract_host_port(port_bindings, "18789/tcp").unwrap_or(0);
-        let ssh_port = Self::extract_host_port(port_bindings, "2222/tcp").unwrap_or(0);
+        let gateway_port =
+            Self::extract_host_port(port_bindings, "18789/tcp").ok_or_else(|| {
+                ApiError::Internal(format!("missing gateway port binding for {}", name))
+            })?;
+        let ssh_port = Self::extract_host_port(port_bindings, "2222/tcp")
+            .ok_or_else(|| ApiError::Internal(format!("missing ssh port binding for {}", name)))?;
 
         // Parse created_at from .Created
         let created_at = v
@@ -399,10 +394,10 @@ impl ComposeManager {
         });
 
         // Resolve image digest from .Image → RepoDigests
-        let image_digest = self.resolve_image_digest(&name);
+        let image_digest = self.resolve_image_digest(name);
 
         Ok(Instance {
-            name,
+            name: name.to_string(),
             token,
             gateway_port,
             ssh_port,
