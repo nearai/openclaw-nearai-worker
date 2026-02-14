@@ -21,6 +21,7 @@ struct DnsRecord {
 impl CloudflareDns {
     pub fn new(api_token: &str, zone_id: &str) -> Self {
         let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
             .default_headers({
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(

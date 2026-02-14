@@ -26,6 +26,12 @@ pub enum ApiError {
     NotImplemented(String),
 }
 
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        ApiError::Internal(e.to_string())
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {

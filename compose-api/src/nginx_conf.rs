@@ -39,7 +39,7 @@ pub fn write_backends_map(instances: &[Instance], domain: &str, map_path: &Path)
 
     tracing::info!(
         "Updated nginx backends map ({} entries)",
-        instances.len()
+        lines.len()
     );
     true
 }

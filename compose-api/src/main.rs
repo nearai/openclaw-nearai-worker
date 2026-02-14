@@ -1220,10 +1220,7 @@ async fn list_backups_endpoint(
         }
     }
 
-    let backups = backup_mgr
-        .list_backups(&name)
-        .await
-        .map_err(|e| ApiError::Internal(e))?;
+    let backups = backup_mgr.list_backups(&name).await?;
 
     let items: Vec<BackupInfoResponse> = backups
         .into_iter()
@@ -1266,10 +1263,7 @@ async fn download_backup_endpoint(
         }
     }
 
-    let url = backup_mgr
-        .download_url(&name, &id)
-        .await
-        .map_err(|e| ApiError::Internal(e))?;
+    let url = backup_mgr.download_url(&name, &id).await?;
 
     Ok(Json(BackupDownloadResponse {
         url,
