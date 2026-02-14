@@ -98,14 +98,13 @@ const ADMIN_TOKEN_HEX_LEN: usize = 32;
 struct AppState {
     compose: Arc<ComposeManager>,
     store: Arc<RwLock<InstanceStore>>,
-    config: AppConfig,
+    config: Arc<AppConfig>,
     dns: Option<Arc<CloudflareDns>>,
     backup: Option<Arc<BackupManager>>,
 }
 
-#[derive(Clone)]
 struct AppConfig {
-    admin_token: String,
+    admin_token: secrecy::SecretString,
     host_address: String,
     openclaw_domain: Option<String>,
     openclaw_image: String,
@@ -142,14 +141,16 @@ impl FromRequestParts<AppState> for AdminAuth {
             })?
             .trim();
 
-        let token_hex: String = token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-        let expected_hex: String = state
-            .config
-            .admin_token
-            .chars()
-            .filter(|c| c.is_ascii_hexdigit())
-            .collect();
-        if token_hex != expected_hex || token_hex.len() != 32 {
+        use secrecy::ExposeSecret;
+        use subtle::ConstantTimeEq;
+
+        if token.len() != ADMIN_TOKEN_HEX_LEN
+            || !bool::from(
+                token
+                    .as_bytes()
+                    .ct_eq(state.config.admin_token.expose_secret().as_bytes()),
+            )
+        {
             return Err(ApiError::Unauthorized("Invalid admin token".into()));
         }
 
@@ -181,10 +182,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let admin_token_raw = std::env::var("ADMIN_TOKEN").expect("ADMIN_TOKEN must be set");
-    let admin_token: String = admin_token_raw
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
+    let admin_token = admin_token_raw.trim().to_string();
     validate_admin_token(&admin_token)?;
 
     let compose_file = std::env::var("COMPOSE_FILE")
@@ -202,8 +200,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("dstack gateway base: {}", base);
     }
 
-    let config = AppConfig {
-        admin_token,
+    let config = Arc::new(AppConfig {
+        admin_token: secrecy::SecretString::from(admin_token),
         host_address: std::env::var("OPENCLAW_HOST_ADDRESS")
             .unwrap_or_else(|_| "localhost".to_string()),
         openclaw_domain: std::env::var("OPENCLAW_DOMAIN").ok(),
@@ -218,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         ingress_container_name: std::env::var("INGRESS_CONTAINER_NAME")
             .unwrap_or_else(|_| "dstack-ingress".to_string()),
-    };
+    });
 
     let dns = match (
         std::env::var("CLOUDFLARE_API_TOKEN").ok(),
