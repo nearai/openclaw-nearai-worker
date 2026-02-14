@@ -116,6 +116,7 @@ struct AppConfig {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     async fn compose_up(
         &self,
         name: &str,
@@ -133,7 +134,15 @@ impl AppState {
         let ssh_pubkey = ssh_pubkey.to_string();
         let image = image.to_string();
         tokio::task::spawn_blocking(move || {
-            compose.up(&name, &nearai_api_key, &token, gateway_port, ssh_port, &ssh_pubkey, &image)
+            compose.up(&compose::InstanceConfig {
+                name: &name,
+                nearai_api_key: &nearai_api_key,
+                token: &token,
+                gateway_port,
+                ssh_port,
+                ssh_pubkey: &ssh_pubkey,
+                image: &image,
+            })
         })
         .await
         .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
@@ -417,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = app
+        // Permissive CORS: required for embedded docs UI and external dashboards
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -637,13 +647,13 @@ fn unbuffered_sse(
 fn sse_stage(stage: &str, message: &str) -> Event {
     Event::default()
         .json_data(serde_json::json!({"stage": stage, "message": message}))
-        .unwrap()
+        .expect("SSE JSON serialization")
 }
 
 fn sse_error(message: &str) -> Event {
     Event::default()
         .json_data(serde_json::json!({"stage": "error", "message": message}))
-        .unwrap()
+        .expect("SSE JSON serialization")
 }
 
 fn sse_created(info: &InstanceInfo) -> Event {
@@ -653,7 +663,7 @@ fn sse_created(info: &InstanceInfo) -> Event {
             "message": format!("Instance '{}' created, ports {}-{} allocated", info.name, info.gateway_port, info.ssh_port),
             "instance": info,
         }))
-        .unwrap()
+        .expect("SSE JSON serialization")
 }
 
 // ── Health polling loop (shared by create/start/restart SSE streams) ─
@@ -1284,7 +1294,7 @@ async fn create_backup_endpoint(
                             "size_bytes": info.size_bytes,
                         }
                     }))
-                    .unwrap());
+                    .expect("SSE JSON serialization"));
             }
             Err(e) => {
                 yield Ok(sse_error(&format!("Backup failed: {}", e)));
@@ -1430,6 +1440,24 @@ async fn fetch_dstack_app_id() -> Option<String> {
     }
 }
 
+// Expose AppConfig fields for generate_urls/generate_ssh_command tests
+#[cfg(test)]
+impl AppConfig {
+    fn test_default() -> Self {
+        Self {
+            admin_token: secrecy::SecretString::from("a".repeat(32)),
+            host_address: "localhost".to_string(),
+            openclaw_domain: None,
+            openclaw_image: "test:local".to_string(),
+            compose_file: std::path::PathBuf::from("/dev/null"),
+            dstack_app_id: None,
+            dstack_gateway_base: None,
+            nginx_map_path: PathBuf::from("/tmp/test.map"),
+            ingress_container_name: "test-ingress".to_string(),
+        }
+    }
+}
+
 async fn background_sync_loop(state: AppState) {
     let domain = match &state.config.openclaw_domain {
         Some(d) => d.clone(),
@@ -1482,7 +1510,11 @@ async fn background_sync_loop(state: AppState) {
                     let tar_bytes = match state.compose_export_instance_data(&inst.name).await {
                         Ok(bytes) => bytes,
                         Err(e) => {
-                            tracing::warn!("Scheduled backup export failed for {}: {}", inst.name, e);
+                            tracing::warn!(
+                                "Scheduled backup export failed for {}: {}",
+                                inst.name,
+                                e
+                            );
                             continue;
                         }
                     };
@@ -1505,5 +1537,122 @@ async fn background_sync_loop(state: AppState) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── validate_admin_token ─────────────────────────────────────────
+
+    #[test]
+    fn test_validate_admin_token_valid() {
+        assert!(validate_admin_token("abcdef0123456789abcdef0123456789").is_ok());
+    }
+
+    #[test]
+    fn test_validate_admin_token_wrong_length() {
+        assert!(validate_admin_token("abcdef").is_err());
+    }
+
+    #[test]
+    fn test_validate_admin_token_non_hex() {
+        assert!(validate_admin_token("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    // ── validate_image ───────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_image_valid_digest() {
+        assert!(validate_image("docker.io/org/img@sha256:abc123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_image_empty() {
+        assert!(validate_image("").is_err());
+    }
+
+    #[test]
+    fn test_validate_image_no_digest() {
+        assert!(validate_image("docker.io/org/img:latest").is_err());
+    }
+
+    #[test]
+    fn test_validate_image_too_long() {
+        let long_image = format!("docker.io/org/img@sha256:{}", "a".repeat(300));
+        assert!(validate_image(&long_image).is_err());
+    }
+
+    // ── generate_urls ────────────────────────────────────────────────
+
+    #[test]
+    fn test_generate_urls_with_domain() {
+        let mut config = AppConfig::test_default();
+        config.openclaw_domain = Some("example.com".to_string());
+        let (url, dashboard) = generate_urls(&config, "test", 19001, "tok");
+        assert_eq!(url, "https://test.example.com");
+        assert_eq!(dashboard, "https://test.example.com/?token=tok");
+    }
+
+    #[test]
+    fn test_generate_urls_without_domain() {
+        let config = AppConfig::test_default();
+        let (url, dashboard) = generate_urls(&config, "test", 19001, "tok");
+        assert_eq!(url, "http://localhost:19001");
+        assert_eq!(dashboard, "http://localhost:19001/?token=tok");
+    }
+
+    // ── generate_ssh_command ─────────────────────────────────────────
+
+    #[test]
+    fn test_generate_ssh_command_without_dstack() {
+        let config = AppConfig::test_default();
+        let cmd = generate_ssh_command(&config, 19002);
+        assert_eq!(cmd, "ssh -p 19002 agent@localhost");
+    }
+
+    #[test]
+    fn test_generate_ssh_command_with_dstack() {
+        let mut config = AppConfig::test_default();
+        config.dstack_app_id = Some("app123".to_string());
+        config.dstack_gateway_base = Some("gw.example.com".to_string());
+        let cmd = generate_ssh_command(&config, 19002);
+        assert!(cmd.contains("app123-19002.gw.example.com"));
+        assert!(cmd.contains("ProxyCommand"));
+    }
+
+    // ── is_valid_instance_name ───────────────────────────────────────
+
+    #[test]
+    fn test_is_valid_instance_name_valid() {
+        assert!(is_valid_instance_name("brave-tiger"));
+        assert!(is_valid_instance_name("a"));
+        assert!(is_valid_instance_name("test-123"));
+    }
+
+    #[test]
+    fn test_is_valid_instance_name_empty() {
+        assert!(!is_valid_instance_name(""));
+    }
+
+    #[test]
+    fn test_is_valid_instance_name_too_long() {
+        assert!(!is_valid_instance_name(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn test_is_valid_instance_name_special_chars() {
+        assert!(!is_valid_instance_name("foo bar"));
+        assert!(!is_valid_instance_name("foo_bar"));
+        assert!(!is_valid_instance_name("foo.bar"));
+        assert!(!is_valid_instance_name("../etc"));
+    }
+
+    #[test]
+    fn test_is_valid_instance_name_hyphens_ok() {
+        assert!(is_valid_instance_name("a-b-c"));
+        assert!(is_valid_instance_name("-leading"));
+        assert!(is_valid_instance_name("trailing-"));
     }
 }

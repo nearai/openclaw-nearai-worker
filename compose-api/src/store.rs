@@ -125,3 +125,81 @@ impl InstanceStore {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_instance(name: &str, gateway_port: u16, ssh_port: u16) -> Instance {
+        Instance {
+            name: name.to_string(),
+            token: "test-token".to_string(),
+            gateway_port,
+            ssh_port,
+            created_at: Utc::now(),
+            ssh_pubkey: "ssh-ed25519 AAAA".to_string(),
+            nearai_api_key: "key".to_string(),
+            active: true,
+            image: None,
+            image_digest: None,
+        }
+    }
+
+    #[test]
+    fn test_next_available_ports_empty_store() {
+        let store = InstanceStore::new();
+        let (gw, ssh) = store.next_available_ports().unwrap();
+        assert_eq!(gw, BASE_PORT);
+        assert_eq!(ssh, BASE_PORT + 1);
+    }
+
+    #[test]
+    fn test_next_available_ports_with_existing() {
+        let mut store = InstanceStore::new();
+        store.add(test_instance("a", BASE_PORT, BASE_PORT + 1));
+        let (gw, ssh) = store.next_available_ports().unwrap();
+        assert_eq!(gw, BASE_PORT + PORTS_PER_INSTANCE);
+        assert_eq!(ssh, BASE_PORT + PORTS_PER_INSTANCE + 1);
+    }
+
+    #[test]
+    fn test_next_available_ports_exhausted() {
+        let mut store = InstanceStore::new();
+        let mut port = BASE_PORT;
+        while port + 1 < MAX_PORT {
+            store.add(test_instance(&format!("inst-{}", port), port, port + 1));
+            port += PORTS_PER_INSTANCE;
+        }
+        assert!(store.next_available_ports().is_err());
+    }
+
+    #[test]
+    fn test_store_crud() {
+        let mut store = InstanceStore::new();
+        assert!(!store.exists("foo"));
+
+        store.add(test_instance("foo", 19001, 19002));
+        assert!(store.exists("foo"));
+        assert!(store.get("foo").is_some());
+        assert_eq!(store.list().len(), 1);
+
+        store.remove("foo");
+        assert!(!store.exists("foo"));
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn test_store_set_active() {
+        let mut store = InstanceStore::new();
+        store.add(test_instance("foo", 19001, 19002));
+        assert!(store.get("foo").unwrap().active);
+
+        store.set_active("foo", false).unwrap();
+        assert!(!store.get("foo").unwrap().active);
+
+        store.set_active("foo", true).unwrap();
+        assert!(store.get("foo").unwrap().active);
+
+        assert!(store.set_active("nonexistent", true).is_err());
+    }
+}
