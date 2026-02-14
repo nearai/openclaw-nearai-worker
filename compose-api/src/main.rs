@@ -115,6 +115,99 @@ struct AppConfig {
     ingress_container_name: String,
 }
 
+impl AppState {
+    async fn compose_up(
+        &self,
+        name: &str,
+        nearai_api_key: &str,
+        token: &str,
+        gateway_port: u16,
+        ssh_port: u16,
+        ssh_pubkey: &str,
+        image: &str,
+    ) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        let nearai_api_key = nearai_api_key.to_string();
+        let token = token.to_string();
+        let ssh_pubkey = ssh_pubkey.to_string();
+        let image = image.to_string();
+        tokio::task::spawn_blocking(move || {
+            compose.up(&name, &nearai_api_key, &token, gateway_port, ssh_port, &ssh_pubkey, &image)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_down(&self, name: &str) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.down(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_stop(&self, name: &str) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.stop(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_start(&self, name: &str) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.start(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_restart(&self, name: &str) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.restart(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_status(&self, name: &str) -> Result<String, ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.status(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_container_health(
+        &self,
+        name: &str,
+    ) -> Result<compose::ContainerHealth, ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.container_health(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_resolve_image_digest(&self, name: &str) -> Option<String> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.resolve_image_digest(&name))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn compose_export_instance_data(&self, name: &str) -> Result<Vec<u8>, ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.export_instance_data(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+}
+
 /// Extractor that validates the admin token from the Authorization header
 struct AdminAuth;
 
@@ -577,7 +670,7 @@ async fn poll_health_to_ready(state: &AppState, name: &str, tx: &tokio::sync::mp
             return;
         }
 
-        let health = match state.compose.container_health(name) {
+        let health = match state.compose_container_health(name).await {
             Ok(h) => h,
             Err(e) => {
                 let _ = tx.send(sse_error(&e.to_string())).await;
@@ -737,7 +830,7 @@ async fn create_instance(
 
         yield Ok(sse_stage("container_starting", "Pulling image and starting container..."));
 
-        if let Err(e) = state.compose.up(
+        if let Err(e) = state.compose_up(
             &name,
             &nearai_api_key,
             &token,
@@ -745,7 +838,7 @@ async fn create_instance(
             ssh_port,
             &ssh_pubkey,
             &image,
-        ) {
+        ).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
         }
@@ -763,7 +856,7 @@ async fn create_instance(
         }
 
         // Resolve the image digest now that the container is running
-        let image_digest = state.compose.resolve_image_digest(&name);
+        let image_digest = state.compose_resolve_image_digest(&name).await;
         if let Some(ref digest) = image_digest {
             yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
         }
@@ -811,7 +904,7 @@ async fn get_instance(
 
     match instance {
         Some(inst) => {
-            let status = state.compose.status(&inst.name)?;
+            let status = state.compose_status(&inst.name).await?;
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
@@ -856,8 +949,8 @@ async fn list_instances(
     let mut responses = Vec::new();
     for inst in instances {
         let status = state
-            .compose
-            .status(&inst.name)
+            .compose_status(&inst.name)
+            .await
             .unwrap_or_else(|_| "unknown".to_string());
         let (url, dashboard_url) =
             generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
@@ -907,7 +1000,7 @@ async fn delete_instance(
         }
     }
 
-    state.compose.down(&name)?;
+    state.compose_down(&name).await?;
 
     if let (Some(ref dns), Some(ref domain)) = (&state.dns, &state.config.openclaw_domain) {
         if let Err(e) = dns.delete_txt_record(&name, domain).await {
@@ -964,7 +1057,7 @@ async fn restart_instance(
             // Full recreate with new image
             yield Ok(sse_stage("container_starting", &format!("Recreating container with image {}...", image)));
 
-            if let Err(e) = state.compose.up(
+            if let Err(e) = state.compose_up(
                 &name,
                 &inst.nearai_api_key,
                 &inst.token,
@@ -972,13 +1065,13 @@ async fn restart_instance(
                 inst.ssh_port,
                 &inst.ssh_pubkey,
                 image,
-            ) {
+            ).await {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
             }
 
             // Resolve new digest
-            let image_digest = state.compose.resolve_image_digest(&name);
+            let image_digest = state.compose_resolve_image_digest(&name).await;
             if let Some(ref digest) = image_digest {
                 yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
             }
@@ -990,7 +1083,7 @@ async fn restart_instance(
             // Simple restart
             yield Ok(sse_stage("container_starting", "Restarting container..."));
 
-            if let Err(e) = state.compose.restart(&name) {
+            if let Err(e) = state.compose_restart(&name).await {
                 yield Ok(sse_error(&format!("Failed to restart container: {}", e)));
                 return;
             }
@@ -1035,7 +1128,7 @@ async fn stop_instance(
     let stream = async_stream::stream! {
         yield Ok(sse_stage("stopping", "Stopping container..."));
 
-        if let Err(e) = state.compose.stop(&name) {
+        if let Err(e) = state.compose_stop(&name).await {
             yield Ok(sse_error(&format!("Failed to stop container: {}", e)));
             return;
         }
@@ -1080,7 +1173,7 @@ async fn start_instance(
     let stream = async_stream::stream! {
         yield Ok(sse_stage("container_starting", "Starting container..."));
 
-        if let Err(e) = state.compose.start(&name) {
+        if let Err(e) = state.compose_start(&name).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
         }
@@ -1166,8 +1259,16 @@ async fn create_backup_endpoint(
     let stream = async_stream::stream! {
         yield Ok(sse_stage("encrypting", "Exporting and encrypting workspace..."));
 
+        let tar_bytes = match state.compose_export_instance_data(&name).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                yield Ok(sse_error(&format!("Backup failed: {}", e)));
+                return;
+            }
+        };
+
         let result = backup_mgr
-            .create_backup(&name, &inst.ssh_pubkey, &state.compose)
+            .create_backup(&name, &inst.ssh_pubkey, tar_bytes)
             .await;
 
         match result {
@@ -1301,9 +1402,10 @@ async fn fetch_dstack_app_id() -> Option<String> {
         return None;
     }
 
-    let output = std::process::Command::new("curl")
+    let output = tokio::process::Command::new("curl")
         .args(["--unix-socket", sock_path, "-s", "http://localhost/Info"])
-        .output();
+        .output()
+        .await;
 
     match output {
         Ok(o) if o.status.success() => {
@@ -1377,8 +1479,15 @@ async fn background_sync_loop(state: AppState) {
                         continue;
                     }
                     tracing::info!("Scheduled backup for instance: {}", inst.name);
+                    let tar_bytes = match state.compose_export_instance_data(&inst.name).await {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!("Scheduled backup export failed for {}: {}", inst.name, e);
+                            continue;
+                        }
+                    };
                     match backup_mgr
-                        .create_backup(&inst.name, &inst.ssh_pubkey, &state.compose)
+                        .create_backup(&inst.name, &inst.ssh_pubkey, tar_bytes)
                         .await
                     {
                         Ok(info) => {

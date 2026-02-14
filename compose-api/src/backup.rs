@@ -8,7 +8,6 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::Serialize;
 
-use crate::compose::ComposeManager;
 use crate::error::ApiError;
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,17 +44,14 @@ impl BackupManager {
         Some(Self { s3, bucket })
     }
 
-    /// Create an encrypted backup of an instance's config and workspace volumes.
-    /// Exports both .openclaw/ and openclaw/ → gzip → age-encrypt with SSH pubkey → upload to S3.
+    /// Create an encrypted backup from pre-exported instance data.
+    /// tar_bytes → gzip → age-encrypt with SSH pubkey → upload to S3.
     pub async fn create_backup(
         &self,
         instance_name: &str,
         ssh_pubkey: &str,
-        compose: &ComposeManager,
+        tar_bytes: Vec<u8>,
     ) -> Result<BackupInfo, ApiError> {
-        // Export both config + workspace as a single tar from container
-        let tar_bytes = compose.export_instance_data(instance_name)?;
-
         if tar_bytes.is_empty() {
             return Err(ApiError::Internal(
                 "instance data export returned empty data".into(),
