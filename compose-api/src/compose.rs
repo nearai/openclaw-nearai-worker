@@ -298,7 +298,11 @@ impl ComposeManager {
                 .strip_prefix("openclaw-")
                 .and_then(|s| s.strip_suffix("-gateway-1"))
             {
-                Some(n) => n.to_string(),
+                Some(n) if crate::is_valid_instance_name(n) => n.to_string(),
+                Some(n) => {
+                    tracing::warn!("skipping instance with invalid name: {}", n);
+                    continue;
+                }
                 None => {
                     tracing::debug!("skipping non-gateway container: {}", container_name);
                     continue;

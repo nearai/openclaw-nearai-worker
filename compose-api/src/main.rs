@@ -471,6 +471,12 @@ struct BackupDownloadResponse {
     expires_in_seconds: u64,
 }
 
+pub fn is_valid_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 fn validate_image(image: &str) -> Result<(), ApiError> {
     let trimmed = image.trim();
     if trimmed.is_empty() {
@@ -656,10 +662,8 @@ async fn create_instance(
 
     // Resolve instance name
     let name = if let Some(provided) = &req.name {
-        let sanitized = provided
-            .to_lowercase()
-            .replace(|c: char| !c.is_alphanumeric() && c != '-', "");
-        if sanitized.is_empty() || sanitized.len() > 32 {
+        let sanitized = provided.to_lowercase();
+        if !is_valid_instance_name(&sanitized) {
             return Err(ApiError::BadRequest(
                 "Invalid name: must be 1-32 alphanumeric/hyphen characters".into(),
             ));
@@ -1192,7 +1196,7 @@ async fn create_backup_endpoint(
 
 #[utoipa::path(get, path = "/instances/{name}/backups", tag = "Backups",
     params(("name" = String, Path, description = "Instance name")),
-    security(),
+    security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "List of available backups", body = BackupListResponse),
         (status = 404, description = "Instance not found", body = ErrorResponse),
@@ -1200,6 +1204,7 @@ async fn create_backup_endpoint(
     )
 )]
 async fn list_backups_endpoint(
+    _auth: AdminAuth,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1237,7 +1242,7 @@ async fn list_backups_endpoint(
         ("name" = String, Path, description = "Instance name"),
         ("id" = String, Path, description = "Backup ID (timestamp)"),
     ),
-    security(),
+    security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Presigned download URL", body = BackupDownloadResponse),
         (status = 404, description = "Instance not found", body = ErrorResponse),
@@ -1245,6 +1250,7 @@ async fn list_backups_endpoint(
     )
 )]
 async fn download_backup_endpoint(
+    _auth: AdminAuth,
     State(state): State<AppState>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
