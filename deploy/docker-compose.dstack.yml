@@ -37,6 +37,7 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - management-data:/app/data
       - nginx-dynamic:/data/nginx
+      - cert-data:/etc/letsencrypt:ro
     environment:
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - OPENCLAW_DOMAIN=${OPENCLAW_DOMAIN}
