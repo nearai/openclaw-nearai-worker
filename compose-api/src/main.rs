@@ -688,7 +688,7 @@ async fn create_instance(
     let token = generate_token();
     let (gateway_port, ssh_port) = {
         let store = state.store.read().await;
-        store.next_available_ports()
+        store.next_available_ports()?
     };
 
     let (url, dashboard_url) = generate_urls(&state.config, &name, gateway_port, &token);
@@ -1150,7 +1150,7 @@ async fn create_backup_endpoint(
     let backup_mgr = state
         .backup
         .as_ref()
-        .ok_or_else(|| ApiError::Internal("Backup not configured".into()))?
+        .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?
         .clone();
 
     let inst = {
@@ -1206,7 +1206,7 @@ async fn list_backups_endpoint(
     let backup_mgr = state
         .backup
         .as_ref()
-        .ok_or_else(|| ApiError::Internal("Backup not configured".into()))?;
+        .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?;
 
     {
         let store = state.store.read().await;
@@ -1251,7 +1251,7 @@ async fn download_backup_endpoint(
     let backup_mgr = state
         .backup
         .as_ref()
-        .ok_or_else(|| ApiError::Internal("Backup not configured".into()))?;
+        .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?;
 
     {
         let store = state.store.read().await;

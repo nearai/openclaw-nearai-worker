@@ -99,7 +99,7 @@ impl InstanceStore {
     }
 
     /// Returns (gateway_port, ssh_port) - two consecutive ports
-    pub fn next_available_ports(&self) -> (u16, u16) {
+    pub fn next_available_ports(&self) -> Result<(u16, u16), crate::error::ApiError> {
         let used_ports: std::collections::HashSet<u16> = self
             .instances
             .values()
@@ -107,14 +107,21 @@ impl InstanceStore {
             .collect();
 
         let mut port = BASE_PORT;
-        while port + 1 < MAX_PORT {
-            if !used_ports.contains(&port) && !used_ports.contains(&(port + 1)) {
-                return (port, port + 1);
+        while let Some(next) = port.checked_add(1) {
+            if next >= MAX_PORT {
+                break;
             }
-            port += PORTS_PER_INSTANCE;
+            if !used_ports.contains(&port) && !used_ports.contains(&next) {
+                return Ok((port, next));
+            }
+            port = match port.checked_add(PORTS_PER_INSTANCE) {
+                Some(p) => p,
+                None => break,
+            };
         }
 
-        let base = BASE_PORT + (self.instances.len() as u16 * PORTS_PER_INSTANCE);
-        (base, base + 1)
+        Err(crate::error::ApiError::Internal(
+            "All ports exhausted".into(),
+        ))
     }
 }
