@@ -43,6 +43,7 @@ aws-config = "1"
 # Crypto
 sha2 = "0.10"
 base64 = "0.22"
+pem = "3"
 
 # Logging
 tracing = "0.1.41"

@@ -1186,31 +1186,35 @@ async fn tdx_attestation(
     let quote = quote_response
         .get("quote")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
+        .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'quote'".into()))?
         .to_string();
     let event_log = quote_response
         .get("event_log")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
+        .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'event_log'".into()))?
         .to_string();
     let returned_report_data = quote_response
         .get("report_data")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable("dstack response missing 'report_data'".into())
+        })?;
     let vm_config = quote_response
         .get("vm_config")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
+        .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'vm_config'".into()))?
         .to_string();
 
     // Decode base64 report_data from dstack response to hex
-    let report_data_hex = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        returned_report_data,
-    ) {
-        Ok(bytes) => hex::encode(bytes),
-        Err(_) => hex::encode(report_data),
-    };
+    let report_data_hex = hex::encode(
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            returned_report_data,
+        )
+        .map_err(|e| {
+            ApiError::ServiceUnavailable(format!("failed to decode report_data from dstack: {}", e))
+        })?,
+    );
 
     Ok(Json(TdxAttestationReport {
         quote,
@@ -1389,34 +1393,21 @@ fn generate_token() -> String {
 /// Read the TLS leaf certificate from the Let's Encrypt cert volume.
 /// Returns (PEM string of leaf cert, DER bytes of leaf cert).
 fn read_tls_certificate(domain: &str) -> Result<(String, Vec<u8>), ApiError> {
-    let cert_path = format!("/etc/letsencrypt/live/{}/fullchain.pem", domain);
-    let pem_data = std::fs::read_to_string(&cert_path).map_err(|e| {
+    let cert_base = std::env::var("CERT_DATA_PATH").unwrap_or_else(|_| "/etc/letsencrypt".into());
+    let cert_path = format!("{}/live/{}/fullchain.pem", cert_base, domain);
+    let pem_data = std::fs::read(&cert_path).map_err(|e| {
         ApiError::ServiceUnavailable(format!("TLS certificate not available: {}", e))
     })?;
 
-    // Extract the first PEM block (leaf certificate)
-    let begin = "-----BEGIN CERTIFICATE-----";
-    let end = "-----END CERTIFICATE-----";
-    let start = pem_data.find(begin).ok_or_else(|| {
+    let certs = pem::parse_many(&pem_data)
+        .map_err(|e| ApiError::ServiceUnavailable(format!("failed to parse PEM: {}", e)))?;
+
+    let leaf_cert = certs.into_iter().next().ok_or_else(|| {
         ApiError::ServiceUnavailable("no certificate found in PEM file".into())
     })?;
-    let end_pos = pem_data[start..].find(end).ok_or_else(|| {
-        ApiError::ServiceUnavailable("malformed PEM certificate".into())
-    })? + start
-        + end.len();
 
-    let leaf_pem = pem_data[start..end_pos].to_string();
-
-    // Decode base64 content between PEM headers to get DER bytes
-    let b64_content: String = leaf_pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect();
-    let der_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &b64_content,
-    )
-    .map_err(|e| ApiError::ServiceUnavailable(format!("failed to decode certificate: {}", e)))?;
+    let leaf_pem = pem::encode(&leaf_cert);
+    let der_bytes = leaf_cert.into_contents();
 
     Ok((leaf_pem, der_bytes))
 }
