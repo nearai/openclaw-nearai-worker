@@ -573,33 +573,33 @@ async fn poll_health_to_ready(state: &AppState, name: &str, tx: &tokio::sync::mp
             return;
         }
 
-        let health = state.compose.container_health(name);
-        let (stage, msg, done) = match health {
-            Ok(h) => match (h.state.as_str(), h.health.as_str()) {
-                ("not_found", _) => (
-                    "container_starting",
-                    "Waiting for container to appear...",
-                    false,
-                ),
-                ("running", "starting") => (
-                    "healthcheck_starting",
-                    "Container running, waiting for health check...",
-                    false,
-                ),
-                ("running", "healthy") => ("healthy", "Health check passed", false),
-                ("running", "none") | ("running", "") => (
-                    "container_running",
-                    "Container is running, health check not yet configured",
-                    false,
-                ),
-                ("exited", _) | ("dead", _) => ("error", "Container exited unexpectedly", true),
-                (_, "unhealthy") => ("error", "Container health check failed", true),
-                _ => ("container_starting", "Waiting for container...", false),
-            },
+        let health = match state.compose.container_health(name) {
+            Ok(h) => h,
             Err(e) => {
-                let leaked: &str = e.to_string().leak();
-                ("error", leaked, true)
+                let _ = tx.send(sse_error(&e.to_string())).await;
+                return;
             }
+        };
+        let (stage, msg, done) = match (health.state.as_str(), health.health.as_str()) {
+            ("not_found", _) => (
+                "container_starting",
+                "Waiting for container to appear...",
+                false,
+            ),
+            ("running", "starting") => (
+                "healthcheck_starting",
+                "Container running, waiting for health check...",
+                false,
+            ),
+            ("running", "healthy") => ("healthy", "Health check passed", false),
+            ("running", "none") | ("running", "") => (
+                "container_running",
+                "Container is running, health check not yet configured",
+                false,
+            ),
+            ("exited", _) | ("dead", _) => ("error", "Container exited unexpectedly", true),
+            (_, "unhealthy") => ("error", "Container health check failed", true),
+            _ => ("container_starting", "Waiting for container...", false),
         };
 
         if stage != last_stage {
