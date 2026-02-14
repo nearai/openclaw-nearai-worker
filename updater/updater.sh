@@ -194,6 +194,19 @@ compose_up() {
     fi
 }
 
+# Build compose CLI flags as a string (for passing to helper containers)
+compose_base_args() {
+    local args=""
+    [ -n "$COMPOSE_PROJECT" ] && args="-p $COMPOSE_PROJECT "
+    args="$args-f $COMPOSE_FILE "
+    if [ -n "$BASE_ENV_FILE" ]; then
+        args="$args--env-file $BASE_ENV_FILE --env-file $ENV_FILE"
+    else
+        args="$args--env-file $ENV_FILE"
+    fi
+    echo "$args"
+}
+
 # ── Env file helpers ─────────────────────────────────────────────────
 
 # Read a value: check overrides first, fall back to base env
@@ -393,8 +406,32 @@ update_self() {
     write_state "updater_digest" "$remote_digest"
     log "Self-updating to ${image_ref}..."
 
-    # This will replace our own container — Docker handles the transition
-    compose_up -d --no-deps openclaw-updater
+    # Launch a sibling helper container to run `docker compose up` for us.
+    # We can't do it directly because compose stop+remove kills this process
+    # before create+start can execute, leaving the new container in "Created" state.
+    docker rm -f openclaw-updater-helper 2>/dev/null || true
+
+    local self_cid
+    self_cid="$(docker ps -q --filter "label=com.docker.compose.service=openclaw-updater" | head -1)"
+    if [ -z "$self_cid" ]; then
+        log_error "Cannot determine own container ID for self-update"
+        return 1
+    fi
+
+    local compose_args
+    compose_args="$(compose_base_args)"
+
+    if ! docker run --rm -d \
+        --name openclaw-updater-helper \
+        --volumes-from "$self_cid" \
+        --entrypoint sh \
+        "$image_ref" \
+        -c "sleep 3 && docker compose $compose_args up -d --no-deps openclaw-updater && sleep 2"; then
+        log_error "Failed to launch self-update helper container"
+        return 1
+    fi
+
+    log "Self-update helper launched, this container will be replaced shortly"
 }
 
 # ── Main loop ────────────────────────────────────────────────────────
