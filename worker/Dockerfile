@@ -84,7 +84,7 @@ RUN npm config set prefix "/home/agent/.npm-global" && \
 # This patch replaces the streaming API call with non-streaming, then synthesizes
 # the stream events that openclaw expects. Tool call args arrive complete.
 COPY patch-streaming.js /tmp/patch-streaming.js
-RUN node /tmp/patch-streaming.js
+RUN node /tmp/patch-streaming.js && rm /tmp/patch-streaming.js
 
 # Switch back to root for final setup
 USER root

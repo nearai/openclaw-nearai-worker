@@ -63,7 +63,7 @@ const replacement = `// PATCHED: non-streaming to avoid NEAR AI tool call trunca
             if (_msg?.tool_calls) {
                 for (const _tc of _msg.tool_calls) {
                     let _args = {};
-                    try { _args = JSON.parse(_tc.function.arguments || "{}"); } catch(e) { _args = {}; }
+                    try { _args = JSON.parse(_tc.function.arguments || "{}"); } catch(e) { console.error("patch-streaming: failed to parse tool args for", _tc.function.name, e.message); _args = {}; }
                     const blk = { type: "toolCall", id: _tc.id, name: _tc.function.name, arguments: _args };
                     blocks.push(blk);
                     stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
