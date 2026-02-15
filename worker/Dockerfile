@@ -79,6 +79,13 @@ RUN npm config set prefix "/home/agent/.npm-global" && \
     npm install -g pnpm bun openclaw@2026.2.1 && \
     /home/agent/.npm-global/bin/pnpm setup
 
+# Workaround: NEAR AI streaming bug truncates tool call arguments.
+# pi-ai hardcodes stream:true with no config override (openclaw#12218).
+# This patch replaces the streaming API call with non-streaming, then synthesizes
+# the stream events that openclaw expects. Tool call args arrive complete.
+COPY patch-streaming.js /tmp/patch-streaming.js
+RUN node /tmp/patch-streaming.js
+
 # Switch back to root for final setup
 USER root
 
