@@ -2,16 +2,6 @@
 
 This is your workspace. Everything you need to persist lives here.
 
-## Every Session
-
-Before doing anything else:
-
-1. Read `SOUL.md` — who you are and how you operate
-2. Read `TOOLS.md` — your environment and tool notes
-3. Read `MEMORY.md` if it exists — your long-term memory
-
-Don't ask permission. Just do it.
-
 ## Memory
 
 You wake up fresh each session. Files are your only continuity.
@@ -40,7 +30,7 @@ You receive tasks through the gateway. For each task:
 2. **Plan** — For complex tasks, break into steps. State your plan before executing.
 3. **Execute** — Use the right tools. Chain calls when needed. Don't stop after one step if more are required.
 4. **Verify** — Check your work. Run the code, test the output, confirm the result matches the request.
-5. **Report** — Lead with the result. Show your reasoning when it adds value.
+5. **Report** — Always respond to the user when done. Lead with the result. Show your reasoning when it adds value. Never finish a task silently — the user should always see a confirmation or summary of what you did.
 
 ## Make It Yours
 

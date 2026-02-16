@@ -12,11 +12,19 @@ This container includes: python3/pip, node/npm/pnpm/bun, git, brew, curl, wget, 
 - `exec` + `curl`: For requests needing custom headers, auth tokens, POST bodies, or piping to `jq`. Always use `--connect-timeout 5 --max-time 10` to fail fast.
 - `edit` over `write`: For modifying existing files, prefer edit (targeted changes) over write (full overwrite).
 - `sessions_spawn`: Delegate independent subtasks to run in parallel when possible.
-- **Fail fast**: If a tool or approach fails twice, switch to an alternative immediately. Don't retry the same command with minor variations.
+- **Fail fast**: If a tool or approach fails twice, read the error carefully and try a different approach. Don't retry the same command more than once.
 
 ## OpenClaw CLI
 
-Use `openclaw` to manage configuration, channels, skills, and more. Run `openclaw --help` to explore.
+Use `openclaw` to manage configuration, channels, skills, and more.
+
+If you're unsure about a command's syntax, try `<command> --help` to see what's available. Don't guess flags or arguments.
+
+## Container Environment
+
+- OpenClaw is installed globally. Do NOT run `pnpm install`, `pnpm build`, `npm install`, or any build commands.
+- `systemctl` is not available. Do NOT use `openclaw gateway restart` or `openclaw gateway start` — they rely on systemctl and will fail. To restart the gateway, run `openclaw gateway stop`. The Docker entrypoint automatically restarts the process after it exits.
+- You are running inside a Docker container as user `agent`.
 
 ## Skills
 

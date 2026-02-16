@@ -212,6 +212,8 @@ start_auto_approve_daemon() {
 
 # Final ownership fix: ensure everything is owned by agent before dropping privileges
 # (config generation and bootstrap above may have created files as root)
+# Pre-create subdirs the gateway needs — prevents root-owned dirs at runtime
+mkdir -p /home/agent/.openclaw/{identity,credentials,cron,agents,canvas}
 chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
 
 start_auto_approve_daemon
@@ -222,6 +224,8 @@ RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
 
 while true; do
   echo "Starting: $*"
+  # Fix ownership before each launch — subdirs may have been created as root
+  chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw 2>/dev/null || true
   # The -p flag preserves environment variables (including PATH set in Dockerfile)
   runuser -p -u agent -- "$@" || true
   EXIT_CODE=$?
