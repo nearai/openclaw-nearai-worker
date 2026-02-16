@@ -32,8 +32,71 @@ pub fn write_backends_map(instances: &[Instance], domain: &str, map_path: &Path)
         return false;
     }
 
-    tracing::info!("Updated nginx backends map ({} entries)", instances.len());
+    tracing::info!("Updated nginx backends map ({} entries)", lines.len());
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_instance(name: &str, port: u16, active: bool) -> Instance {
+        Instance {
+            name: name.to_string(),
+            token: "tok".to_string(),
+            gateway_port: port,
+            ssh_port: port + 1,
+            created_at: chrono::Utc::now(),
+            ssh_pubkey: "ssh-ed25519 AAAA".to_string(),
+            nearai_api_key: "key".to_string(),
+            active,
+            image: None,
+            image_digest: None,
+            nearai_api_url: None,
+        }
+    }
+
+    #[test]
+    fn test_writes_correct_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("backends.map");
+        let instances = vec![test_instance("brave-tiger", 19001, true)];
+
+        let changed = write_backends_map(&instances, "example.com", &map_path);
+        assert!(changed);
+
+        let content = std::fs::read_to_string(&map_path).unwrap();
+        assert!(content.contains("brave-tiger.example.com http://127.0.0.1:19001;"));
+    }
+
+    #[test]
+    fn test_filters_inactive_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("backends.map");
+        let instances = vec![
+            test_instance("active", 19001, true),
+            test_instance("stopped", 19003, false),
+        ];
+
+        write_backends_map(&instances, "example.com", &map_path);
+
+        let content = std::fs::read_to_string(&map_path).unwrap();
+        assert!(content.contains("active.example.com"));
+        assert!(!content.contains("stopped.example.com"));
+    }
+
+    #[test]
+    fn test_returns_false_when_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("backends.map");
+        let instances = vec![test_instance("a", 19001, true)];
+
+        let first = write_backends_map(&instances, "example.com", &map_path);
+        assert!(first);
+
+        let second = write_backends_map(&instances, "example.com", &map_path);
+        assert!(!second);
+    }
 }
 
 /// Sends `nginx -s reload` to the ingress container.

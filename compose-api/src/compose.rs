@@ -13,6 +13,17 @@ pub struct ContainerHealth {
     pub health: String,
 }
 
+pub struct InstanceConfig<'a> {
+    pub name: &'a str,
+    pub nearai_api_key: &'a str,
+    pub token: &'a str,
+    pub gateway_port: u16,
+    pub ssh_port: u16,
+    pub ssh_pubkey: &'a str,
+    pub image: &'a str,
+    pub nearai_api_url: &'a str,
+}
+
 /// Manages one Docker Compose project per worker via the `docker compose` CLI.
 pub struct ComposeManager {
     /// Path to the parameterized worker template (docker-compose.worker.yml).
@@ -41,6 +52,10 @@ impl ComposeManager {
         })
     }
 
+    fn env_path(&self, name: &str) -> PathBuf {
+        self.env_dir.join(format!("{}.env", name))
+    }
+
     // ── env-file helpers ──────────────────────────────────────────────
 
     /// Write a per-instance .env file consumed by docker-compose.worker.yml.
@@ -52,12 +67,13 @@ impl ComposeManager {
     ) -> Result<PathBuf, ApiError> {
         for (k, v) in vars {
             if k.contains('\n') || k.contains('\r') || v.contains('\n') || v.contains('\r') {
-                return Err(ApiError::Internal(format!(
+                return Err(ApiError::Internal(
                     "env file rejected: key or value contains newline (injection attempt?)"
-                )));
+                        .to_string(),
+                ));
             }
         }
-        let path = self.env_dir.join(format!("{}.env", name));
+        let path = self.env_path(name);
         let content: String = vars
             .iter()
             .map(|(k, v)| format!("{}={}", k, v))
@@ -70,43 +86,33 @@ impl ComposeManager {
     }
 
     pub fn remove_env_file(&self, name: &str) {
-        let path = self.env_dir.join(format!("{}.env", name));
+        let path = self.env_path(name);
         let _ = std::fs::remove_file(path);
     }
 
     // ── compose lifecycle ─────────────────────────────────────────────
 
     /// `docker compose -p openclaw-{name} up -d --pull always`
-    pub fn up(
-        &self,
-        name: &str,
-        nearai_api_key: &str,
-        token: &str,
-        gateway_port: u16,
-        ssh_port: u16,
-        ssh_pubkey: &str,
-        image: &str,
-        nearai_api_url: &str,
-    ) -> Result<(), ApiError> {
+    pub fn up(&self, cfg: &InstanceConfig) -> Result<(), ApiError> {
         let mut vars = HashMap::new();
-        vars.insert("NEARAI_API_KEY".into(), nearai_api_key.into());
-        vars.insert("NEARAI_API_URL".into(), nearai_api_url.into());
-        vars.insert("OPENCLAW_GATEWAY_TOKEN".into(), token.into());
-        vars.insert("GATEWAY_PORT".into(), gateway_port.to_string());
-        vars.insert("SSH_PORT".into(), ssh_port.to_string());
-        vars.insert("OPENCLAW_IMAGE".into(), image.to_string());
-        vars.insert("SSH_PUBKEY".into(), ssh_pubkey.into());
-        let env_path = self.write_env_file(name, &vars)?;
+        vars.insert("NEARAI_API_KEY".into(), cfg.nearai_api_key.into());
+        vars.insert("NEARAI_API_URL".into(), cfg.nearai_api_url.into());
+        vars.insert("OPENCLAW_GATEWAY_TOKEN".into(), cfg.token.into());
+        vars.insert("GATEWAY_PORT".into(), cfg.gateway_port.to_string());
+        vars.insert("SSH_PORT".into(), cfg.ssh_port.to_string());
+        vars.insert("OPENCLAW_IMAGE".into(), cfg.image.to_string());
+        vars.insert("SSH_PUBKEY".into(), cfg.ssh_pubkey.into());
+        let env_path = self.write_env_file(cfg.name, &vars)?;
 
         // Pull from registry for remote images (contain '/') or digest-pinned references;
         // local-only images (no '/') use --pull never
-        let pull_policy = if image.contains('/') || image.contains("@sha256:") {
+        let pull_policy = if cfg.image.contains('/') || cfg.image.contains("@sha256:") {
             "always"
         } else {
             "never"
         };
         self.compose_cmd(
-            name,
+            cfg.name,
             &env_path,
             &["up", "-d", "--pull", pull_policy],
             Some(&vars),
@@ -115,30 +121,30 @@ impl ComposeManager {
 
     /// `docker compose -p openclaw-{name} down -v` (removes volumes too)
     pub fn down(&self, name: &str) -> Result<(), ApiError> {
-        let env_path = self.env_dir.join(format!("{}.env", name));
+        let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["down", "-v"], None)?;
         self.remove_env_file(name);
         Ok(())
     }
 
     pub fn stop(&self, name: &str) -> Result<(), ApiError> {
-        let env_path = self.env_dir.join(format!("{}.env", name));
+        let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["stop"], None)
     }
 
     pub fn start(&self, name: &str) -> Result<(), ApiError> {
-        let env_path = self.env_dir.join(format!("{}.env", name));
+        let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["start"], None)
     }
 
     pub fn restart(&self, name: &str) -> Result<(), ApiError> {
-        let env_path = self.env_dir.join(format!("{}.env", name));
+        let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["restart"], None)
     }
 
     /// Returns the output of `docker compose ps --format json`.
     pub fn status(&self, name: &str) -> Result<String, ApiError> {
-        let env_path = self.env_dir.join(format!("{}.env", name));
+        let env_path = self.env_path(name);
         let project = format!("openclaw-{}", name);
 
         let output = Command::new("docker")
@@ -311,7 +317,11 @@ impl ComposeManager {
                 .strip_prefix("openclaw-")
                 .and_then(|s| s.strip_suffix("-gateway-1"))
             {
-                Some(n) => n.to_string(),
+                Some(n) if crate::is_valid_instance_name(n) => n.to_string(),
+                Some(n) => {
+                    tracing::warn!("skipping instance with invalid name: {}", n);
+                    continue;
+                }
                 None => {
                     tracing::debug!("skipping non-gateway container: {}", container_name);
                     continue;

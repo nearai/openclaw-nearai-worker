@@ -101,7 +101,7 @@ impl InstanceStore {
     }
 
     /// Returns (gateway_port, ssh_port) - two consecutive ports
-    pub fn next_available_ports(&self) -> (u16, u16) {
+    pub fn next_available_ports(&self) -> Result<(u16, u16), crate::error::ApiError> {
         let used_ports: std::collections::HashSet<u16> = self
             .instances
             .values()
@@ -109,14 +109,100 @@ impl InstanceStore {
             .collect();
 
         let mut port = BASE_PORT;
-        while port + 1 < MAX_PORT {
-            if !used_ports.contains(&port) && !used_ports.contains(&(port + 1)) {
-                return (port, port + 1);
+        while let Some(next) = port.checked_add(1) {
+            if next >= MAX_PORT {
+                break;
             }
-            port += PORTS_PER_INSTANCE;
+            if !used_ports.contains(&port) && !used_ports.contains(&next) {
+                return Ok((port, next));
+            }
+            port = match port.checked_add(PORTS_PER_INSTANCE) {
+                Some(p) => p,
+                None => break,
+            };
         }
 
-        let base = BASE_PORT + (self.instances.len() as u16 * PORTS_PER_INSTANCE);
-        (base, base + 1)
+        Err(crate::error::ApiError::Conflict(
+            "All ports exhausted".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_instance(name: &str, gateway_port: u16, ssh_port: u16) -> Instance {
+        Instance {
+            name: name.to_string(),
+            token: "test-token".to_string(),
+            gateway_port,
+            ssh_port,
+            created_at: Utc::now(),
+            ssh_pubkey: "ssh-ed25519 AAAA".to_string(),
+            nearai_api_key: "key".to_string(),
+            nearai_api_url: None,
+            active: true,
+            image: None,
+            image_digest: None,
+        }
+    }
+
+    #[test]
+    fn test_next_available_ports_empty_store() {
+        let store = InstanceStore::new();
+        let (gw, ssh) = store.next_available_ports().unwrap();
+        assert_eq!(gw, BASE_PORT);
+        assert_eq!(ssh, BASE_PORT + 1);
+    }
+
+    #[test]
+    fn test_next_available_ports_with_existing() {
+        let mut store = InstanceStore::new();
+        store.add(test_instance("a", BASE_PORT, BASE_PORT + 1));
+        let (gw, ssh) = store.next_available_ports().unwrap();
+        assert_eq!(gw, BASE_PORT + PORTS_PER_INSTANCE);
+        assert_eq!(ssh, BASE_PORT + PORTS_PER_INSTANCE + 1);
+    }
+
+    #[test]
+    fn test_next_available_ports_exhausted() {
+        let mut store = InstanceStore::new();
+        let mut port = BASE_PORT;
+        while port + 1 < MAX_PORT {
+            store.add(test_instance(&format!("inst-{}", port), port, port + 1));
+            port += PORTS_PER_INSTANCE;
+        }
+        assert!(store.next_available_ports().is_err());
+    }
+
+    #[test]
+    fn test_store_crud() {
+        let mut store = InstanceStore::new();
+        assert!(!store.exists("foo"));
+
+        store.add(test_instance("foo", 19001, 19002));
+        assert!(store.exists("foo"));
+        assert!(store.get("foo").is_some());
+        assert_eq!(store.list().len(), 1);
+
+        store.remove("foo");
+        assert!(!store.exists("foo"));
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn test_store_set_active() {
+        let mut store = InstanceStore::new();
+        store.add(test_instance("foo", 19001, 19002));
+        assert!(store.get("foo").unwrap().active);
+
+        store.set_active("foo", false).unwrap();
+        assert!(!store.get("foo").unwrap().active);
+
+        store.set_active("foo", true).unwrap();
+        assert!(store.get("foo").unwrap().active);
+
+        assert!(store.set_active("nonexistent", true).is_err());
     }
 }

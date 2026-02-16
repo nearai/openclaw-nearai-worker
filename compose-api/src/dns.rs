@@ -21,6 +21,7 @@ struct DnsRecord {
 impl CloudflareDns {
     pub fn new(api_token: &str, zone_id: &str) -> Self {
         let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
             .default_headers({
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(
@@ -138,7 +139,7 @@ impl CloudflareDns {
         app_id: &str,
         port: u16,
     ) -> anyhow::Result<()> {
-        let prefix = format!("_dstack-app-address.");
+        let prefix = "_dstack-app-address.".to_string();
         let suffix = format!(".{}", domain);
 
         // List all existing _dstack-app-address.*.domain TXT records

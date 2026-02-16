@@ -8,7 +8,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::Serialize;
 
-use crate::compose::ComposeManager;
+use crate::error::ApiError;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupInfo {
@@ -44,31 +44,28 @@ impl BackupManager {
         Some(Self { s3, bucket })
     }
 
-    /// Create an encrypted backup of an instance's config and workspace volumes.
-    /// Exports both .openclaw/ and openclaw/ → gzip → age-encrypt with SSH pubkey → upload to S3.
+    /// Create an encrypted backup from pre-exported instance data.
+    /// tar_bytes → gzip → age-encrypt with SSH pubkey → upload to S3.
     pub async fn create_backup(
         &self,
         instance_name: &str,
         ssh_pubkey: &str,
-        compose: &ComposeManager,
-    ) -> Result<BackupInfo, String> {
-        // Export both config + workspace as a single tar from container
-        let tar_bytes = compose
-            .export_instance_data(instance_name)
-            .map_err(|e| format!("export failed: {}", e))?;
-
+        tar_bytes: Vec<u8>,
+    ) -> Result<BackupInfo, ApiError> {
         if tar_bytes.is_empty() {
-            return Err("instance data export returned empty data".into());
+            return Err(ApiError::Internal(
+                "instance data export returned empty data".into(),
+            ));
         }
 
         // Gzip compress
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder
             .write_all(&tar_bytes)
-            .map_err(|e| format!("gzip failed: {}", e))?;
+            .map_err(|e| ApiError::Internal(format!("gzip failed: {}", e)))?;
         let gz_bytes = encoder
             .finish()
-            .map_err(|e| format!("gzip finish failed: {}", e))?;
+            .map_err(|e| ApiError::Internal(format!("gzip finish failed: {}", e)))?;
 
         // Encrypt with age using SSH public key
         let encrypted = encrypt_with_ssh_pubkey(&gz_bytes, ssh_pubkey)?;
@@ -87,7 +84,7 @@ impl BackupManager {
             .body(encrypted.into())
             .send()
             .await
-            .map_err(|e| format!("S3 upload failed: {}", e))?;
+            .map_err(|e| ApiError::Internal(format!("S3 upload failed: {}", e)))?;
 
         Ok(BackupInfo {
             id: timestamp_str,
@@ -97,7 +94,7 @@ impl BackupManager {
     }
 
     /// List available backups for an instance.
-    pub async fn list_backups(&self, instance_name: &str) -> Result<Vec<BackupInfo>, String> {
+    pub async fn list_backups(&self, instance_name: &str) -> Result<Vec<BackupInfo>, ApiError> {
         let prefix = format!("backups/{}/", instance_name);
 
         let resp = self
@@ -107,7 +104,7 @@ impl BackupManager {
             .prefix(&prefix)
             .send()
             .await
-            .map_err(|e| format!("S3 list failed: {}", e))?;
+            .map_err(|e| ApiError::Internal(format!("S3 list failed: {}", e)))?;
 
         let mut backups = Vec::new();
         if let Some(contents) = resp.contents {
@@ -142,7 +139,7 @@ impl BackupManager {
         &self,
         instance_name: &str,
         backup_id: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, ApiError> {
         let key = format!("backups/{}/{}.tar.gz.age", instance_name, backup_id);
 
         let presigned = self
@@ -154,35 +151,35 @@ impl BackupManager {
                 PresigningConfig::builder()
                     .expires_in(Duration::from_secs(3600))
                     .build()
-                    .map_err(|e| format!("presign config error: {}", e))?,
+                    .map_err(|e| ApiError::Internal(format!("presign config error: {}", e)))?,
             )
             .await
-            .map_err(|e| format!("presign failed: {}", e))?;
+            .map_err(|e| ApiError::Internal(format!("presign failed: {}", e)))?;
 
         Ok(presigned.uri().to_string())
     }
 }
 
 /// Encrypt data using an SSH public key via the `age` crate.
-fn encrypt_with_ssh_pubkey(data: &[u8], ssh_pubkey: &str) -> Result<Vec<u8>, String> {
+fn encrypt_with_ssh_pubkey(data: &[u8], ssh_pubkey: &str) -> Result<Vec<u8>, ApiError> {
     let recipient = age::ssh::Recipient::from_str(ssh_pubkey)
-        .map_err(|e| format!("invalid SSH public key: {:?}", e))?;
+        .map_err(|e| ApiError::Internal(format!("invalid SSH public key: {:?}", e)))?;
 
     let recipient: Box<dyn age::Recipient + Send> = Box::new(recipient);
     let encryptor =
         age::Encryptor::with_recipients(std::iter::once(&*recipient as &dyn age::Recipient))
-            .map_err(|e| format!("encryptor init failed: {:?}", e))?;
+            .map_err(|e| ApiError::Internal(format!("encryptor init failed: {:?}", e)))?;
 
     let mut encrypted = Vec::new();
     let mut writer = encryptor
         .wrap_output(&mut encrypted)
-        .map_err(|e| format!("age wrap_output failed: {}", e))?;
+        .map_err(|e| ApiError::Internal(format!("age wrap_output failed: {}", e)))?;
     writer
         .write_all(data)
-        .map_err(|e| format!("age write failed: {}", e))?;
+        .map_err(|e| ApiError::Internal(format!("age write failed: {}", e)))?;
     writer
         .finish()
-        .map_err(|e| format!("age finish failed: {}", e))?;
+        .map_err(|e| ApiError::Internal(format!("age finish failed: {}", e)))?;
 
     Ok(encrypted)
 }

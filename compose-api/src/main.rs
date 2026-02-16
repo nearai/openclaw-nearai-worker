@@ -100,14 +100,13 @@ const ADMIN_TOKEN_HEX_LEN: usize = 32;
 struct AppState {
     compose: Arc<ComposeManager>,
     store: Arc<RwLock<InstanceStore>>,
-    config: AppConfig,
+    config: Arc<AppConfig>,
     dns: Option<Arc<CloudflareDns>>,
     backup: Option<Arc<BackupManager>>,
 }
 
-#[derive(Clone)]
 struct AppConfig {
-    admin_token: String,
+    admin_token: secrecy::SecretString,
     host_address: String,
     openclaw_domain: Option<String>,
     openclaw_image: String,
@@ -116,6 +115,111 @@ struct AppConfig {
     dstack_gateway_base: Option<String>,
     nginx_map_path: PathBuf,
     ingress_container_name: String,
+}
+
+impl AppState {
+    #[allow(clippy::too_many_arguments)]
+    async fn compose_up(
+        &self,
+        name: &str,
+        nearai_api_key: &str,
+        token: &str,
+        gateway_port: u16,
+        ssh_port: u16,
+        ssh_pubkey: &str,
+        image: &str,
+        nearai_api_url: &str,
+    ) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        let nearai_api_key = nearai_api_key.to_string();
+        let token = token.to_string();
+        let ssh_pubkey = ssh_pubkey.to_string();
+        let image = image.to_string();
+        let nearai_api_url = nearai_api_url.to_string();
+        tokio::task::spawn_blocking(move || {
+            compose.up(&compose::InstanceConfig {
+                name: &name,
+                nearai_api_key: &nearai_api_key,
+                token: &token,
+                gateway_port,
+                ssh_port,
+                ssh_pubkey: &ssh_pubkey,
+                image: &image,
+                nearai_api_url: &nearai_api_url,
+            })
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_down(&self, name: &str) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.down(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_stop(&self, name: &str) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.stop(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_start(&self, name: &str) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.start(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_restart(&self, name: &str) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.restart(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_status(&self, name: &str) -> Result<String, ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.status(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_container_health(
+        &self,
+        name: &str,
+    ) -> Result<compose::ContainerHealth, ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.container_health(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_resolve_image_digest(&self, name: &str) -> Option<String> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.resolve_image_digest(&name))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn compose_export_instance_data(&self, name: &str) -> Result<Vec<u8>, ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.export_instance_data(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
 }
 
 /// Extractor that validates the admin token from the Authorization header
@@ -144,14 +248,16 @@ impl FromRequestParts<AppState> for AdminAuth {
             })?
             .trim();
 
-        let token_hex: String = token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-        let expected_hex: String = state
-            .config
-            .admin_token
-            .chars()
-            .filter(|c| c.is_ascii_hexdigit())
-            .collect();
-        if token_hex != expected_hex || token_hex.len() != 32 {
+        use secrecy::ExposeSecret;
+        use subtle::ConstantTimeEq;
+
+        if token.len() != ADMIN_TOKEN_HEX_LEN
+            || !bool::from(
+                token
+                    .as_bytes()
+                    .ct_eq(state.config.admin_token.expose_secret().as_bytes()),
+            )
+        {
             return Err(ApiError::Unauthorized("Invalid admin token".into()));
         }
 
@@ -183,10 +289,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let admin_token_raw = std::env::var("ADMIN_TOKEN").expect("ADMIN_TOKEN must be set");
-    let admin_token: String = admin_token_raw
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
+    let admin_token = admin_token_raw.trim().to_string();
     validate_admin_token(&admin_token)?;
 
     let compose_file = std::env::var("COMPOSE_FILE")
@@ -204,8 +307,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("dstack gateway base: {}", base);
     }
 
-    let config = AppConfig {
-        admin_token,
+    let config = Arc::new(AppConfig {
+        admin_token: secrecy::SecretString::from(admin_token),
         host_address: std::env::var("OPENCLAW_HOST_ADDRESS")
             .unwrap_or_else(|_| "localhost".to_string()),
         openclaw_domain: std::env::var("OPENCLAW_DOMAIN").ok(),
@@ -220,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         ingress_container_name: std::env::var("INGRESS_CONTAINER_NAME")
             .unwrap_or_else(|_| "dstack-ingress".to_string()),
-    };
+    });
 
     let dns = match (
         std::env::var("CLOUDFLARE_API_TOKEN").ok(),
@@ -329,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = app
+        // Permissive CORS: required for embedded docs UI and external dashboards
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -496,6 +600,23 @@ struct BackupDownloadResponse {
     expires_in_seconds: u64,
 }
 
+pub fn is_valid_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn reject_newlines(field: &str, value: &str) -> Result<(), ApiError> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(ApiError::BadRequest(format!(
+            "{field} must not contain newline characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate and sanitize nearai_api_url. Prevents injection into .env files: the value is
 /// written by ComposeManager::write_env_file as KEY=value\n. An attacker could inject
 /// newlines to add arbitrary env vars (e.g. OPENCLAW_IMAGE=malicious) or overwrite existing ones.
@@ -598,13 +719,13 @@ fn unbuffered_sse(
 fn sse_stage(stage: &str, message: &str) -> Event {
     Event::default()
         .json_data(serde_json::json!({"stage": stage, "message": message}))
-        .unwrap()
+        .expect("SSE JSON serialization")
 }
 
 fn sse_error(message: &str) -> Event {
     Event::default()
         .json_data(serde_json::json!({"stage": "error", "message": message}))
-        .unwrap()
+        .expect("SSE JSON serialization")
 }
 
 fn sse_created(info: &InstanceInfo) -> Event {
@@ -614,7 +735,7 @@ fn sse_created(info: &InstanceInfo) -> Event {
             "message": format!("Instance '{}' created, ports {}-{} allocated", info.name, info.gateway_port, info.ssh_port),
             "instance": info,
         }))
-        .unwrap()
+        .expect("SSE JSON serialization")
 }
 
 // ── Health polling loop (shared by create/start/restart SSE streams) ─
@@ -631,33 +752,33 @@ async fn poll_health_to_ready(state: &AppState, name: &str, tx: &tokio::sync::mp
             return;
         }
 
-        let health = state.compose.container_health(name);
-        let (stage, msg, done) = match health {
-            Ok(h) => match (h.state.as_str(), h.health.as_str()) {
-                ("not_found", _) => (
-                    "container_starting",
-                    "Waiting for container to appear...",
-                    false,
-                ),
-                ("running", "starting") => (
-                    "healthcheck_starting",
-                    "Container running, waiting for health check...",
-                    false,
-                ),
-                ("running", "healthy") => ("healthy", "Health check passed", false),
-                ("running", "none") | ("running", "") => (
-                    "container_running",
-                    "Container is running, health check not yet configured",
-                    false,
-                ),
-                ("exited", _) | ("dead", _) => ("error", "Container exited unexpectedly", true),
-                (_, "unhealthy") => ("error", "Container health check failed", true),
-                _ => ("container_starting", "Waiting for container...", false),
-            },
+        let health = match state.compose_container_health(name).await {
+            Ok(h) => h,
             Err(e) => {
-                let leaked: &str = e.to_string().leak();
-                ("error", leaked, true)
+                let _ = tx.send(sse_error(&e.to_string())).await;
+                return;
             }
+        };
+        let (stage, msg, done) = match (health.state.as_str(), health.health.as_str()) {
+            ("not_found", _) => (
+                "container_starting",
+                "Waiting for container to appear...",
+                false,
+            ),
+            ("running", "starting") => (
+                "healthcheck_starting",
+                "Container running, waiting for health check...",
+                false,
+            ),
+            ("running", "healthy") => ("healthy", "Health check passed", false),
+            ("running", "none") | ("running", "") => (
+                "container_running",
+                "Container is running, health check not yet configured",
+                false,
+            ),
+            ("exited", _) | ("dead", _) => ("error", "Container exited unexpectedly", true),
+            (_, "unhealthy") => ("error", "Container health check failed", true),
+            _ => ("container_starting", "Waiting for container...", false),
         };
 
         if stage != last_stage {
@@ -714,6 +835,11 @@ async fn create_instance(
         None => state.config.openclaw_image.clone(),
     };
 
+    // Defense-in-depth: reject newlines at the API boundary
+    reject_newlines("nearai_api_key", &req.nearai_api_key)?;
+    reject_newlines("ssh_pubkey", &req.ssh_pubkey)?;
+    reject_newlines("image", &image)?;
+
     // Validate nearai_api_url (prevents .env injection via newlines)
     let nearai_api_url = match req.nearai_api_url.as_deref().filter(|s| !s.is_empty()) {
         Some(url) => validate_nearai_api_url(url)?,
@@ -722,10 +848,8 @@ async fn create_instance(
 
     // Resolve instance name
     let name = if let Some(provided) = &req.name {
-        let sanitized = provided
-            .to_lowercase()
-            .replace(|c: char| !c.is_alphanumeric() && c != '-', "");
-        if sanitized.is_empty() || sanitized.len() > 32 {
+        let sanitized = provided.to_lowercase();
+        if !is_valid_instance_name(&sanitized) {
             return Err(ApiError::BadRequest(
                 "Invalid name: must be 1-32 alphanumeric/hyphen characters".into(),
             ));
@@ -754,7 +878,7 @@ async fn create_instance(
     let token = generate_token();
     let (gateway_port, ssh_port) = {
         let store = state.store.read().await;
-        store.next_available_ports()
+        store.next_available_ports()?
     };
 
     let (url, dashboard_url) = generate_urls(&state.config, &name, gateway_port, &token);
@@ -800,7 +924,7 @@ async fn create_instance(
 
         yield Ok(sse_stage("container_starting", "Pulling image and starting container..."));
 
-        if let Err(e) = state.compose.up(
+        if let Err(e) = state.compose_up(
             &name,
             &nearai_api_key,
             &token,
@@ -809,7 +933,7 @@ async fn create_instance(
             &ssh_pubkey,
             &image,
             &nearai_api_url,
-        ) {
+        ).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
         }
@@ -827,7 +951,7 @@ async fn create_instance(
         }
 
         // Resolve the image digest now that the container is running
-        let image_digest = state.compose.resolve_image_digest(&name);
+        let image_digest = state.compose_resolve_image_digest(&name).await;
         if let Some(ref digest) = image_digest {
             yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
         }
@@ -875,7 +999,7 @@ async fn get_instance(
 
     match instance {
         Some(inst) => {
-            let status = state.compose.status(&inst.name)?;
+            let status = state.compose_status(&inst.name).await?;
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
@@ -920,8 +1044,8 @@ async fn list_instances(
     let mut responses = Vec::new();
     for inst in instances {
         let status = state
-            .compose
-            .status(&inst.name)
+            .compose_status(&inst.name)
+            .await
             .unwrap_or_else(|_| "unknown".to_string());
         let (url, dashboard_url) =
             generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
@@ -971,7 +1095,7 @@ async fn delete_instance(
         }
     }
 
-    state.compose.down(&name)?;
+    state.compose_down(&name).await?;
 
     if let (Some(ref dns), Some(ref domain)) = (&state.dns, &state.config.openclaw_domain) {
         if let Err(e) = dns.delete_txt_record(&name, domain).await {
@@ -1028,7 +1152,7 @@ async fn restart_instance(
             // Full recreate with new image
             yield Ok(sse_stage("container_starting", &format!("Recreating container with image {}...", image)));
 
-            if let Err(e) = state.compose.up(
+            if let Err(e) = state.compose_up(
                 &name,
                 &inst.nearai_api_key,
                 &inst.token,
@@ -1039,13 +1163,13 @@ async fn restart_instance(
                 inst.nearai_api_url
                     .as_deref()
                     .unwrap_or(DEFAULT_NEARAI_API_URL),
-            ) {
+            ).await {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
             }
 
             // Resolve new digest
-            let image_digest = state.compose.resolve_image_digest(&name);
+            let image_digest = state.compose_resolve_image_digest(&name).await;
             if let Some(ref digest) = image_digest {
                 yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
             }
@@ -1057,7 +1181,7 @@ async fn restart_instance(
             // Simple restart
             yield Ok(sse_stage("container_starting", "Restarting container..."));
 
-            if let Err(e) = state.compose.restart(&name) {
+            if let Err(e) = state.compose_restart(&name).await {
                 yield Ok(sse_error(&format!("Failed to restart container: {}", e)));
                 return;
             }
@@ -1102,7 +1226,7 @@ async fn stop_instance(
     let stream = async_stream::stream! {
         yield Ok(sse_stage("stopping", "Stopping container..."));
 
-        if let Err(e) = state.compose.stop(&name) {
+        if let Err(e) = state.compose_stop(&name).await {
             yield Ok(sse_error(&format!("Failed to stop container: {}", e)));
             return;
         }
@@ -1147,7 +1271,7 @@ async fn start_instance(
     let stream = async_stream::stream! {
         yield Ok(sse_stage("container_starting", "Starting container..."));
 
-        if let Err(e) = state.compose.start(&name) {
+        if let Err(e) = state.compose_start(&name).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
         }
@@ -1221,7 +1345,7 @@ async fn tdx_attestation(State(state): State<AppState>) -> Result<impl IntoRespo
     // Compute SHA-256 fingerprint of the DER-encoded leaf certificate
     use sha2::{Digest, Sha256};
     let fingerprint = Sha256::digest(&leaf_der);
-    let fingerprint_hex = hex::encode(&fingerprint);
+    let fingerprint_hex = hex::encode(fingerprint);
 
     // Build 64-byte report_data: sha256(cert) in first 32 bytes, zeros in last 32
     let mut report_data = [0u8; 64];
@@ -1293,7 +1417,7 @@ async fn create_backup_endpoint(
     let backup_mgr = state
         .backup
         .as_ref()
-        .ok_or_else(|| ApiError::Internal("Backup not configured".into()))?
+        .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?
         .clone();
 
     let inst = {
@@ -1305,8 +1429,16 @@ async fn create_backup_endpoint(
     let stream = async_stream::stream! {
         yield Ok(sse_stage("encrypting", "Exporting and encrypting workspace..."));
 
+        let tar_bytes = match state.compose_export_instance_data(&name).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                yield Ok(sse_error(&format!("Backup failed: {}", e)));
+                return;
+            }
+        };
+
         let result = backup_mgr
-            .create_backup(&name, &inst.ssh_pubkey, &state.compose)
+            .create_backup(&name, &inst.ssh_pubkey, tar_bytes)
             .await;
 
         match result {
@@ -1322,7 +1454,7 @@ async fn create_backup_endpoint(
                             "size_bytes": info.size_bytes,
                         }
                     }))
-                    .unwrap());
+                    .expect("SSE JSON serialization"));
             }
             Err(e) => {
                 yield Ok(sse_error(&format!("Backup failed: {}", e)));
@@ -1335,7 +1467,7 @@ async fn create_backup_endpoint(
 
 #[utoipa::path(get, path = "/instances/{name}/backups", tag = "Backups",
     params(("name" = String, Path, description = "Instance name")),
-    security(),
+    security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "List of available backups", body = BackupListResponse),
         (status = 404, description = "Instance not found", body = ErrorResponse),
@@ -1343,13 +1475,14 @@ async fn create_backup_endpoint(
     )
 )]
 async fn list_backups_endpoint(
+    _auth: AdminAuth,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let backup_mgr = state
         .backup
         .as_ref()
-        .ok_or_else(|| ApiError::Internal("Backup not configured".into()))?;
+        .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?;
 
     {
         let store = state.store.read().await;
@@ -1358,10 +1491,7 @@ async fn list_backups_endpoint(
         }
     }
 
-    let backups = backup_mgr
-        .list_backups(&name)
-        .await
-        .map_err(|e| ApiError::Internal(e))?;
+    let backups = backup_mgr.list_backups(&name).await?;
 
     let items: Vec<BackupInfoResponse> = backups
         .into_iter()
@@ -1380,7 +1510,7 @@ async fn list_backups_endpoint(
         ("name" = String, Path, description = "Instance name"),
         ("id" = String, Path, description = "Backup ID (timestamp)"),
     ),
-    security(),
+    security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Presigned download URL", body = BackupDownloadResponse),
         (status = 404, description = "Instance not found", body = ErrorResponse),
@@ -1388,13 +1518,14 @@ async fn list_backups_endpoint(
     )
 )]
 async fn download_backup_endpoint(
+    _auth: AdminAuth,
     State(state): State<AppState>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
     let backup_mgr = state
         .backup
         .as_ref()
-        .ok_or_else(|| ApiError::Internal("Backup not configured".into()))?;
+        .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?;
 
     {
         let store = state.store.read().await;
@@ -1403,10 +1534,7 @@ async fn download_backup_endpoint(
         }
     }
 
-    let url = backup_mgr
-        .download_url(&name, &id)
-        .await
-        .map_err(|e| ApiError::Internal(e))?;
+    let url = backup_mgr.download_url(&name, &id).await?;
 
     Ok(Json(BackupDownloadResponse {
         url,
@@ -1511,9 +1639,10 @@ async fn fetch_dstack_app_id() -> Option<String> {
         return None;
     }
 
-    let output = std::process::Command::new("curl")
+    let output = tokio::process::Command::new("curl")
         .args(["--unix-socket", sock_path, "-s", "http://localhost/Info"])
-        .output();
+        .output()
+        .await;
 
     match output {
         Ok(o) if o.status.success() => {
@@ -1534,6 +1663,24 @@ async fn fetch_dstack_app_id() -> Option<String> {
         Err(e) => {
             tracing::warn!("Failed to run curl for dstack APP_ID: {}", e);
             None
+        }
+    }
+}
+
+// Expose AppConfig fields for generate_urls/generate_ssh_command tests
+#[cfg(test)]
+impl AppConfig {
+    fn test_default() -> Self {
+        Self {
+            admin_token: secrecy::SecretString::from("a".repeat(32)),
+            host_address: "localhost".to_string(),
+            openclaw_domain: None,
+            openclaw_image: "test:local".to_string(),
+            compose_file: std::path::PathBuf::from("/dev/null"),
+            dstack_app_id: None,
+            dstack_gateway_base: None,
+            nginx_map_path: PathBuf::from("/tmp/test.map"),
+            ingress_container_name: "test-ingress".to_string(),
         }
     }
 }
@@ -1587,8 +1734,19 @@ async fn background_sync_loop(state: AppState) {
                         continue;
                     }
                     tracing::info!("Scheduled backup for instance: {}", inst.name);
+                    let tar_bytes = match state.compose_export_instance_data(&inst.name).await {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Scheduled backup export failed for {}: {}",
+                                inst.name,
+                                e
+                            );
+                            continue;
+                        }
+                    };
                     match backup_mgr
-                        .create_backup(&inst.name, &inst.ssh_pubkey, &state.compose)
+                        .create_backup(&inst.name, &inst.ssh_pubkey, tar_bytes)
                         .await
                     {
                         Ok(info) => {
@@ -1606,5 +1764,122 @@ async fn background_sync_loop(state: AppState) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── validate_admin_token ─────────────────────────────────────────
+
+    #[test]
+    fn test_validate_admin_token_valid() {
+        assert!(validate_admin_token("abcdef0123456789abcdef0123456789").is_ok());
+    }
+
+    #[test]
+    fn test_validate_admin_token_wrong_length() {
+        assert!(validate_admin_token("abcdef").is_err());
+    }
+
+    #[test]
+    fn test_validate_admin_token_non_hex() {
+        assert!(validate_admin_token("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+    }
+
+    // ── validate_image ───────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_image_valid_digest() {
+        assert!(validate_image("docker.io/org/img@sha256:abc123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_image_empty() {
+        assert!(validate_image("").is_err());
+    }
+
+    #[test]
+    fn test_validate_image_no_digest() {
+        assert!(validate_image("docker.io/org/img:latest").is_err());
+    }
+
+    #[test]
+    fn test_validate_image_too_long() {
+        let long_image = format!("docker.io/org/img@sha256:{}", "a".repeat(300));
+        assert!(validate_image(&long_image).is_err());
+    }
+
+    // ── generate_urls ────────────────────────────────────────────────
+
+    #[test]
+    fn test_generate_urls_with_domain() {
+        let mut config = AppConfig::test_default();
+        config.openclaw_domain = Some("example.com".to_string());
+        let (url, dashboard) = generate_urls(&config, "test", 19001, "tok");
+        assert_eq!(url, "https://test.example.com");
+        assert_eq!(dashboard, "https://test.example.com/?token=tok");
+    }
+
+    #[test]
+    fn test_generate_urls_without_domain() {
+        let config = AppConfig::test_default();
+        let (url, dashboard) = generate_urls(&config, "test", 19001, "tok");
+        assert_eq!(url, "http://localhost:19001");
+        assert_eq!(dashboard, "http://localhost:19001/?token=tok");
+    }
+
+    // ── generate_ssh_command ─────────────────────────────────────────
+
+    #[test]
+    fn test_generate_ssh_command_without_dstack() {
+        let config = AppConfig::test_default();
+        let cmd = generate_ssh_command(&config, 19002);
+        assert_eq!(cmd, "ssh -p 19002 agent@localhost");
+    }
+
+    #[test]
+    fn test_generate_ssh_command_with_dstack() {
+        let mut config = AppConfig::test_default();
+        config.dstack_app_id = Some("app123".to_string());
+        config.dstack_gateway_base = Some("gw.example.com".to_string());
+        let cmd = generate_ssh_command(&config, 19002);
+        assert!(cmd.contains("app123-19002.gw.example.com"));
+        assert!(cmd.contains("ProxyCommand"));
+    }
+
+    // ── is_valid_instance_name ───────────────────────────────────────
+
+    #[test]
+    fn test_is_valid_instance_name_valid() {
+        assert!(is_valid_instance_name("brave-tiger"));
+        assert!(is_valid_instance_name("a"));
+        assert!(is_valid_instance_name("test-123"));
+    }
+
+    #[test]
+    fn test_is_valid_instance_name_empty() {
+        assert!(!is_valid_instance_name(""));
+    }
+
+    #[test]
+    fn test_is_valid_instance_name_too_long() {
+        assert!(!is_valid_instance_name(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn test_is_valid_instance_name_special_chars() {
+        assert!(!is_valid_instance_name("foo bar"));
+        assert!(!is_valid_instance_name("foo_bar"));
+        assert!(!is_valid_instance_name("foo.bar"));
+        assert!(!is_valid_instance_name("../etc"));
+    }
+
+    #[test]
+    fn test_is_valid_instance_name_hyphens_ok() {
+        assert!(is_valid_instance_name("a-b-c"));
+        assert!(!is_valid_instance_name("-leading"));
+        assert!(!is_valid_instance_name("trailing-"));
     }
 }

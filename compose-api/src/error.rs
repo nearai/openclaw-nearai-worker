@@ -24,6 +24,15 @@ pub enum ApiError {
 
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        ApiError::Internal(e.to_string())
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -41,6 +50,7 @@ impl IntoResponse for ApiError {
                 )
             }
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
+            ApiError::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg.clone()),
         };
 
         (status, Json(json!({ "error": message }))).into_response()
