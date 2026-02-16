@@ -603,7 +603,18 @@ struct BackupDownloadResponse {
 pub fn is_valid_instance_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 32
+        && !name.starts_with('-')
+        && !name.ends_with('-')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn reject_newlines(field: &str, value: &str) -> Result<(), ApiError> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(ApiError::BadRequest(format!(
+            "{field} must not contain newline characters"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate and sanitize nearai_api_url. Prevents injection into .env files: the value is
@@ -823,6 +834,11 @@ async fn create_instance(
         }
         None => state.config.openclaw_image.clone(),
     };
+
+    // Defense-in-depth: reject newlines at the API boundary
+    reject_newlines("nearai_api_key", &req.nearai_api_key)?;
+    reject_newlines("ssh_pubkey", &req.ssh_pubkey)?;
+    reject_newlines("image", &image)?;
 
     // Validate nearai_api_url (prevents .env injection via newlines)
     let nearai_api_url = match req.nearai_api_url.as_deref().filter(|s| !s.is_empty()) {
@@ -1863,7 +1879,7 @@ mod tests {
     #[test]
     fn test_is_valid_instance_name_hyphens_ok() {
         assert!(is_valid_instance_name("a-b-c"));
-        assert!(is_valid_instance_name("-leading"));
-        assert!(is_valid_instance_name("trailing-"));
+        assert!(!is_valid_instance_name("-leading"));
+        assert!(!is_valid_instance_name("trailing-"));
     }
 }

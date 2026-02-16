@@ -122,7 +122,7 @@ impl InstanceStore {
             };
         }
 
-        Err(crate::error::ApiError::Internal(
+        Err(crate::error::ApiError::Conflict(
             "All ports exhausted".into(),
         ))
     }
