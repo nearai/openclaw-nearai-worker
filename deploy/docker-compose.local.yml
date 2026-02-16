@@ -1,0 +1,160 @@
+# Local Development Stack
+#
+# Runs the full management stack on macOS Docker Desktop without CVM dependencies.
+# Usage (from repo root):
+#   ./deploy/dev.sh              # build + start
+#   ./deploy/dev.sh --no-build   # start without rebuilding
+#   ./deploy/dev.sh --down       # tear down
+#
+# Or manually:
+#   docker compose -f deploy/docker-compose.local.yml --env-file deploy/.env.dstack.local up -d
+
+services:
+  # One-shot: create empty backends.map so nginx can start
+  nginx-init:
+    image: alpine:3
+    volumes:
+      - nginx-dynamic:/data/nginx
+    entrypoint: ["/bin/sh", "-c", "touch /data/nginx/backends.map"]
+    restart: "no"
+
+  # HTTP-only nginx (replaces dstack-ingress in production)
+  # Container name must be "dstack-ingress" so compose-api's
+  # `docker exec dstack-ingress nginx -s reload` works unchanged.
+  dstack-ingress:
+    image: ${INGRESS_IMAGE:-nginx:alpine}
+    container_name: dstack-ingress
+    network_mode: host
+    volumes:
+      - nginx-dynamic:/data/nginx
+    configs:
+      - source: openclaw_nginx
+        target: /etc/nginx/conf.d/openclaw.conf
+    depends_on:
+      nginx-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  compose-api:
+    image: ${COMPOSE_API_IMAGE:-openclaw-compose-api:local}
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - management-data:/app/data
+      - nginx-dynamic:/data/nginx
+    environment:
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - OPENCLAW_DOMAIN=${OPENCLAW_DOMAIN}
+      - OPENCLAW_IMAGE=${OPENCLAW_IMAGE}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID:-}
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN:-}
+      - NGINX_MAP_PATH=/data/nginx/backends.map
+      - INGRESS_CONTAINER_NAME=dstack-ingress
+      - COMPOSE_FILE=/app/docker-compose.worker.yml
+      - LISTEN_ADDR=0.0.0.0:8080
+      - BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
+      - BACKUP_S3_REGION=${BACKUP_S3_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 120s
+    restart: unless-stopped
+    depends_on:
+      - dstack-ingress
+
+  openclaw-updater:
+    image: ${UPDATER_IMAGE:-openclaw-updater:local}
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - management-data:/app/data
+      - ${DEPLOY_DIR:-.}:/app/deploy
+    environment:
+      - UPDATER_COMPOSE_API_IMAGE=${COMPOSE_API_IMAGE_REPO:-}
+      - UPDATER_WORKER_IMAGE=${WORKER_IMAGE_REPO:-}
+      - UPDATER_SELF_IMAGE=${UPDATER_SELF_IMAGE:-}
+      - UPDATER_CHANNEL=${UPDATER_CHANNEL:-latest}
+      - UPDATER_POLL_INTERVAL=${UPDATER_POLL_INTERVAL:-300}
+      - UPDATER_COMPOSE_FILE=${UPDATER_COMPOSE_FILE:-/app/deploy/docker-compose.local.yml}
+      - UPDATER_ENV_FILE=${UPDATER_ENV_FILE:-/app/deploy/.env.dstack.local}
+      - UPDATER_BASE_ENV_FILE=${UPDATER_BASE_ENV_FILE:-}
+      - UPDATER_COMPOSE_PROJECT=${UPDATER_COMPOSE_PROJECT:-}
+      - UPDATER_COSIGN_IDENTITY_REGEXP=${UPDATER_COSIGN_IDENTITY:-}
+      - UPDATER_COSIGN_ISSUER=https://token.actions.githubusercontent.com
+      - UPDATER_HEALTH_URL=http://127.0.0.1:8080/health
+      - UPDATER_HEALTH_TIMEOUT=60
+      - UPDATER_STATE_FILE=/app/data/updater-state.json
+      - UPDATER_SKIP_VERIFY=${UPDATER_SKIP_VERIFY:-0}
+    restart: unless-stopped
+    depends_on:
+      - compose-api
+
+  datadog-agent:
+    image: ${DATADOG_IMAGE:-datadog/agent:latest}
+    container_name: datadog-agent
+    network_mode: host
+    profiles:
+      - monitoring
+    environment:
+      - DD_API_KEY=${DD_API_KEY:-}
+      - DD_SITE=us3.datadoghq.com
+      - DD_ENV=${DD_ENV:-dev}
+      - DD_HOSTNAME=${DD_HOSTNAME:-openclaw-management-stack}
+      - DD_LOGS_ENABLED=true
+      - DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL=true
+      - DD_CONTAINER_EXCLUDE_LOGS=name:openclaw-.*-gateway-.*
+      - DD_CONTAINER_EXCLUDE=name:openclaw-.*-gateway-.*
+      - DD_PROCESS_AGENT_ENABLED=true
+      - DD_DOGSTATSD_NON_LOCAL_TRAFFIC=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  registry:
+    image: registry:2
+    ports:
+      - "5050:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+    restart: unless-stopped
+
+configs:
+  openclaw_nginx:
+    content: |
+      map $$host $$openclaw_backend {
+          include /data/nginx/backends.map;
+      }
+
+      server {
+          listen 80 default_server;
+          server_name _;
+
+          location / {
+              proxy_pass $$openclaw_backend;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $$http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $$host;
+          }
+      }
+
+      server {
+          listen 80;
+          server_name api.localhost;
+
+          location / {
+              proxy_pass http://127.0.0.1:8080;
+              proxy_set_header Host $$host;
+          }
+      }
+
+volumes:
+  nginx-dynamic:
+  management-data:
+  registry-data:
