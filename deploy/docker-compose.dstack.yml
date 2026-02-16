@@ -70,6 +70,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - management-data:/app/data
+      - compose-files:/app/compose-live
       - ${DEPLOY_DIR:-.}:/app/deploy
     environment:
       - UPDATER_COMPOSE_API_IMAGE=${COMPOSE_API_IMAGE_REPO:-}
@@ -159,3 +160,4 @@ volumes:
   cert-data:
   nginx-dynamic:
   management-data:
+  compose-files:
