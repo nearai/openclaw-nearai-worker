@@ -5,11 +5,12 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse,
     },
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +57,9 @@ use store::{Instance, InstanceStore};
         create_backup_endpoint,
         list_backups_endpoint,
         download_backup_endpoint,
+        get_config,
+        set_config,
+        delete_config_key,
     ),
     components(schemas(
         VersionResponse,
@@ -115,6 +119,7 @@ struct AppConfig {
     dstack_gateway_base: Option<String>,
     nginx_map_path: PathBuf,
     ingress_container_name: String,
+    env_override_file: Option<PathBuf>,
 }
 
 impl AppState {
@@ -323,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         ingress_container_name: std::env::var("INGRESS_CONTAINER_NAME")
             .unwrap_or_else(|_| "dstack-ingress".to_string()),
+        env_override_file: std::env::var("ENV_OVERRIDE_FILE").ok().map(PathBuf::from),
     });
 
     let dns = match (
@@ -419,7 +425,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
         .route("/instances/{name}/attestation", get(instance_attestation))
-        .route("/attestation/report", get(tdx_attestation));
+        .route("/attestation/report", get(tdx_attestation))
+        .route("/config", get(get_config))
+        .route("/config", put(set_config))
+        .route("/config/{key}", delete(delete_config_key));
 
     if state.backup.is_some() {
         app = app
@@ -1540,6 +1549,159 @@ async fn download_backup_endpoint(
     }))
 }
 
+// ── Config (env override) handlers ───────────────────────────────────
+
+fn validate_env_key(key: &str) -> Result<(), ApiError> {
+    if key.is_empty() || key.len() > 128 {
+        return Err(ApiError::BadRequest(
+            "Key must be 1-128 characters".into(),
+        ));
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(ApiError::BadRequest(
+            "Key must match [A-Z0-9_]+".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_env_value(value: &str) -> Result<(), ApiError> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(ApiError::BadRequest(
+            "Value must not contain newline characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_env_override_file(path: &std::path::Path) -> Result<BTreeMap<String, String>, ApiError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "Failed to read override file: {}",
+                e
+            )))
+        }
+    };
+
+    let mut map = BTreeMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            map.insert(key.to_string(), value.to_string());
+        }
+    }
+    Ok(map)
+}
+
+fn write_env_override_file(
+    path: &std::path::Path,
+    vars: &BTreeMap<String, String>,
+) -> Result<(), ApiError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ApiError::Internal(format!("Failed to create override file directory: {}", e))
+        })?;
+    }
+    let content: String = vars
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(path, content)
+        .map_err(|e| ApiError::Internal(format!("Failed to write override file: {}", e)))?;
+    Ok(())
+}
+
+fn require_override_file(config: &AppConfig) -> Result<&std::path::Path, ApiError> {
+    config
+        .env_override_file
+        .as_deref()
+        .ok_or_else(|| ApiError::NotFound("ENV_OVERRIDE_FILE not configured".into()))
+}
+
+#[utoipa::path(get, path = "/config", tag = "Config",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Current env var overrides", body = Object),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Override file not configured", body = ErrorResponse),
+    )
+)]
+async fn get_config(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let path = require_override_file(&state.config)?;
+    let vars = read_env_override_file(path)?;
+    Ok(Json(vars))
+}
+
+#[utoipa::path(put, path = "/config", tag = "Config",
+    request_body = Object,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Updated env var overrides", body = Object),
+        (status = 400, description = "Invalid key or value", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Override file not configured", body = ErrorResponse),
+    )
+)]
+async fn set_config(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Json(body): Json<BTreeMap<String, String>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let path = require_override_file(&state.config)?;
+
+    for (key, value) in &body {
+        validate_env_key(key)?;
+        validate_env_value(value)?;
+    }
+
+    let mut vars = read_env_override_file(path)?;
+    for (key, value) in body {
+        vars.insert(key, value);
+    }
+    write_env_override_file(path, &vars)?;
+
+    tracing::info!("Config updated: {} vars in override file", vars.len());
+    Ok(Json(vars))
+}
+
+#[utoipa::path(delete, path = "/config/{key}", tag = "Config",
+    params(("key" = String, Path, description = "Environment variable key to remove")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Key removed"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Override file not configured or key not found", body = ErrorResponse),
+    )
+)]
+async fn delete_config_key(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let path = require_override_file(&state.config)?;
+    let mut vars = read_env_override_file(path)?;
+    if vars.remove(&key).is_none() {
+        return Err(ApiError::NotFound(format!("Key '{}' not found", key)));
+    }
+    write_env_override_file(path, &vars)?;
+    tracing::info!("Config key '{}' removed from override file", key);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Utilities ────────────────────────────────────────────────────────
 
 async fn update_nginx_now(state: &AppState) {
@@ -1678,6 +1840,7 @@ impl AppConfig {
             dstack_gateway_base: None,
             nginx_map_path: PathBuf::from("/tmp/test.map"),
             ingress_container_name: "test-ingress".to_string(),
+            env_override_file: None,
         }
     }
 }

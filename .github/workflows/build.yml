@@ -36,7 +36,7 @@ jobs:
             dockerfile: compose-api/Dockerfile
             build_script: false
           - name: openclaw-updater
-            context: updater
+            context: .
             dockerfile: updater/Dockerfile
             build_script: false
     steps:

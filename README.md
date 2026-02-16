@@ -82,8 +82,8 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
 
 2. **Deploy** (from repo root):
    ```bash
-   chmod +x deploy/deploy.sh
-   ./deploy/deploy.sh
+   chmod +x deploy/dev.sh
+   ./deploy/dev.sh
    ```
 
 3. **Create users via Compose API:**
@@ -343,8 +343,9 @@ All from repo root. Single-tenant (one worker):
 
 Multi-tenant (Compose API + per-user workers):
 
-- `cd compose-api && ./build-local.sh` - Build Compose API image (or `docker build --build-arg CACHEBUST=$(date +%s) -t openclaw-compose-api:local .`)
-- `docker compose -f deploy/docker-compose.simple.yml --env-file deploy/.env.prod up -d` - Start Compose API
+- `./deploy/dev.sh` - Build all images and start the local development stack
+- `./deploy/dev.sh --no-build` - Start without rebuilding images
+- `./deploy/dev.sh --down` - Tear down the stack
 
 ## Commands (CVM)
 
