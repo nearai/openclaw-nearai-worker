@@ -33,12 +33,15 @@ fi
 
 # Validate required configuration
 [ -z "$COMPOSE_API_IMAGE" ] && { echo "FATAL: UPDATER_COMPOSE_API_IMAGE is required" >&2; exit 1; }
-[ -z "$COSIGN_IDENTITY" ]   && { echo "FATAL: UPDATER_COSIGN_IDENTITY_REGEXP is required" >&2; exit 1; }
+if [ "${UPDATER_SKIP_VERIFY:-0}" != "1" ]; then
+    [ -z "$COSIGN_IDENTITY" ] && { echo "FATAL: UPDATER_COSIGN_IDENTITY_REGEXP is required" >&2; exit 1; }
+fi
 COSIGN_ISSUER="${UPDATER_COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
 HEALTH_URL="${UPDATER_HEALTH_URL:-http://127.0.0.1:8080/health}"
 HEALTH_TIMEOUT="${UPDATER_HEALTH_TIMEOUT:-60}"
 STATE_FILE="${UPDATER_STATE_FILE:-/app/data/updater-state.json}"
 SELF_CHECK_INTERVAL="${UPDATER_SELF_CHECK_INTERVAL:-288}"  # every 24h at 5min polls
+BUNDLED_COMPOSE="/app/compose/docker-compose.dstack.yml"
 
 # ── Logging ───────────────────────────────────────────────────────────
 
@@ -74,11 +77,20 @@ parse_image() {
     local registry repo
 
     if [[ "$image" == *"/"*"/"* ]]; then
+        # Two+ slashes: explicit registry/namespace/repo
         registry="${image%%/*}"
         repo="${image#*/}"
     elif [[ "$image" == *"/"* ]]; then
-        registry="registry-1.docker.io"
-        repo="${image}"
+        local first="${image%%/*}"
+        if [[ "$first" == *.* ]] || [[ "$first" == *:* ]] || [[ "$first" == "localhost" ]]; then
+            # First component is a registry (contains dot, port, or is localhost)
+            registry="$first"
+            repo="${image#*/}"
+        else
+            # Docker Hub user/repo
+            registry="registry-1.docker.io"
+            repo="${image}"
+        fi
     else
         registry="registry-1.docker.io"
         repo="library/${image}"
@@ -106,6 +118,13 @@ fetch_remote_digest() {
 
     read -r registry repo <<< "$(parse_image "$image")"
 
+    # Use http:// for localhost registries, https:// for everything else
+    local scheme="https"
+    if [[ "$registry" == localhost:* ]] || [[ "$registry" == "localhost" ]] \
+       || [[ "$registry" == 127.0.0.1:* ]] || [[ "$registry" == "127.0.0.1" ]]; then
+        scheme="http"
+    fi
+
     if [ "$registry" = "registry-1.docker.io" ]; then
         token="$(get_auth_token "$repo")"
         digest="$(curl -fsSL \
@@ -122,7 +141,7 @@ fetch_remote_digest() {
             -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
             -H "Accept: application/vnd.oci.image.index.v1+json" \
             --head \
-            "https://${registry}/v2/${repo}/manifests/${tag}" 2>/dev/null \
+            "${scheme}://${registry}/v2/${repo}/manifests/${tag}" 2>/dev/null \
             | grep -i 'docker-content-digest' \
             | awk '{print $2}' \
             | tr -d '\r')"
@@ -135,6 +154,12 @@ fetch_remote_digest() {
 
 verify_attestation() {
     local image_ref="$1"
+
+    if [ "${UPDATER_SKIP_VERIFY:-0}" = "1" ]; then
+        log "SKIP_VERIFY: skipping cosign verification for ${image_ref}"
+        return 0
+    fi
+
     log "Verifying cosign signature for ${image_ref}..."
 
     if cosign verify \
@@ -233,6 +258,44 @@ write_env_var() {
         sed "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
     else
         echo "${key}=${value}" >> "$ENV_FILE"
+    fi
+}
+
+# ── Bootstrap ────────────────────────────────────────────────────────
+
+bootstrap() {
+    log "Checking if bootstrap is needed..."
+
+    # If compose-api is already running, skip (existing deployment or reboot)
+    if docker ps --filter "label=com.docker.compose.service=compose-api" --format '{{.Names}}' | grep -q .; then
+        log "compose-api already running, skipping bootstrap"
+        return 0
+    fi
+
+    log "Bootstrap: compose-api not found, performing initial setup"
+
+    # Copy bundled compose file to deploy volume
+    local compose_dir
+    compose_dir="$(dirname "$COMPOSE_FILE")"
+    mkdir -p "$compose_dir"
+
+    if [ -f "$BUNDLED_COMPOSE" ]; then
+        cp "$BUNDLED_COMPOSE" "$COMPOSE_FILE"
+        log "Bootstrap: wrote compose file to $COMPOSE_FILE"
+    else
+        log_error "Bootstrap: bundled compose file not found at $BUNDLED_COMPOSE"
+        return 1
+    fi
+
+    # Start all services
+    log "Bootstrap: starting all services..."
+    compose_up -d --remove-orphans
+
+    if wait_for_healthy "$HEALTH_TIMEOUT"; then
+        log "Bootstrap: all services started successfully"
+    else
+        log_error "Bootstrap: compose-api failed health check"
+        return 1
     fi
 }
 
@@ -402,6 +465,13 @@ update_self() {
         return 1
     fi
 
+    # Extract updated compose file from new image
+    log "Syncing compose file from new image..."
+    docker run --rm \
+        -v "$(dirname "$COMPOSE_FILE"):/target" \
+        --entrypoint sh "$image_ref" \
+        -c "cp /app/compose/docker-compose.dstack.yml /target/"
+
     write_env_var "UPDATER_IMAGE" "$image_ref"
     write_state "updater_digest" "$remote_digest"
     log "Self-updating to ${image_ref}..."
@@ -426,7 +496,7 @@ update_self() {
         --volumes-from "$self_cid" \
         --entrypoint sh \
         "$image_ref" \
-        -c "sleep 3 && docker compose $compose_args up -d --no-deps openclaw-updater && sleep 2"; then
+        -c "sleep 3 && docker compose $compose_args up -d --remove-orphans --no-deps openclaw-updater && sleep 2"; then
         log_error "Failed to launch self-update helper container"
         return 1
     fi
@@ -454,6 +524,9 @@ main() {
     log "  cosign identity:   ${COSIGN_IDENTITY}"
 
     init_state
+
+    # Bootstrap: deploy all services if compose-api isn't running yet
+    bootstrap || true
 
     # Seed current digest from running container on first start
     if [ -z "$(read_state "compose_api_digest")" ]; then

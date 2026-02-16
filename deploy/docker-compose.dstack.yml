@@ -7,7 +7,7 @@ services:
     restart: "no"
 
   dstack-ingress:
-    image: dstacktee/dstack-ingress:1.2@sha256:549d6864ccbde3f35622a4bfbbc54911363650de84f37698d72d85ec4714d6fd
+    image: ${INGRESS_IMAGE:-dstacktee/dstack-ingress:1.2@sha256:549d6864ccbde3f35622a4bfbbc54911363650de84f37698d72d85ec4714d6fd}
     container_name: dstack-ingress
     network_mode: host
     environment:
@@ -37,7 +37,7 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - management-data:/app/data
       - nginx-dynamic:/data/nginx
-      - cert-data:/etc/letsencrypt:ro
+      - cert-data:/etc/letsencrypt
     environment:
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - OPENCLAW_DOMAIN=${OPENCLAW_DOMAIN}
@@ -53,6 +53,12 @@ services:
       - BACKUP_S3_REGION=${BACKUP_S3_REGION:-}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 120s
     restart: unless-stopped
     depends_on:
       - dstack-ingress
@@ -82,6 +88,28 @@ services:
     restart: unless-stopped
     depends_on:
       - compose-api
+
+  datadog-agent:
+    image: ${DATADOG_IMAGE:-datadog/agent:latest}
+    container_name: datadog-agent
+    network_mode: host
+    environment:
+      - DD_API_KEY=${DD_API_KEY}
+      - DD_SITE=us3.datadoghq.com
+      - DD_ENV=${DD_ENV:-dev}
+      - DD_HOSTNAME=${DD_HOSTNAME:-openclaw-management-stack}
+      - DD_LOGS_ENABLED=true
+      - DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL=true
+      - DD_CONTAINER_EXCLUDE_LOGS=name:openclaw-.*-gateway-.*
+      - DD_CONTAINER_EXCLUDE=name:openclaw-.*-gateway-.*
+      - DD_PROCESS_AGENT_ENABLED=true
+      - DD_DOGSTATSD_NON_LOCAL_TRAFFIC=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc/:/host/proc/:ro
+      - /sys/fs/cgroup/:/host/sys/fs/cgroup:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    restart: unless-stopped
 
 configs:
   openclaw_nginx:
