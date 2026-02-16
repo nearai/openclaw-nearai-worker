@@ -111,6 +111,7 @@ struct AppConfig {
     host_address: String,
     openclaw_domain: Option<String>,
     openclaw_image: String,
+    nearai_api_url: String,
     compose_file: std::path::PathBuf,
     dstack_app_id: Option<String>,
     dstack_gateway_base: Option<String>,
@@ -211,6 +212,8 @@ async fn main() -> anyhow::Result<()> {
         openclaw_domain: std::env::var("OPENCLAW_DOMAIN").ok(),
         openclaw_image: std::env::var("OPENCLAW_IMAGE")
             .unwrap_or_else(|_| "openclaw-nearai-worker:local".to_string()),
+        nearai_api_url: std::env::var("NEARAI_API_URL")
+            .unwrap_or_else(|_| "https://cloud-api.near.ai/v1".to_string()),
         compose_file: std::path::PathBuf::from(compose_file),
         dstack_app_id,
         dstack_gateway_base,
@@ -736,6 +739,7 @@ async fn create_instance(
         created_at: chrono::Utc::now(),
         ssh_pubkey: req.ssh_pubkey.clone(),
         nearai_api_key: req.nearai_api_key.clone(),
+        nearai_api_url: Some(state.config.nearai_api_url.clone()),
         active: true,
         image: Some(image.clone()),
         image_digest: None,
@@ -763,6 +767,7 @@ async fn create_instance(
             ssh_port,
             &ssh_pubkey,
             &image,
+            &state.config.nearai_api_url,
         ) {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
@@ -990,6 +995,9 @@ async fn restart_instance(
                 inst.ssh_port,
                 &inst.ssh_pubkey,
                 image,
+                inst.nearai_api_url
+                    .as_deref()
+                    .unwrap_or(&state.config.nearai_api_url),
             ) {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
@@ -1159,9 +1167,7 @@ async fn instance_attestation(
         (status = 503, description = "Attestation not available", body = ErrorResponse),
     )
 )]
-async fn tdx_attestation(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, ApiError> {
+async fn tdx_attestation(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let domain = state
         .config
         .openclaw_domain
@@ -1402,9 +1408,10 @@ fn read_tls_certificate(domain: &str) -> Result<(String, Vec<u8>), ApiError> {
     let certs = pem::parse_many(&pem_data)
         .map_err(|e| ApiError::ServiceUnavailable(format!("failed to parse PEM: {}", e)))?;
 
-    let leaf_cert = certs.into_iter().next().ok_or_else(|| {
-        ApiError::ServiceUnavailable("no certificate found in PEM file".into())
-    })?;
+    let leaf_cert = certs
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::ServiceUnavailable("no certificate found in PEM file".into()))?;
 
     let leaf_pem = pem::encode(&leaf_cert);
     let der_bytes = leaf_cert.into_contents();
@@ -1413,9 +1420,7 @@ fn read_tls_certificate(domain: &str) -> Result<(String, Vec<u8>), ApiError> {
 }
 
 /// Call dstack guest-agent GetQuote RPC via Unix socket.
-async fn fetch_dstack_quote(
-    report_data: &[u8; 64],
-) -> Result<serde_json::Value, ApiError> {
+async fn fetch_dstack_quote(report_data: &[u8; 64]) -> Result<serde_json::Value, ApiError> {
     let sock_path = "/var/run/dstack.sock";
     if !std::path::Path::new(sock_path).exists() {
         return Err(ApiError::ServiceUnavailable(

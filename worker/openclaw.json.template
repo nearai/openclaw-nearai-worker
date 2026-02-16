@@ -3,7 +3,7 @@
     "mode": "merge",
     "providers": {
       "nearai": {
-        "baseUrl": "https://cloud-api.near.ai/v1",
+        "baseUrl": "${NEARAI_API_URL}",
         "apiKey": "${NEARAI_API_KEY}",
         "auth": "api-key",
         "api": "openai-completions",

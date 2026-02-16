@@ -121,7 +121,10 @@ impl CloudflareDns {
 
             tracing::info!("Deleted DNS TXT record: {}", record_name);
         } else {
-            tracing::debug!("DNS TXT record not found (already deleted?): {}", record_name);
+            tracing::debug!(
+                "DNS TXT record not found (already deleted?): {}",
+                record_name
+            );
         }
 
         Ok(())
@@ -174,7 +177,11 @@ impl CloudflareDns {
                     .send()
                     .await;
                 if let Err(e) = resp {
-                    tracing::warn!("Failed to delete orphaned DNS record {}: {}", record.name, e);
+                    tracing::warn!(
+                        "Failed to delete orphaned DNS record {}: {}",
+                        record.name,
+                        e
+                    );
                 }
             }
         }
@@ -199,11 +206,7 @@ impl CloudflareDns {
         Ok(body.result.first().map(|r| r.id.clone()))
     }
 
-    async fn list_txt_records(
-        &self,
-        prefix: &str,
-        suffix: &str,
-    ) -> anyhow::Result<Vec<DnsRecord>> {
+    async fn list_txt_records(&self, prefix: &str, suffix: &str) -> anyhow::Result<Vec<DnsRecord>> {
         let mut records = Vec::new();
         let mut page = 1u32;
 

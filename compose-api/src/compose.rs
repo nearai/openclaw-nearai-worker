@@ -75,9 +75,11 @@ impl ComposeManager {
         ssh_port: u16,
         ssh_pubkey: &str,
         image: &str,
+        nearai_api_url: &str,
     ) -> Result<(), ApiError> {
         let mut vars = HashMap::new();
         vars.insert("NEARAI_API_KEY".into(), nearai_api_key.into());
+        vars.insert("NEARAI_API_URL".into(), nearai_api_url.into());
         vars.insert("OPENCLAW_GATEWAY_TOKEN".into(), token.into());
         vars.insert("GATEWAY_PORT".into(), gateway_port.to_string());
         vars.insert("SSH_PORT".into(), ssh_port.to_string());
@@ -360,6 +362,10 @@ impl ComposeManager {
             .unwrap_or_default();
         let ssh_pubkey = env_map.get("SSH_PUBKEY").cloned().unwrap_or_default();
         let nearai_api_key = env_map.get("NEARAI_API_KEY").cloned().unwrap_or_default();
+        let nearai_api_url = env_map
+            .get("NEARAI_API_URL")
+            .cloned()
+            .filter(|s| !s.is_empty());
         let image_env = env_map.get("OPENCLAW_IMAGE").cloned();
 
         // Parse port bindings from .HostConfig.PortBindings
@@ -404,6 +410,7 @@ impl ComposeManager {
             created_at,
             ssh_pubkey,
             nearai_api_key,
+            nearai_api_url,
             active,
             image,
             image_digest,
@@ -430,6 +437,12 @@ impl ComposeManager {
     pub fn ensure_env_file(&self, inst: &Instance) -> Result<PathBuf, ApiError> {
         let mut vars = HashMap::new();
         vars.insert("NEARAI_API_KEY".into(), inst.nearai_api_key.clone());
+        vars.insert(
+            "NEARAI_API_URL".into(),
+            inst.nearai_api_url
+                .as_deref()
+                .unwrap_or("https://cloud-api.near.ai/v1"),
+        );
         vars.insert("OPENCLAW_GATEWAY_TOKEN".into(), inst.token.clone());
         vars.insert("GATEWAY_PORT".into(), inst.gateway_port.to_string());
         vars.insert("SSH_PORT".into(), inst.ssh_port.to_string());

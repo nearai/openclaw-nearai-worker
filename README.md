@@ -35,6 +35,7 @@ Required variables:
 - `NEARAI_API_KEY`: NEAR AI Cloud API key
 
 Optional variables:
+- `NEARAI_API_URL`: NEAR AI Cloud API URL (default: `https://cloud-api.near.ai/v1`).
 - `OPENCLAW_FORCE_CONFIG_REGEN`: Set to `1` to force regeneration of config from template (default: `0`)
 - `OPENCLAW_GATEWAY_BIND`: Gateway bind address — `lan` (default) or `loopback`. See [Gateway binding and security](#gateway-binding-and-security).
 - `SSH_PUBKEY`: Your SSH public key (e.g. contents of `~/.ssh/id_ed25519.pub`). When set, enables SSH server on port 2222 for key-based login as user `agent`. See [SSH access](#ssh-access).
