@@ -91,9 +91,9 @@ jobs:
       - name: Verify streaming patch applied
         if: matrix.build_script
         run: |
-          echo "Verifying non-streaming patch in built image..."
-          skopeo copy oci-archive:./oci.tar docker-daemon:verify-patch:latest
-          docker run --rm --entrypoint grep verify-patch:latest \
+          echo "Verifying non-streaming patch in pushed image..."
+          docker pull "${{ env.IMAGE_REFERENCE }}"
+          docker run --rm --entrypoint grep "${{ env.IMAGE_REFERENCE }}" \
             -q 'nonStreamParams' /home/agent/.npm-global/lib/node_modules/openclaw/node_modules/@mariozechner/pi-ai/dist/providers/openai-completions.js
           echo "✓ Streaming patch verified in final image"
 
