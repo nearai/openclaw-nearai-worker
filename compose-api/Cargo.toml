@@ -42,7 +42,6 @@ aws-config = "1"
 
 # Crypto
 sha2 = "0.10"
-base64 = "0.22"
 pem = "3"
 
 # Security

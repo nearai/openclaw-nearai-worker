@@ -1385,16 +1385,14 @@ async fn tdx_attestation(State(state): State<AppState>) -> Result<impl IntoRespo
         .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'vm_config'".into()))?
         .to_string();
 
-    // Decode base64 report_data from dstack response to hex
-    let report_data_hex = hex::encode(
-        base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            returned_report_data,
-        )
-        .map_err(|e| {
-            ApiError::ServiceUnavailable(format!("failed to decode report_data from dstack: {}", e))
-        })?,
-    );
+    // dstack returns report_data as a hex string — validate and use directly
+    let report_data_hex = returned_report_data.to_string();
+    hex::decode(&report_data_hex).map_err(|e| {
+        ApiError::ServiceUnavailable(format!(
+            "dstack returned invalid hex report_data: {}",
+            e
+        ))
+    })?;
 
     Ok(Json(TdxAttestationReport {
         quote,
@@ -1759,9 +1757,8 @@ async fn fetch_dstack_quote(report_data: &[u8; 64]) -> Result<serde_json::Value,
         ));
     }
 
-    let report_data_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, report_data);
-    let body = serde_json::json!({ "report_data": report_data_b64 }).to_string();
+    let report_data_hex = hex::encode(report_data);
+    let body = serde_json::json!({ "report_data": report_data_hex }).to_string();
 
     let output = tokio::process::Command::new("curl")
         .args([
