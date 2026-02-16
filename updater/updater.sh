@@ -466,15 +466,23 @@ update_self() {
         return 1
     fi
 
+    # Resolve own container ID (needed for --volumes-from in both sync and helper)
+    local self_cid
+    self_cid="$(docker ps -q --filter "label=com.docker.compose.service=openclaw-updater" | head -1)"
+    if [ -z "$self_cid" ]; then
+        log_error "Cannot determine own container ID for self-update"
+        return 1
+    fi
+
     # Extract updated compose file from new image.
-    # HOST_DEPLOY_DIR provides the host-side path for Docker Desktop where
-    # container paths (/app/deploy) differ from host paths.
-    local host_deploy_dir="${HOST_DEPLOY_DIR:-$(dirname "$COMPOSE_FILE")}"
+    # Uses --volumes-from so the temp container gets the same mounts as us,
+    # which works with bind mounts (standard server, local dev) and named
+    # volumes (dstack CVM bootstrap) without needing host-side paths.
     log "Syncing compose file from new image..."
     docker run --rm \
-        -v "${host_deploy_dir}:/target" \
+        --volumes-from "$self_cid" \
         --entrypoint sh "$image_ref" \
-        -c "cp /app/compose/docker-compose.dstack.yml /target/"
+        -c "cp /app/compose/docker-compose.dstack.yml $(dirname "$COMPOSE_FILE")/"
 
     write_env_var "UPDATER_IMAGE" "$image_ref"
     write_state "updater_digest" "$remote_digest"
@@ -484,13 +492,6 @@ update_self() {
     # We can't do it directly because compose stop+remove kills this process
     # before create+start can execute, leaving the new container in "Created" state.
     docker rm -f openclaw-updater-helper 2>/dev/null || true
-
-    local self_cid
-    self_cid="$(docker ps -q --filter "label=com.docker.compose.service=openclaw-updater" | head -1)"
-    if [ -z "$self_cid" ]; then
-        log_error "Cannot determine own container ID for self-update"
-        return 1
-    fi
 
     local compose_args
     compose_args="$(compose_base_args)"
