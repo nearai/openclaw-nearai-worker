@@ -267,15 +267,9 @@ write_env_var() {
 bootstrap() {
     log "Checking if bootstrap is needed..."
 
-    # If compose-api is already running, skip (existing deployment or reboot)
-    if docker ps --filter "label=com.docker.compose.service=compose-api" --format '{{.Names}}' | grep -q .; then
-        log "compose-api already running, skipping bootstrap"
-        return 0
-    fi
-
-    log "Bootstrap: compose-api not found, performing initial setup"
-
-    # Copy bundled compose file to deploy volume
+    # Always copy bundled compose file to the deploy volume so that
+    # compose_up can reconcile all services (ingress, datadog, etc.)
+    # even when Docker state persists across CVM re-deploys.
     local compose_dir
     compose_dir="$(dirname "$COMPOSE_FILE")"
     mkdir -p "$compose_dir"
@@ -288,15 +282,24 @@ bootstrap() {
         return 1
     fi
 
-    # Start all services
-    log "Bootstrap: starting all services..."
+    local fresh_deploy=true
+    if docker ps --filter "label=com.docker.compose.service=compose-api" --format '{{.Names}}' | grep -q .; then
+        fresh_deploy=false
+    fi
+
+    # Start/reconcile all services (idempotent — running services stay untouched)
+    log "Bootstrap: ensuring all services are running..."
     compose_up -d --remove-orphans
 
-    if wait_for_healthy "$HEALTH_TIMEOUT"; then
-        log "Bootstrap: all services started successfully"
+    if [ "$fresh_deploy" = true ]; then
+        if wait_for_healthy "$HEALTH_TIMEOUT"; then
+            log "Bootstrap: all services started successfully"
+        else
+            log_error "Bootstrap: compose-api failed health check"
+            return 1
+        fi
     else
-        log_error "Bootstrap: compose-api failed health check"
-        return 1
+        log "Bootstrap: reconciled services (compose-api was already running)"
     fi
 }
 
