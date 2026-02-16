@@ -120,6 +120,10 @@ if [ "$NO_BUILD" -eq 0 ]; then
   log_info "Pushing openclaw-compose-api to local registry..."
   docker tag openclaw-compose-api:local localhost:5050/openclaw-compose-api:latest
   docker push localhost:5050/openclaw-compose-api:latest
+
+  log_info "Pushing openclaw-nearai-worker to local registry..."
+  docker tag openclaw-nearai-worker:local localhost:5050/openclaw-nearai-worker:latest
+  docker push localhost:5050/openclaw-nearai-worker:latest
 fi
 
 if [ "$BUILD_ONLY" -eq 1 ]; then
