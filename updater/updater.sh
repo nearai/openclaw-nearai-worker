@@ -13,6 +13,7 @@ ENV_FILE="${UPDATER_ENV_FILE:?UPDATER_ENV_FILE is required}"
 BASE_ENV_FILE="${UPDATER_BASE_ENV_FILE:-}"
 COMPOSE_PROJECT="${UPDATER_COMPOSE_PROJECT:-}"
 COSIGN_IDENTITY="${UPDATER_COSIGN_IDENTITY_REGEXP:-}"
+HOST_DEPLOY_DIR="${UPDATER_HOST_DEPLOY_DIR:-}"
 
 # Auto-detect dstack mode by checking well-known path
 DSTACK_ENV_PATH="/app/deploy/.host-shared/.decrypted-env"
@@ -465,10 +466,13 @@ update_self() {
         return 1
     fi
 
-    # Extract updated compose file from new image
+    # Extract updated compose file from new image.
+    # HOST_DEPLOY_DIR provides the host-side path for Docker Desktop where
+    # container paths (/app/deploy) differ from host paths.
+    local host_deploy_dir="${HOST_DEPLOY_DIR:-$(dirname "$COMPOSE_FILE")}"
     log "Syncing compose file from new image..."
     docker run --rm \
-        -v "$(dirname "$COMPOSE_FILE"):/target" \
+        -v "${host_deploy_dir}:/target" \
         --entrypoint sh "$image_ref" \
         -c "cp /app/compose/docker-compose.dstack.yml /target/"
 
@@ -491,9 +495,14 @@ update_self() {
     local compose_args
     compose_args="$(compose_base_args)"
 
+    # Pass DEPLOY_DIR so compose resolves the host-side bind mount correctly
+    local helper_env=""
+    [ -n "$HOST_DEPLOY_DIR" ] && helper_env="-e DEPLOY_DIR=${HOST_DEPLOY_DIR}"
+
     if ! docker run --rm -d \
         --name openclaw-updater-helper \
         --volumes-from "$self_cid" \
+        $helper_env \
         --entrypoint sh \
         "$image_ref" \
         -c "sleep 3 && docker compose $compose_args up -d --remove-orphans --no-deps openclaw-updater && sleep 2"; then

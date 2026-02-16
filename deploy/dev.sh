@@ -124,6 +124,10 @@ if [ "$NO_BUILD" -eq 0 ]; then
   log_info "Pushing openclaw-nearai-worker to local registry..."
   docker tag openclaw-nearai-worker:local localhost:5050/openclaw-nearai-worker:latest
   docker push localhost:5050/openclaw-nearai-worker:latest
+
+  log_info "Pushing openclaw-updater to local registry..."
+  docker tag openclaw-updater:local localhost:5050/openclaw-updater:latest
+  docker push localhost:5050/openclaw-updater:latest
 fi
 
 if [ "$BUILD_ONLY" -eq 1 ]; then
@@ -132,6 +136,11 @@ if [ "$BUILD_ONLY" -eq 1 ]; then
 fi
 
 # ── Start stack ─────────────────────────────────────────────────────
+
+# DEPLOY_DIR must be an absolute host path so the updater's self-update
+# helper container can re-mount it correctly (Docker Desktop remaps `.`
+# relative to the helper's cwd, which is inside a container).
+export DEPLOY_DIR="$REPO_ROOT/deploy"
 
 log_info "Starting local stack..."
 docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
