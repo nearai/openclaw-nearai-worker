@@ -5,6 +5,8 @@
 services:
   gateway:
     image: ${OPENCLAW_IMAGE:-openclaw-nearai-worker:local}
+    labels:
+      openclaw.managed: "true"
     environment:
       HOME: /home/agent
       TERM: xterm-256color

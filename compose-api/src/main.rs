@@ -52,6 +52,7 @@ use store::{Instance, InstanceStore};
         stop_instance,
         start_instance,
         instance_attestation,
+        tdx_attestation,
         create_backup_endpoint,
         list_backups_endpoint,
         download_backup_endpoint,
@@ -64,6 +65,7 @@ use store::{Instance, InstanceStore};
         InstanceResponse,
         InstancesListResponse,
         AttestationResponse,
+        TdxAttestationReport,
         BackupInfoResponse,
         BackupListResponse,
         BackupDownloadResponse,
@@ -122,7 +124,10 @@ struct AdminAuth;
 impl FromRequestParts<AppState> for AdminAuth {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let auth_header = parts
             .headers
             .get("Authorization")
@@ -132,11 +137,20 @@ impl FromRequestParts<AppState> for AdminAuth {
         let token = auth_header
             .strip_prefix("Bearer ")
             .or_else(|| auth_header.strip_prefix("bearer "))
-            .ok_or_else(|| ApiError::Unauthorized("Invalid Authorization header format. Expected: Bearer <token>".into()))?
+            .ok_or_else(|| {
+                ApiError::Unauthorized(
+                    "Invalid Authorization header format. Expected: Bearer <token>".into(),
+                )
+            })?
             .trim();
 
         let token_hex: String = token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-        let expected_hex: String = state.config.admin_token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        let expected_hex: String = state
+            .config
+            .admin_token
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
         if token_hex != expected_hex || token_hex.len() != 32 {
             return Err(ApiError::Unauthorized("Invalid admin token".into()));
         }
@@ -169,7 +183,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let admin_token_raw = std::env::var("ADMIN_TOKEN").expect("ADMIN_TOKEN must be set");
-    let admin_token: String = admin_token_raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let admin_token: String = admin_token_raw
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
     validate_admin_token(&admin_token)?;
 
     let compose_file = std::env::var("COMPOSE_FILE")
@@ -198,7 +215,8 @@ async fn main() -> anyhow::Result<()> {
         dstack_app_id,
         dstack_gateway_base,
         nginx_map_path: PathBuf::from(
-            std::env::var("NGINX_MAP_PATH").unwrap_or_else(|_| "/data/nginx/backends.map".to_string()),
+            std::env::var("NGINX_MAP_PATH")
+                .unwrap_or_else(|_| "/data/nginx/backends.map".to_string()),
         ),
         ingress_container_name: std::env::var("INGRESS_CONTAINER_NAME")
             .unwrap_or_else(|_| "dstack-ingress".to_string()),
@@ -213,7 +231,9 @@ async fn main() -> anyhow::Result<()> {
             Some(Arc::new(CloudflareDns::new(&token, &zone_id)))
         }
         _ => {
-            tracing::info!("Cloudflare DNS not configured (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ZONE_ID not set)");
+            tracing::info!(
+                "Cloudflare DNS not configured (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ZONE_ID not set)"
+            );
             None
         }
     };
@@ -223,7 +243,24 @@ async fn main() -> anyhow::Result<()> {
         std::path::PathBuf::from("data/envs"),
     )?);
 
-    let store = Arc::new(RwLock::new(InstanceStore::load_or_create("data/users.json")?));
+    let mut instance_store = InstanceStore::new();
+    match compose.discover_instances() {
+        Ok(discovered) => {
+            if !discovered.is_empty() {
+                tracing::info!("discovered {} instances from Docker", discovered.len());
+                for inst in &discovered {
+                    if let Err(e) = compose.ensure_env_file(inst) {
+                        tracing::warn!("failed to write env file for {}: {}", inst.name, e);
+                    }
+                }
+                instance_store.populate(discovered);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to discover instances from Docker: {}", e);
+        }
+    }
+    let store = Arc::new(RwLock::new(instance_store));
 
     let backup = match BackupManager::from_env().await {
         Some(bm) => Some(Arc::new(bm)),
@@ -234,7 +271,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if let Some(ref domain) = config.openclaw_domain {
-        tracing::info!("OPENCLAW_DOMAIN set: instance URLs will use https://{{name}}.{}", domain);
+        tracing::info!(
+            "OPENCLAW_DOMAIN set: instance URLs will use https://{{name}}.{}",
+            domain
+        );
     }
 
     let state = AppState {
@@ -248,9 +288,11 @@ async fn main() -> anyhow::Result<()> {
     update_nginx_now(&state).await;
 
     // Ensure the "api" subdomain DNS record exists so the dstack gateway routes to us
-    if let (Some(ref dns), Some(ref domain), Some(ref app_id)) =
-        (&state.dns, &state.config.openclaw_domain, &state.config.dstack_app_id)
-    {
+    if let (Some(ref dns), Some(ref domain), Some(ref app_id)) = (
+        &state.dns,
+        &state.config.openclaw_domain,
+        &state.config.dstack_app_id,
+    ) {
         if let Err(e) = dns.ensure_txt_record("api", domain, app_id, 443).await {
             tracing::warn!("Failed to create DNS record for api.{}: {}", domain, e);
         }
@@ -273,13 +315,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/{name}/restart", post(restart_instance))
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
-        .route("/instances/{name}/attestation", get(instance_attestation));
+        .route("/instances/{name}/attestation", get(instance_attestation))
+        .route("/attestation/report", get(tdx_attestation));
 
     if state.backup.is_some() {
         app = app
             .route("/instances/{name}/backup", post(create_backup_endpoint))
             .route("/instances/{name}/backups", get(list_backups_endpoint))
-            .route("/instances/{name}/backups/{id}", get(download_backup_endpoint));
+            .route(
+                "/instances/{name}/backups/{id}",
+                get(download_backup_endpoint),
+            );
     }
 
     let app = app
@@ -402,6 +448,23 @@ struct AttestationResponse {
     image_digest: Option<String>,
 }
 
+/// TDX attestation report with TLS certificate binding
+#[derive(Serialize, utoipa::ToSchema)]
+struct TdxAttestationReport {
+    /// Base64-encoded TDX DCAP quote (~4KB)
+    quote: String,
+    /// TCG event log (JSON string)
+    event_log: String,
+    /// Hex-encoded 64-byte report_data embedded in the quote
+    report_data: String,
+    /// VM configuration (OS image hash, etc.)
+    vm_config: String,
+    /// PEM-encoded TLS leaf certificate
+    tls_certificate: String,
+    /// Hex SHA-256 fingerprint of the DER-encoded leaf certificate
+    tls_certificate_fingerprint: String,
+}
+
 /// Error response body
 #[derive(Serialize, utoipa::ToSchema)]
 struct ErrorResponse {
@@ -436,7 +499,9 @@ fn validate_image(image: &str) -> Result<(), ApiError> {
         return Err(ApiError::BadRequest("image must not be empty".into()));
     }
     if trimmed.len() > 256 {
-        return Err(ApiError::BadRequest("image must not exceed 256 characters".into()));
+        return Err(ApiError::BadRequest(
+            "image must not exceed 256 characters".into(),
+        ));
     }
     if !trimmed.contains("@sha256:") {
         return Err(ApiError::BadRequest(
@@ -447,7 +512,12 @@ fn validate_image(image: &str) -> Result<(), ApiError> {
 }
 
 /// Generate URL and dashboard_url based on config
-fn generate_urls(config: &AppConfig, name: &str, gateway_port: u16, token: &str) -> (String, String) {
+fn generate_urls(
+    config: &AppConfig,
+    name: &str,
+    gateway_port: u16,
+    token: &str,
+) -> (String, String) {
     match &config.openclaw_domain {
         Some(domain) => {
             let base = format!("https://{}.{}", name, domain);
@@ -478,10 +548,7 @@ fn generate_ssh_command(config: &AppConfig, ssh_port: u16) -> String {
 fn unbuffered_sse(
     stream: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
 ) -> impl IntoResponse {
-    let headers = [
-        ("X-Accel-Buffering", "no"),
-        ("Cache-Control", "no-cache"),
-    ];
+    let headers = [("X-Accel-Buffering", "no"), ("Cache-Control", "no-cache")];
     let sse = Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
@@ -514,27 +581,37 @@ fn sse_created(info: &InstanceInfo) -> Event {
 
 // ── Health polling loop (shared by create/start/restart SSE streams) ─
 
-async fn poll_health_to_ready(
-    state: &AppState,
-    name: &str,
-    tx: &tokio::sync::mpsc::Sender<Event>,
-) {
+async fn poll_health_to_ready(state: &AppState, name: &str, tx: &tokio::sync::mpsc::Sender<Event>) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
     let mut last_stage = String::new();
 
     loop {
         if tokio::time::Instant::now() >= deadline {
-            let _ = tx.send(sse_error("timeout waiting for container to become ready")).await;
+            let _ = tx
+                .send(sse_error("timeout waiting for container to become ready"))
+                .await;
             return;
         }
 
         let health = state.compose.container_health(name);
         let (stage, msg, done) = match health {
             Ok(h) => match (h.state.as_str(), h.health.as_str()) {
-                ("not_found", _) => ("container_starting", "Waiting for container to appear...", false),
-                ("running", "starting") => ("healthcheck_starting", "Container running, waiting for health check...", false),
+                ("not_found", _) => (
+                    "container_starting",
+                    "Waiting for container to appear...",
+                    false,
+                ),
+                ("running", "starting") => (
+                    "healthcheck_starting",
+                    "Container running, waiting for health check...",
+                    false,
+                ),
                 ("running", "healthy") => ("healthy", "Health check passed", false),
-                ("running", "none") | ("running", "") => ("container_running", "Container is running, health check not yet configured", false),
+                ("running", "none") | ("running", "") => (
+                    "container_running",
+                    "Container is running, health check not yet configured",
+                    false,
+                ),
                 ("exited", _) | ("dead", _) => ("error", "Container exited unexpectedly", true),
                 (_, "unhealthy") => ("error", "Container health check failed", true),
                 _ => ("container_starting", "Waiting for container...", false),
@@ -555,7 +632,9 @@ async fn poll_health_to_ready(
             let _ = tx.send(sse_stage(stage, msg)).await;
 
             if stage == "healthy" {
-                let _ = tx.send(sse_stage("ready", &format!("Instance '{}' is ready", name))).await;
+                let _ = tx
+                    .send(sse_stage("ready", &format!("Instance '{}' is ready", name)))
+                    .await;
                 return;
             }
         }
@@ -599,17 +678,27 @@ async fn create_instance(
 
     // Resolve instance name
     let name = if let Some(provided) = &req.name {
-        let sanitized = provided.to_lowercase().replace(|c: char| !c.is_alphanumeric() && c != '-', "");
+        let sanitized = provided
+            .to_lowercase()
+            .replace(|c: char| !c.is_alphanumeric() && c != '-', "");
         if sanitized.is_empty() || sanitized.len() > 32 {
-            return Err(ApiError::BadRequest("Invalid name: must be 1-32 alphanumeric/hyphen characters".into()));
+            return Err(ApiError::BadRequest(
+                "Invalid name: must be 1-32 alphanumeric/hyphen characters".into(),
+            ));
         }
         const RESERVED: &[&str] = &["api", "www", "mail", "admin", "gateway"];
         if RESERVED.contains(&sanitized.as_str()) {
-            return Err(ApiError::BadRequest(format!("'{}' is a reserved name", sanitized)));
+            return Err(ApiError::BadRequest(format!(
+                "'{}' is a reserved name",
+                sanitized
+            )));
         }
         let store = state.store.read().await;
         if store.exists(&sanitized) {
-            return Err(ApiError::Conflict(format!("Instance '{}' already exists", sanitized)));
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' already exists",
+                sanitized
+            )));
         }
         sanitized
     } else {
@@ -655,7 +744,7 @@ async fn create_instance(
     // Save to store before streaming so it's persisted immediately
     {
         let mut store = state.store.write().await;
-        store.add(instance)?;
+        store.add(instance);
     }
 
     let nearai_api_key = req.nearai_api_key.clone();
@@ -741,9 +830,13 @@ async fn get_instance(
     match instance {
         Some(inst) => {
             let status = state.compose.status(&inst.name)?;
-            let (url, dashboard_url) = generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
+            let (url, dashboard_url) =
+                generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
-            let image = inst.image.clone().unwrap_or_else(|| state.config.openclaw_image.clone());
+            let image = inst
+                .image
+                .clone()
+                .unwrap_or_else(|| state.config.openclaw_image.clone());
             Ok(Json(InstanceResponse {
                 name: inst.name,
                 token: inst.token,
@@ -780,11 +873,17 @@ async fn list_instances(
 
     let mut responses = Vec::new();
     for inst in instances {
-        let status = state.compose.status(&inst.name)
+        let status = state
+            .compose
+            .status(&inst.name)
             .unwrap_or_else(|_| "unknown".to_string());
-        let (url, dashboard_url) = generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
+        let (url, dashboard_url) =
+            generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
         let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
-        let image = inst.image.clone().unwrap_or_else(|| state.config.openclaw_image.clone());
+        let image = inst
+            .image
+            .clone()
+            .unwrap_or_else(|| state.config.openclaw_image.clone());
         responses.push(InstanceResponse {
             name: inst.name,
             token: inst.token,
@@ -800,7 +899,9 @@ async fn list_instances(
         });
     }
 
-    Ok(Json(InstancesListResponse { instances: responses }))
+    Ok(Json(InstancesListResponse {
+        instances: responses,
+    }))
 }
 
 #[utoipa::path(delete, path = "/instances/{name}", tag = "Instances",
@@ -826,9 +927,7 @@ async fn delete_instance(
 
     state.compose.down(&name)?;
 
-    if let (Some(ref dns), Some(ref domain)) =
-        (&state.dns, &state.config.openclaw_domain)
-    {
+    if let (Some(ref dns), Some(ref domain)) = (&state.dns, &state.config.openclaw_domain) {
         if let Err(e) = dns.delete_txt_record(&name, domain).await {
             tracing::warn!("Failed to delete DNS record for {}: {}", name, e);
         }
@@ -836,7 +935,7 @@ async fn delete_instance(
 
     {
         let mut store = state.store.write().await;
-        store.remove(&name)?;
+        store.remove(&name);
     }
 
     update_nginx_now(&state).await;
@@ -1044,11 +1143,86 @@ async fn instance_attestation(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let store = state.store.read().await;
-    let inst = store.get(&name)
+    let inst = store
+        .get(&name)
         .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
     Ok(Json(AttestationResponse {
         name: inst.name.clone(),
         image_digest: inst.image_digest.clone(),
+    }))
+}
+
+#[utoipa::path(get, path = "/attestation/report", tag = "Attestation",
+    security(),
+    responses(
+        (status = 200, description = "TDX attestation report bound to the TLS certificate", body = TdxAttestationReport),
+        (status = 503, description = "Attestation not available", body = ErrorResponse),
+    )
+)]
+async fn tdx_attestation(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let domain = state
+        .config
+        .openclaw_domain
+        .as_deref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("OPENCLAW_DOMAIN not configured".into()))?;
+
+    // Read the TLS leaf certificate
+    let (leaf_pem, leaf_der) = read_tls_certificate(domain)?;
+
+    // Compute SHA-256 fingerprint of the DER-encoded leaf certificate
+    use sha2::{Digest, Sha256};
+    let fingerprint = Sha256::digest(&leaf_der);
+    let fingerprint_hex = hex::encode(&fingerprint);
+
+    // Build 64-byte report_data: sha256(cert) in first 32 bytes, zeros in last 32
+    let mut report_data = [0u8; 64];
+    report_data[..32].copy_from_slice(&fingerprint);
+
+    // Get TDX quote from dstack guest-agent
+    let quote_response = fetch_dstack_quote(&report_data).await?;
+
+    let quote = quote_response
+        .get("quote")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'quote'".into()))?
+        .to_string();
+    let event_log = quote_response
+        .get("event_log")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'event_log'".into()))?
+        .to_string();
+    let returned_report_data = quote_response
+        .get("report_data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable("dstack response missing 'report_data'".into())
+        })?;
+    let vm_config = quote_response
+        .get("vm_config")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'vm_config'".into()))?
+        .to_string();
+
+    // Decode base64 report_data from dstack response to hex
+    let report_data_hex = hex::encode(
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            returned_report_data,
+        )
+        .map_err(|e| {
+            ApiError::ServiceUnavailable(format!("failed to decode report_data from dstack: {}", e))
+        })?,
+    );
+
+    Ok(Json(TdxAttestationReport {
+        quote,
+        event_log,
+        report_data: report_data_hex,
+        vm_config,
+        tls_certificate: leaf_pem,
+        tls_certificate_fingerprint: fingerprint_hex,
     }))
 }
 
@@ -1201,7 +1375,8 @@ async fn update_nginx_now(state: &AppState) {
             let store = state.store.read().await;
             store.list()
         };
-        let changed = nginx_conf::write_backends_map(&instances, domain, &state.config.nginx_map_path);
+        let changed =
+            nginx_conf::write_backends_map(&instances, domain, &state.config.nginx_map_path);
         if changed {
             nginx_conf::reload_nginx(&state.config.ingress_container_name);
         }
@@ -1213,6 +1388,74 @@ fn generate_token() -> String {
     let mut rng = rand::rng();
     let bytes: [u8; 32] = rng.random();
     hex::encode(bytes)
+}
+
+/// Read the TLS leaf certificate from the Let's Encrypt cert volume.
+/// Returns (PEM string of leaf cert, DER bytes of leaf cert).
+fn read_tls_certificate(domain: &str) -> Result<(String, Vec<u8>), ApiError> {
+    let cert_base = std::env::var("CERT_DATA_PATH").unwrap_or_else(|_| "/etc/letsencrypt".into());
+    let cert_path = format!("{}/live/{}/fullchain.pem", cert_base, domain);
+    let pem_data = std::fs::read(&cert_path).map_err(|e| {
+        ApiError::ServiceUnavailable(format!("TLS certificate not available: {}", e))
+    })?;
+
+    let certs = pem::parse_many(&pem_data)
+        .map_err(|e| ApiError::ServiceUnavailable(format!("failed to parse PEM: {}", e)))?;
+
+    let leaf_cert = certs.into_iter().next().ok_or_else(|| {
+        ApiError::ServiceUnavailable("no certificate found in PEM file".into())
+    })?;
+
+    let leaf_pem = pem::encode(&leaf_cert);
+    let der_bytes = leaf_cert.into_contents();
+
+    Ok((leaf_pem, der_bytes))
+}
+
+/// Call dstack guest-agent GetQuote RPC via Unix socket.
+async fn fetch_dstack_quote(
+    report_data: &[u8; 64],
+) -> Result<serde_json::Value, ApiError> {
+    let sock_path = "/var/run/dstack.sock";
+    if !std::path::Path::new(sock_path).exists() {
+        return Err(ApiError::ServiceUnavailable(
+            "dstack.sock not found — not running in a TEE".into(),
+        ));
+    }
+
+    let report_data_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, report_data);
+    let body = serde_json::json!({ "report_data": report_data_b64 }).to_string();
+
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "--unix-socket",
+            sock_path,
+            "-s",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body,
+            "http://localhost/GetQuote",
+        ])
+        .output()
+        .await
+        .map_err(|e| ApiError::ServiceUnavailable(format!("failed to call dstack: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::ServiceUnavailable(format!(
+            "dstack GetQuote failed: {}",
+            stderr
+        )));
+    }
+
+    let response_body = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&response_body).map_err(|e| {
+        ApiError::ServiceUnavailable(format!("failed to parse dstack response: {}", e))
+    })
 }
 
 async fn fetch_dstack_app_id() -> Option<String> {
@@ -1272,11 +1515,8 @@ async fn background_sync_loop(state: AppState) {
             store.list()
         };
 
-        let changed = nginx_conf::write_backends_map(
-            &instances,
-            &domain,
-            &state.config.nginx_map_path,
-        );
+        let changed =
+            nginx_conf::write_backends_map(&instances, &domain, &state.config.nginx_map_path);
         if changed {
             nginx_conf::reload_nginx(&state.config.ingress_container_name);
         }
@@ -1316,22 +1556,6 @@ async fn background_sync_loop(state: AppState) {
                         Err(e) => {
                             tracing::warn!("Scheduled backup failed for {}: {}", inst.name, e);
                         }
-                    }
-                }
-
-                // Backup instance metadata (users.json) after instance backups
-                let metadata_json = {
-                    let store = state.store.read().await;
-                    store.to_json()
-                };
-                match metadata_json {
-                    Ok(data) => {
-                        if let Err(e) = backup_mgr.backup_metadata(&data).await {
-                            tracing::warn!("Metadata backup failed: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to serialize metadata for backup: {}", e);
                     }
                 }
             }
