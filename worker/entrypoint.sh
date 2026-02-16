@@ -3,7 +3,6 @@ set -eu -o pipefail
 
 # Security: Prevent accidental exposure of sensitive environment variables
 # Never log, echo, or print the values of these variables:
-# - NEARAI_API_URL
 # - NEARAI_API_KEY
 # - OPENCLAW_GATEWAY_TOKEN
 # - SSH_PUBKEY
