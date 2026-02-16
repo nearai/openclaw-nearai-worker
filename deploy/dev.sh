@@ -120,11 +120,6 @@ if [ "$NO_BUILD" -eq 0 ]; then
   log_info "Pushing openclaw-compose-api to local registry..."
   docker tag openclaw-compose-api:local localhost:5050/openclaw-compose-api:latest
   docker push localhost:5050/openclaw-compose-api:latest
-
-  # Reset COMPOSE_API_IMAGE to :latest so compose-api boots from the
-  # registry image directly (updater may have pinned it to a digest).
-  sed -i.bak 's|^COMPOSE_API_IMAGE=.*|COMPOSE_API_IMAGE=localhost:5050/openclaw-compose-api:latest|' "$ENV_FILE"
-  rm -f "${ENV_FILE}.bak"
 fi
 
 if [ "$BUILD_ONLY" -eq 1 ]; then

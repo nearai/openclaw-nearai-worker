@@ -58,6 +58,7 @@ services:
       - BACKUP_S3_REGION=${BACKUP_S3_REGION:-}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - ENV_OVERRIDE_FILE=/app/data/.env.overrides
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
       interval: 5s
@@ -82,9 +83,9 @@ services:
       - UPDATER_CHANNEL=${UPDATER_CHANNEL:-latest}
       - UPDATER_POLL_INTERVAL=${UPDATER_POLL_INTERVAL:-300}
       - UPDATER_COMPOSE_FILE=${UPDATER_COMPOSE_FILE:-/app/deploy/docker-compose.local.yml}
-      - UPDATER_ENV_FILE=${UPDATER_ENV_FILE:-/app/deploy/.env.dstack.local}
-      - UPDATER_BASE_ENV_FILE=${UPDATER_BASE_ENV_FILE:-}
-      - UPDATER_COMPOSE_PROJECT=${UPDATER_COMPOSE_PROJECT:-}
+      - UPDATER_ENV_FILE=/app/data/.env.overrides
+      - UPDATER_BASE_ENV_FILE=/app/deploy/.env.dstack.local
+      - UPDATER_COMPOSE_PROJECT=deploy
       - UPDATER_COSIGN_IDENTITY_REGEXP=${UPDATER_COSIGN_IDENTITY:-}
       - UPDATER_COSIGN_ISSUER=https://token.actions.githubusercontent.com
       - UPDATER_HEALTH_URL=http://127.0.0.1:8080/health
