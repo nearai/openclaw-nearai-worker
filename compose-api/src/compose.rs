@@ -5,6 +5,9 @@ use std::process::Command;
 use crate::error::ApiError;
 use crate::store::Instance;
 
+/// Default NEAR AI Cloud API URL used when not specified per-instance.
+pub const DEFAULT_NEARAI_API_URL: &str = "https://cloud-api.near.ai/v1";
+
 pub struct ContainerHealth {
     pub state: String,
     pub health: String,
@@ -41,11 +44,19 @@ impl ComposeManager {
     // ── env-file helpers ──────────────────────────────────────────────
 
     /// Write a per-instance .env file consumed by docker-compose.worker.yml.
+    /// Rejects keys/values containing newlines to prevent injection of arbitrary env vars.
     pub fn write_env_file(
         &self,
         name: &str,
         vars: &HashMap<String, String>,
     ) -> Result<PathBuf, ApiError> {
+        for (k, v) in vars {
+            if k.contains('\n') || k.contains('\r') || v.contains('\n') || v.contains('\r') {
+                return Err(ApiError::Internal(format!(
+                    "env file rejected: key or value contains newline (injection attempt?)"
+                )));
+            }
+        }
         let path = self.env_dir.join(format!("{}.env", name));
         let content: String = vars
             .iter()
@@ -441,7 +452,8 @@ impl ComposeManager {
             "NEARAI_API_URL".into(),
             inst.nearai_api_url
                 .as_deref()
-                .unwrap_or("https://cloud-api.near.ai/v1"),
+                .unwrap_or(DEFAULT_NEARAI_API_URL)
+                .to_string(),
         );
         vars.insert("OPENCLAW_GATEWAY_TOKEN".into(), inst.token.clone());
         vars.insert("GATEWAY_PORT".into(), inst.gateway_port.to_string());
