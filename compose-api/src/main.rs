@@ -29,7 +29,7 @@ mod nginx_conf;
 mod store;
 
 use backup::BackupManager;
-use compose::ComposeManager;
+use compose::{ComposeManager, DEFAULT_NEARAI_API_URL};
 use dns::CloudflareDns;
 use error::ApiError;
 use store::{Instance, InstanceStore};
@@ -52,6 +52,7 @@ use store::{Instance, InstanceStore};
         stop_instance,
         start_instance,
         instance_attestation,
+        tdx_attestation,
         create_backup_endpoint,
         list_backups_endpoint,
         download_backup_endpoint,
@@ -64,6 +65,7 @@ use store::{Instance, InstanceStore};
         InstanceResponse,
         InstancesListResponse,
         AttestationResponse,
+        TdxAttestationReport,
         BackupInfoResponse,
         BackupListResponse,
         BackupDownloadResponse,
@@ -126,6 +128,7 @@ impl AppState {
         ssh_port: u16,
         ssh_pubkey: &str,
         image: &str,
+        nearai_api_url: &str,
     ) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
@@ -133,6 +136,7 @@ impl AppState {
         let token = token.to_string();
         let ssh_pubkey = ssh_pubkey.to_string();
         let image = image.to_string();
+        let nearai_api_url = nearai_api_url.to_string();
         tokio::task::spawn_blocking(move || {
             compose.up(&compose::InstanceConfig {
                 name: &name,
@@ -142,6 +146,7 @@ impl AppState {
                 ssh_port,
                 ssh_pubkey: &ssh_pubkey,
                 image: &image,
+                nearai_api_url: &nearai_api_url,
             })
         })
         .await
@@ -413,7 +418,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/{name}/restart", post(restart_instance))
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
-        .route("/instances/{name}/attestation", get(instance_attestation));
+        .route("/instances/{name}/attestation", get(instance_attestation))
+        .route("/attestation/report", get(tdx_attestation));
 
     if state.backup.is_some() {
         app = app
@@ -476,6 +482,9 @@ struct CreateInstanceRequest {
     nearai_api_key: String,
     /// SSH public key for direct SSH access
     ssh_pubkey: String,
+    /// Optional NEAR AI Cloud API URL (default: https://cloud-api.near.ai/v1)
+    #[serde(default)]
+    nearai_api_url: Option<String>,
     /// Optional instance name (auto-generated if omitted, 1-32 alphanumeric/hyphen chars)
     #[serde(default)]
     name: Option<String>,
@@ -546,6 +555,23 @@ struct AttestationResponse {
     image_digest: Option<String>,
 }
 
+/// TDX attestation report with TLS certificate binding
+#[derive(Serialize, utoipa::ToSchema)]
+struct TdxAttestationReport {
+    /// Base64-encoded TDX DCAP quote (~4KB)
+    quote: String,
+    /// TCG event log (JSON string)
+    event_log: String,
+    /// Hex-encoded 64-byte report_data embedded in the quote
+    report_data: String,
+    /// VM configuration (OS image hash, etc.)
+    vm_config: String,
+    /// PEM-encoded TLS leaf certificate
+    tls_certificate: String,
+    /// Hex SHA-256 fingerprint of the DER-encoded leaf certificate
+    tls_certificate_fingerprint: String,
+}
+
 /// Error response body
 #[derive(Serialize, utoipa::ToSchema)]
 struct ErrorResponse {
@@ -578,6 +604,41 @@ pub fn is_valid_instance_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 32
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Validate and sanitize nearai_api_url. Prevents injection into .env files: the value is
+/// written by ComposeManager::write_env_file as KEY=value\n. An attacker could inject
+/// newlines to add arbitrary env vars (e.g. OPENCLAW_IMAGE=malicious) or overwrite existing ones.
+fn validate_nearai_api_url(url: &str) -> Result<String, ApiError> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must not be empty".into(),
+        ));
+    }
+    if trimmed.len() > 512 {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must not exceed 512 characters".into(),
+        ));
+    }
+    // Reject newlines/carriage returns — prevents .env injection of arbitrary KEY=value lines
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must not contain newline characters".into(),
+        ));
+    }
+    // Reject '=' — prevents injecting env-style assignments within the value
+    if trimmed.contains('=') {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must not contain '='".into(),
+        ));
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must be a valid HTTP or HTTPS URL".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn validate_image(image: &str) -> Result<(), ApiError> {
@@ -763,6 +824,12 @@ async fn create_instance(
         None => state.config.openclaw_image.clone(),
     };
 
+    // Validate nearai_api_url (prevents .env injection via newlines)
+    let nearai_api_url = match req.nearai_api_url.as_deref().filter(|s| !s.is_empty()) {
+        Some(url) => validate_nearai_api_url(url)?,
+        None => DEFAULT_NEARAI_API_URL.to_string(),
+    };
+
     // Resolve instance name
     let name = if let Some(provided) = &req.name {
         let sanitized = provided.to_lowercase();
@@ -821,6 +888,7 @@ async fn create_instance(
         created_at: chrono::Utc::now(),
         ssh_pubkey: req.ssh_pubkey.clone(),
         nearai_api_key: req.nearai_api_key.clone(),
+        nearai_api_url: Some(nearai_api_url.clone()),
         active: true,
         image: Some(image.clone()),
         image_digest: None,
@@ -848,6 +916,7 @@ async fn create_instance(
             ssh_port,
             &ssh_pubkey,
             &image,
+            &nearai_api_url,
         ).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
@@ -1075,6 +1144,9 @@ async fn restart_instance(
                 inst.ssh_port,
                 &inst.ssh_pubkey,
                 image,
+                inst.nearai_api_url
+                    .as_deref()
+                    .unwrap_or(DEFAULT_NEARAI_API_URL),
             ).await {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
@@ -1234,6 +1306,78 @@ async fn instance_attestation(
     Ok(Json(AttestationResponse {
         name: inst.name.clone(),
         image_digest: inst.image_digest.clone(),
+    }))
+}
+
+#[utoipa::path(get, path = "/attestation/report", tag = "Attestation",
+    security(),
+    responses(
+        (status = 200, description = "TDX attestation report bound to the TLS certificate", body = TdxAttestationReport),
+        (status = 503, description = "Attestation not available", body = ErrorResponse),
+    )
+)]
+async fn tdx_attestation(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let domain = state
+        .config
+        .openclaw_domain
+        .as_deref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("OPENCLAW_DOMAIN not configured".into()))?;
+
+    // Read the TLS leaf certificate
+    let (leaf_pem, leaf_der) = read_tls_certificate(domain)?;
+
+    // Compute SHA-256 fingerprint of the DER-encoded leaf certificate
+    use sha2::{Digest, Sha256};
+    let fingerprint = Sha256::digest(&leaf_der);
+    let fingerprint_hex = hex::encode(fingerprint);
+
+    // Build 64-byte report_data: sha256(cert) in first 32 bytes, zeros in last 32
+    let mut report_data = [0u8; 64];
+    report_data[..32].copy_from_slice(&fingerprint);
+
+    // Get TDX quote from dstack guest-agent
+    let quote_response = fetch_dstack_quote(&report_data).await?;
+
+    let quote = quote_response
+        .get("quote")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'quote'".into()))?
+        .to_string();
+    let event_log = quote_response
+        .get("event_log")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'event_log'".into()))?
+        .to_string();
+    let returned_report_data = quote_response
+        .get("report_data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable("dstack response missing 'report_data'".into())
+        })?;
+    let vm_config = quote_response
+        .get("vm_config")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::ServiceUnavailable("dstack response missing 'vm_config'".into()))?
+        .to_string();
+
+    // Decode base64 report_data from dstack response to hex
+    let report_data_hex = hex::encode(
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            returned_report_data,
+        )
+        .map_err(|e| {
+            ApiError::ServiceUnavailable(format!("failed to decode report_data from dstack: {}", e))
+        })?,
+    );
+
+    Ok(Json(TdxAttestationReport {
+        quote,
+        event_log,
+        report_data: report_data_hex,
+        vm_config,
+        tls_certificate: leaf_pem,
+        tls_certificate_fingerprint: fingerprint_hex,
     }))
 }
 
@@ -1403,6 +1547,73 @@ fn generate_token() -> String {
     let mut rng = rand::rng();
     let bytes: [u8; 32] = rng.random();
     hex::encode(bytes)
+}
+
+/// Read the TLS leaf certificate from the Let's Encrypt cert volume.
+/// Returns (PEM string of leaf cert, DER bytes of leaf cert).
+fn read_tls_certificate(domain: &str) -> Result<(String, Vec<u8>), ApiError> {
+    let cert_base = std::env::var("CERT_DATA_PATH").unwrap_or_else(|_| "/etc/letsencrypt".into());
+    let cert_path = format!("{}/live/{}/fullchain.pem", cert_base, domain);
+    let pem_data = std::fs::read(&cert_path).map_err(|e| {
+        ApiError::ServiceUnavailable(format!("TLS certificate not available: {}", e))
+    })?;
+
+    let certs = pem::parse_many(&pem_data)
+        .map_err(|e| ApiError::ServiceUnavailable(format!("failed to parse PEM: {}", e)))?;
+
+    let leaf_cert = certs
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::ServiceUnavailable("no certificate found in PEM file".into()))?;
+
+    let leaf_pem = pem::encode(&leaf_cert);
+    let der_bytes = leaf_cert.into_contents();
+
+    Ok((leaf_pem, der_bytes))
+}
+
+/// Call dstack guest-agent GetQuote RPC via Unix socket.
+async fn fetch_dstack_quote(report_data: &[u8; 64]) -> Result<serde_json::Value, ApiError> {
+    let sock_path = "/var/run/dstack.sock";
+    if !std::path::Path::new(sock_path).exists() {
+        return Err(ApiError::ServiceUnavailable(
+            "dstack.sock not found — not running in a TEE".into(),
+        ));
+    }
+
+    let report_data_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, report_data);
+    let body = serde_json::json!({ "report_data": report_data_b64 }).to_string();
+
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "--unix-socket",
+            sock_path,
+            "-s",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body,
+            "http://localhost/GetQuote",
+        ])
+        .output()
+        .await
+        .map_err(|e| ApiError::ServiceUnavailable(format!("failed to call dstack: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::ServiceUnavailable(format!(
+            "dstack GetQuote failed: {}",
+            stderr
+        )));
+    }
+
+    let response_body = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&response_body).map_err(|e| {
+        ApiError::ServiceUnavailable(format!("failed to parse dstack response: {}", e))
+    })
 }
 
 async fn fetch_dstack_app_id() -> Option<String> {

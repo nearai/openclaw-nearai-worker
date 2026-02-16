@@ -22,6 +22,9 @@ pub enum ApiError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("Not implemented: {0}")]
     NotImplemented(String),
 }
@@ -46,6 +49,7 @@ impl IntoResponse for ApiError {
                     "Internal server error".to_string(),
                 )
             }
+            ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             ApiError::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg.clone()),
         };
 

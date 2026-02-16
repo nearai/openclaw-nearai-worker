@@ -88,6 +88,12 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
   export OPENCLAW_GATEWAY_TOKEN
 fi
 
+# Default NEAR AI Cloud API base URL (export so envsubst sees it)
+if [ -z "${NEARAI_API_URL:-}" ]; then
+  NEARAI_API_URL=https://cloud-api.near.ai/v1
+  export NEARAI_API_URL
+fi
+
 # Create config directory if it doesn't exist
 # Note: Directory is already created and owned by agent in Dockerfile, but ensure it exists
 mkdir -p /home/agent/.openclaw
@@ -111,6 +117,7 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
 
   # Export variables for envsubst (only the ones we need)
   export NEARAI_API_KEY
+  export NEARAI_API_URL
   export OPENCLAW_GATEWAY_TOKEN
   export OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
 
@@ -212,6 +219,8 @@ start_auto_approve_daemon() {
 
 # Final ownership fix: ensure everything is owned by agent before dropping privileges
 # (config generation and bootstrap above may have created files as root)
+# Pre-create subdirs the gateway needs — prevents root-owned dirs at runtime
+mkdir -p /home/agent/.openclaw/{identity,credentials,cron,agents,canvas}
 chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
 
 start_auto_approve_daemon
@@ -222,6 +231,8 @@ RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
 
 while true; do
   echo "Starting: $*"
+  # Fix ownership before each launch — subdirs may have been created as root
+  chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw 2>/dev/null || true
   # The -p flag preserves environment variables (including PATH set in Dockerfile)
   runuser -p -u agent -- "$@" || true
   EXIT_CODE=$?

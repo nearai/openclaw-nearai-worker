@@ -21,6 +21,8 @@ pub struct Instance {
     pub ssh_pubkey: String,
     #[serde(default)]
     pub nearai_api_key: String,
+    #[serde(default)]
+    pub nearai_api_url: Option<String>,
     #[serde(default = "default_active")]
     pub active: bool,
     #[serde(default)]
@@ -139,6 +141,7 @@ mod tests {
             created_at: Utc::now(),
             ssh_pubkey: "ssh-ed25519 AAAA".to_string(),
             nearai_api_key: "key".to_string(),
+            nearai_api_url: None,
             active: true,
             image: None,
             image_digest: None,
