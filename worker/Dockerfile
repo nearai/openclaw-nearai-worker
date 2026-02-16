@@ -83,8 +83,13 @@ RUN npm config set prefix "/home/agent/.npm-global" && \
 # pi-ai hardcodes stream:true with no config override (openclaw#12218).
 # This patch replaces the streaming API call with non-streaming, then synthesizes
 # the stream events that openclaw expects. Tool call args arrive complete.
-COPY patch-streaming.js /tmp/patch-streaming.js
+COPY --chown=agent:agent patch-streaming.js /tmp/patch-streaming.js
 RUN node /tmp/patch-streaming.js && rm /tmp/patch-streaming.js
+# Verify patch applied correctly — fail build if markers are missing
+RUN grep -q 'nonStreamParams' /home/agent/.npm-global/lib/node_modules/openclaw/node_modules/@mariozechner/pi-ai/dist/providers/openai-completions.js \
+    && grep -q 'stream: false' /home/agent/.npm-global/lib/node_modules/openclaw/node_modules/@mariozechner/pi-ai/dist/providers/openai-completions.js \
+    && echo "patch-streaming: verification passed" \
+    || (echo "patch-streaming: verification FAILED — patched markers not found" >&2 && exit 1)
 
 # Switch back to root for final setup
 USER root
