@@ -88,6 +88,12 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
   export OPENCLAW_GATEWAY_TOKEN
 fi
 
+# Default NEAR AI Cloud API base URL (export so envsubst sees it)
+if [ -z "${NEARAI_API_URL:-}" ]; then
+  NEARAI_API_URL=https://cloud-api.near.ai/v1
+  export NEARAI_API_URL
+fi
+
 # Create config directory if it doesn't exist
 # Note: Directory is already created and owned by agent in Dockerfile, but ensure it exists
 mkdir -p /home/agent/.openclaw
@@ -111,6 +117,7 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
 
   # Export variables for envsubst (only the ones we need)
   export NEARAI_API_KEY
+  export NEARAI_API_URL
   export OPENCLAW_GATEWAY_TOKEN
   export OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
 

@@ -29,7 +29,7 @@ mod nginx_conf;
 mod store;
 
 use backup::BackupManager;
-use compose::ComposeManager;
+use compose::{ComposeManager, DEFAULT_NEARAI_API_URL};
 use dns::CloudflareDns;
 use error::ApiError;
 use store::{Instance, InstanceStore};
@@ -378,6 +378,9 @@ struct CreateInstanceRequest {
     nearai_api_key: String,
     /// SSH public key for direct SSH access
     ssh_pubkey: String,
+    /// Optional NEAR AI Cloud API URL (default: https://cloud-api.near.ai/v1)
+    #[serde(default)]
+    nearai_api_url: Option<String>,
     /// Optional instance name (auto-generated if omitted, 1-32 alphanumeric/hyphen chars)
     #[serde(default)]
     name: Option<String>,
@@ -491,6 +494,41 @@ struct BackupListResponse {
 struct BackupDownloadResponse {
     url: String,
     expires_in_seconds: u64,
+}
+
+/// Validate and sanitize nearai_api_url. Prevents injection into .env files: the value is
+/// written by ComposeManager::write_env_file as KEY=value\n. An attacker could inject
+/// newlines to add arbitrary env vars (e.g. OPENCLAW_IMAGE=malicious) or overwrite existing ones.
+fn validate_nearai_api_url(url: &str) -> Result<String, ApiError> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must not be empty".into(),
+        ));
+    }
+    if trimmed.len() > 512 {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must not exceed 512 characters".into(),
+        ));
+    }
+    // Reject newlines/carriage returns — prevents .env injection of arbitrary KEY=value lines
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must not contain newline characters".into(),
+        ));
+    }
+    // Reject '=' — prevents injecting env-style assignments within the value
+    if trimmed.contains('=') {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must not contain '='".into(),
+        ));
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err(ApiError::BadRequest(
+            "nearai_api_url must be a valid HTTP or HTTPS URL".into(),
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn validate_image(image: &str) -> Result<(), ApiError> {
@@ -676,6 +714,12 @@ async fn create_instance(
         None => state.config.openclaw_image.clone(),
     };
 
+    // Validate nearai_api_url (prevents .env injection via newlines)
+    let nearai_api_url = match req.nearai_api_url.as_deref().filter(|s| !s.is_empty()) {
+        Some(url) => validate_nearai_api_url(url)?,
+        None => DEFAULT_NEARAI_API_URL.to_string(),
+    };
+
     // Resolve instance name
     let name = if let Some(provided) = &req.name {
         let sanitized = provided
@@ -736,6 +780,7 @@ async fn create_instance(
         created_at: chrono::Utc::now(),
         ssh_pubkey: req.ssh_pubkey.clone(),
         nearai_api_key: req.nearai_api_key.clone(),
+        nearai_api_url: Some(nearai_api_url.clone()),
         active: true,
         image: Some(image.clone()),
         image_digest: None,
@@ -763,6 +808,7 @@ async fn create_instance(
             ssh_port,
             &ssh_pubkey,
             &image,
+            &nearai_api_url,
         ) {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
@@ -990,6 +1036,9 @@ async fn restart_instance(
                 inst.ssh_port,
                 &inst.ssh_pubkey,
                 image,
+                inst.nearai_api_url
+                    .as_deref()
+                    .unwrap_or(DEFAULT_NEARAI_API_URL),
             ) {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
@@ -1159,9 +1208,7 @@ async fn instance_attestation(
         (status = 503, description = "Attestation not available", body = ErrorResponse),
     )
 )]
-async fn tdx_attestation(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, ApiError> {
+async fn tdx_attestation(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let domain = state
         .config
         .openclaw_domain
@@ -1402,9 +1449,10 @@ fn read_tls_certificate(domain: &str) -> Result<(String, Vec<u8>), ApiError> {
     let certs = pem::parse_many(&pem_data)
         .map_err(|e| ApiError::ServiceUnavailable(format!("failed to parse PEM: {}", e)))?;
 
-    let leaf_cert = certs.into_iter().next().ok_or_else(|| {
-        ApiError::ServiceUnavailable("no certificate found in PEM file".into())
-    })?;
+    let leaf_cert = certs
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::ServiceUnavailable("no certificate found in PEM file".into()))?;
 
     let leaf_pem = pem::encode(&leaf_cert);
     let der_bytes = leaf_cert.into_contents();
@@ -1413,9 +1461,7 @@ fn read_tls_certificate(domain: &str) -> Result<(String, Vec<u8>), ApiError> {
 }
 
 /// Call dstack guest-agent GetQuote RPC via Unix socket.
-async fn fetch_dstack_quote(
-    report_data: &[u8; 64],
-) -> Result<serde_json::Value, ApiError> {
+async fn fetch_dstack_quote(report_data: &[u8; 64]) -> Result<serde_json::Value, ApiError> {
     let sock_path = "/var/run/dstack.sock";
     if !std::path::Path::new(sock_path).exists() {
         return Err(ApiError::ServiceUnavailable(

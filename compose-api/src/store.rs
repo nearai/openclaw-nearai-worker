@@ -21,6 +21,8 @@ pub struct Instance {
     pub ssh_pubkey: String,
     #[serde(default)]
     pub nearai_api_key: String,
+    #[serde(default)]
+    pub nearai_api_url: Option<String>,
     #[serde(default = "default_active")]
     pub active: bool,
     #[serde(default)]

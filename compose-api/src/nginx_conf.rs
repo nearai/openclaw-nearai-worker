@@ -13,12 +13,7 @@ pub fn write_backends_map(instances: &[Instance], domain: &str, map_path: &Path)
     let mut lines: Vec<String> = instances
         .iter()
         .filter(|i| i.active)
-        .map(|i| {
-            format!(
-                "{}.{} http://127.0.0.1:{};",
-                i.name, domain, i.gateway_port
-            )
-        })
+        .map(|i| format!("{}.{} http://127.0.0.1:{};", i.name, domain, i.gateway_port))
         .collect();
     lines.sort();
     let new_content = lines.join("\n") + "\n";
@@ -37,10 +32,7 @@ pub fn write_backends_map(instances: &[Instance], domain: &str, map_path: &Path)
         return false;
     }
 
-    tracing::info!(
-        "Updated nginx backends map ({} entries)",
-        instances.len()
-    );
+    tracing::info!("Updated nginx backends map ({} entries)", instances.len());
     true
 }
 
