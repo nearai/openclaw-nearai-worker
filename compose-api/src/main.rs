@@ -111,7 +111,6 @@ struct AppConfig {
     host_address: String,
     openclaw_domain: Option<String>,
     openclaw_image: String,
-    nearai_api_url: String,
     compose_file: std::path::PathBuf,
     dstack_app_id: Option<String>,
     dstack_gateway_base: Option<String>,
@@ -212,8 +211,6 @@ async fn main() -> anyhow::Result<()> {
         openclaw_domain: std::env::var("OPENCLAW_DOMAIN").ok(),
         openclaw_image: std::env::var("OPENCLAW_IMAGE")
             .unwrap_or_else(|_| "openclaw-nearai-worker:local".to_string()),
-        nearai_api_url: std::env::var("NEARAI_API_URL")
-            .unwrap_or_else(|_| "https://cloud-api.near.ai/v1".to_string()),
         compose_file: std::path::PathBuf::from(compose_file),
         dstack_app_id,
         dstack_gateway_base,
@@ -375,12 +372,17 @@ async fn version() -> Json<VersionResponse> {
 
 // ── Request / Response types ─────────────────────────────────────────
 
+const DEFAULT_NEARAI_API_URL: &str = "https://cloud-api.near.ai/v1";
+
 #[derive(Deserialize, utoipa::ToSchema)]
 struct CreateInstanceRequest {
     /// NEAR AI API key for the instance
     nearai_api_key: String,
     /// SSH public key for direct SSH access
     ssh_pubkey: String,
+    /// Optional NEAR AI Cloud API URL (default: https://cloud-api.near.ai/v1)
+    #[serde(default)]
+    nearai_api_url: Option<String>,
     /// Optional instance name (auto-generated if omitted, 1-32 alphanumeric/hyphen chars)
     #[serde(default)]
     name: Option<String>,
@@ -739,7 +741,11 @@ async fn create_instance(
         created_at: chrono::Utc::now(),
         ssh_pubkey: req.ssh_pubkey.clone(),
         nearai_api_key: req.nearai_api_key.clone(),
-        nearai_api_url: Some(state.config.nearai_api_url.clone()),
+        nearai_api_url: req
+            .nearai_api_url
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned(),
         active: true,
         image: Some(image.clone()),
         image_digest: None,
@@ -759,6 +765,11 @@ async fn create_instance(
 
         yield Ok(sse_stage("container_starting", "Pulling image and starting container..."));
 
+        let nearai_api_url = req
+            .nearai_api_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_NEARAI_API_URL);
         if let Err(e) = state.compose.up(
             &name,
             &nearai_api_key,
@@ -767,7 +778,7 @@ async fn create_instance(
             ssh_port,
             &ssh_pubkey,
             &image,
-            &state.config.nearai_api_url,
+            nearai_api_url,
         ) {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
@@ -997,7 +1008,7 @@ async fn restart_instance(
                 image,
                 inst.nearai_api_url
                     .as_deref()
-                    .unwrap_or(&state.config.nearai_api_url),
+                    .unwrap_or(DEFAULT_NEARAI_API_URL),
             ) {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
