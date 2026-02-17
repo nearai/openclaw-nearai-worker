@@ -22,7 +22,7 @@ chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
 # ============================================
 setup_ssh() {
   echo "Setting up SSH server..."
-  
+
   # Configure authorized_keys from SSH_PUBKEY environment variable
   if [ -n "${SSH_PUBKEY:-}" ]; then
     echo "Configuring SSH authorized_keys..."
@@ -34,7 +34,7 @@ setup_ssh() {
     chmod 600 /home/agent/.ssh/authorized_keys
     chown -R agent:agent /home/agent/.ssh
     echo "SSH authorized_keys configured successfully"
-    
+
     # Create privilege separation directory required by sshd
     mkdir -p /run/sshd
     chmod 0755 /run/sshd
@@ -43,6 +43,7 @@ setup_ssh() {
     passwd -d agent 2>/dev/null || usermod -U agent 2>/dev/null || true
 
     # Start SSH daemon on port 2222 (non-privileged); listen on all interfaces for external access
+    # sshd forks/daemonizes, so the child process survives the exec into systemd below
     echo "Starting SSH daemon on port 2222..."
     SSHD_OUTPUT=$(/usr/sbin/sshd -f /dev/null \
       -o Port=2222 \
@@ -67,6 +68,15 @@ setup_ssh() {
 }
 
 setup_ssh
+
+# ============================================
+# systemd User Session Setup
+# ============================================
+# Enable linger so systemd-logind starts a user instance for agent automatically.
+# This makes systemctl --user work (used by openclaw gateway install/restart/start/stop).
+# libpam-systemd creates /run/user/1001 (XDG_RUNTIME_DIR) when the user session starts.
+mkdir -p /var/lib/systemd/linger
+touch /var/lib/systemd/linger/agent
 
 # ============================================
 # OpenClaw Configuration
@@ -108,7 +118,7 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
   else
     echo "Generating config from template..."
   fi
-  
+
   # Template file must exist
   if [ ! -f /app/openclaw.json.template ]; then
     echo "Error: Template file /app/openclaw.json.template not found" >&2
@@ -134,6 +144,19 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
   chmod 600 /home/agent/.openclaw/openclaw.json
   echo "Config file created at /home/agent/.openclaw/openclaw.json"
 fi
+
+# Write gateway environment file for the systemd service
+# The openclaw-gateway.service reads this via EnvironmentFile=
+cat > /home/agent/.openclaw/gateway.env <<EOF
+PATH=/home/agent/.npm-global/bin:/home/agent/.local/share/pnpm:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HOME=/home/agent
+NODE_ENV=production
+PNPM_HOME=/home/agent/.local/share/pnpm
+SHELL=/bin/bash
+OPENCLAW_GATEWAY_BIND=${OPENCLAW_GATEWAY_BIND:-lan}
+EOF
+chown agent:agent /home/agent/.openclaw/gateway.env
+chmod 600 /home/agent/.openclaw/gateway.env
 
 # Create workspace directory if it doesn't exist
 # Note: Directory is already created and owned by agent in Dockerfile, but ensure it exists
@@ -174,6 +197,13 @@ fi
 # When OPENCLAW_AUTO_APPROVE_DEVICES=1, automatically approve the FIRST device pairing request only.
 # Subsequent devices require manual approval for security.
 # This is useful for headless/automated deployments where initial setup needs automation.
+#
+# NOTE: Since openclaw 2026.2.15, the CLI resolves gateway targets using the bind mode
+# (lan/loopback). When bind=lan, the CLI connects via the LAN IP, and the gateway treats
+# it as a remote client requiring manual pairing — a chicken-and-egg problem.
+# Fix: force the CLI to connect via loopback (ws://127.0.0.1:<port>) so the gateway
+# recognizes it as a local client and auto-approves the pairing silently.
+# See: openclaw #16299, #11448, #16434
 AUTO_APPROVE_DEVICES="${OPENCLAW_AUTO_APPROVE_DEVICES:-0}"
 AUTO_APPROVE_FLAG="/home/agent/.openclaw/.device_approved"
 
@@ -184,6 +214,19 @@ start_auto_approve_daemon() {
       # Wait for gateway to start
       sleep 10
 
+      # Read gateway port and token from config for loopback CLI connection.
+      # The CLI must connect via loopback so the gateway sees it as a local client
+      # and auto-approves the pairing (isLocalDirectRequest → silent: true).
+      GATEWAY_PORT=$(jq -r '.gateway.port // 18789' /home/agent/.openclaw/openclaw.json 2>/dev/null || echo 18789)
+      GATEWAY_TOKEN=$(jq -r '.gateway.auth.token // empty' /home/agent/.openclaw/openclaw.json 2>/dev/null || true)
+
+      if [ -z "$GATEWAY_TOKEN" ]; then
+        echo "Warning: Could not read gateway token from config. Auto-approve daemon exiting." >&2
+        exit 1
+      fi
+
+      LOOPBACK_ARGS="--url ws://127.0.0.1:${GATEWAY_PORT} --token ${GATEWAY_TOKEN}"
+
       while true; do
         # Check if we already approved a device - if so, exit daemon
         if [ -f "$AUTO_APPROVE_FLAG" ]; then
@@ -191,15 +234,15 @@ start_auto_approve_daemon() {
           exit 0
         fi
 
-        # Get pending device requests
-        PENDING=$(runuser -p -u agent -- openclaw devices list --json 2>/dev/null || echo '{"pending":[]}')
+        # Get pending device requests (connect via loopback for auto-pairing)
+        PENDING=$(runuser -p -u agent -- env HOME=/home/agent openclaw devices list --json $LOOPBACK_ARGS 2>/dev/null || echo '{"pending":[]}')
 
         # Get the first pending request ID only
         FIRST_REQUEST_ID=$(echo "$PENDING" | jq -r '.pending[0]?.requestId // empty' 2>/dev/null)
 
         if [ -n "$FIRST_REQUEST_ID" ]; then
           echo "Auto-approving first device pairing request: $FIRST_REQUEST_ID"
-          if runuser -p -u agent -- openclaw devices approve "$FIRST_REQUEST_ID" 2>/dev/null; then
+          if runuser -p -u agent -- env HOME=/home/agent openclaw devices approve "$FIRST_REQUEST_ID" $LOOPBACK_ARGS 2>/dev/null; then
             # Mark that we've approved a device
             touch "$AUTO_APPROVE_FLAG"
             chown agent:agent "$AUTO_APPROVE_FLAG" 2>/dev/null || true
@@ -225,17 +268,8 @@ chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
 
 start_auto_approve_daemon
 
-# Execute the command with automatic restart (openclaw is installed globally)
-# The loop keeps the container alive and restarts the gateway if it exits
-RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
-
-while true; do
-  echo "Starting: $*"
-  # Fix ownership before each launch — subdirs may have been created as root
-  chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw 2>/dev/null || true
-  # The -p flag preserves environment variables (including PATH set in Dockerfile)
-  runuser -p -u agent -- "$@" || true
-  EXIT_CODE=$?
-  echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."
-  sleep "$RESTART_DELAY"
-done
+# Hand off to systemd as PID 1
+# systemd manages the openclaw-gateway.service (Restart=always, RestartSec=5)
+# The auto-approve daemon (forked subshell) and sshd (daemonized) survive the exec
+echo "Starting systemd as PID 1..."
+exec /lib/systemd/systemd

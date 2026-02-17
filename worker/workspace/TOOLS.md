@@ -23,7 +23,6 @@ If you're unsure about a command's syntax, try `<command> --help` to see what's 
 ## Container Environment
 
 - OpenClaw is installed globally. Do NOT run `pnpm install`, `pnpm build`, `npm install`, or any build commands.
-- `systemctl` is not available. Do NOT use `openclaw gateway restart` or `openclaw gateway start` — they rely on systemctl and will fail. To restart the gateway, run `openclaw gateway stop`. The Docker entrypoint automatically restarts the process after it exits.
 - You are running inside a Docker container as user `agent`.
 
 ## Skills

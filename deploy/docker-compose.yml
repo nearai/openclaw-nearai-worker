@@ -2,9 +2,11 @@ services:
   openclaw-gateway:
     build: ../worker
     image: openclaw-nearai-worker:local
+    privileged: true
     environment:
       HOME: /home/agent
       TERM: xterm-256color
+      container: docker
       # NEAR AI Cloud API Key
       NEARAI_API_KEY: ${NEARAI_API_KEY}
       # NEAR AI Cloud API URL (default: https://cloud-api.near.ai/v1)
@@ -15,6 +17,10 @@ services:
       OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
       # Optional: SSH public key for key-based login (enables SSH server on port 2222; required for external SSH).
       SSH_PUBKEY: ${SSH_PUBKEY:-}
+    tmpfs:
+      - /run
+      - /run/lock
+      - /tmp
     volumes:
       - openclaw-config:/home/agent/.openclaw
       - openclaw-workspace:/home/agent/openclaw
@@ -24,25 +30,14 @@ services:
       - "18790:18790"
       # SSH (port 2222)
       - "2222:2222"
-    init: true
     restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:18789/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-    command:
-      [
-        "openclaw",
-        "gateway",
-        "run",
-        "--bind",
-        "${OPENCLAW_GATEWAY_BIND:-lan}",
-        "--port",
-        "18789",
-        "--verbose"
-      ]
 
 volumes:
   openclaw-config:
