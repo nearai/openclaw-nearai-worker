@@ -114,6 +114,7 @@ struct AppConfig {
     host_address: String,
     openclaw_domain: Option<String>,
     openclaw_image: String,
+    ironclaw_image: String,
     compose_file: std::path::PathBuf,
     dstack_app_id: Option<String>,
     dstack_gateway_base: Option<String>,
@@ -134,6 +135,7 @@ impl AppState {
         ssh_pubkey: &str,
         image: &str,
         nearai_api_url: &str,
+        service_type: &str,
     ) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
@@ -142,6 +144,7 @@ impl AppState {
         let ssh_pubkey = ssh_pubkey.to_string();
         let image = image.to_string();
         let nearai_api_url = nearai_api_url.to_string();
+        let service_type = service_type.to_string();
         tokio::task::spawn_blocking(move || {
             compose.up(&compose::InstanceConfig {
                 name: &name,
@@ -152,6 +155,7 @@ impl AppState {
                 ssh_pubkey: &ssh_pubkey,
                 image: &image,
                 nearai_api_url: &nearai_api_url,
+                service_type: &service_type,
             })
         })
         .await
@@ -299,6 +303,8 @@ async fn main() -> anyhow::Result<()> {
 
     let compose_file = std::env::var("COMPOSE_FILE")
         .unwrap_or_else(|_| "/app/docker-compose.worker.yml".to_string());
+    let ironclaw_compose_file = std::env::var("IRONCLAW_COMPOSE_FILE")
+        .unwrap_or_else(|_| "/app/docker-compose.ironclaw.yml".to_string());
 
     let dstack_app_id = fetch_dstack_app_id().await;
     if let Some(ref app_id) = dstack_app_id {
@@ -319,7 +325,9 @@ async fn main() -> anyhow::Result<()> {
         openclaw_domain: std::env::var("OPENCLAW_DOMAIN").ok(),
         openclaw_image: std::env::var("OPENCLAW_IMAGE")
             .unwrap_or_else(|_| "openclaw-nearai-worker:local".to_string()),
-        compose_file: std::path::PathBuf::from(compose_file),
+        ironclaw_image: std::env::var("IRONCLAW_IMAGE")
+            .unwrap_or_else(|_| "ironclaw-nearai-worker:local".to_string()),
+        compose_file: std::path::PathBuf::from(&compose_file),
         dstack_app_id,
         dstack_gateway_base,
         nginx_map_path: PathBuf::from(
@@ -347,8 +355,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let mut compose_files = std::collections::HashMap::new();
+    compose_files.insert("openclaw".to_string(), config.compose_file.clone());
+    let ironclaw_path = std::path::PathBuf::from(&ironclaw_compose_file);
+    if ironclaw_path.exists() {
+        compose_files.insert("ironclaw".to_string(), ironclaw_path);
+        tracing::info!("IronClaw compose template loaded: {}", ironclaw_compose_file);
+    } else {
+        tracing::info!(
+            "IronClaw compose template not found at {}, ironclaw service type disabled",
+            ironclaw_compose_file
+        );
+    }
+
     let compose = Arc::new(ComposeManager::new(
-        config.compose_file.clone(),
+        compose_files,
         std::path::PathBuf::from("data/envs"),
     )?);
 
@@ -500,6 +521,9 @@ struct CreateInstanceRequest {
     /// Optional Docker image reference (defaults to server-configured image)
     #[serde(default)]
     image: Option<String>,
+    /// Service type: "openclaw" (default) or "ironclaw"
+    #[serde(default)]
+    service_type: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -835,13 +859,28 @@ async fn create_instance(
         return Err(ApiError::BadRequest("ssh_pubkey is required".into()));
     }
 
-    // Resolve image
+    // Resolve service type
+    let service_type = req
+        .service_type
+        .as_deref()
+        .unwrap_or("openclaw")
+        .to_string();
+    if service_type != "openclaw" && service_type != "ironclaw" {
+        return Err(ApiError::BadRequest(
+            "service_type must be 'openclaw' or 'ironclaw'".into(),
+        ));
+    }
+
+    // Resolve image based on service type
     let image = match &req.image {
         Some(img) => {
             validate_image(img)?;
             img.trim().to_string()
         }
-        None => state.config.openclaw_image.clone(),
+        None => match service_type.as_str() {
+            "ironclaw" => state.config.ironclaw_image.clone(),
+            _ => state.config.openclaw_image.clone(),
+        },
     };
 
     // Defense-in-depth: reject newlines at the API boundary
@@ -917,6 +956,7 @@ async fn create_instance(
         active: true,
         image: Some(image.clone()),
         image_digest: None,
+        service_type: Some(service_type.clone()),
     };
 
     // Save to store before streaming so it's persisted immediately
@@ -942,6 +982,7 @@ async fn create_instance(
             &ssh_pubkey,
             &image,
             &nearai_api_url,
+            &service_type,
         ).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
@@ -1172,6 +1213,7 @@ async fn restart_instance(
                 inst.nearai_api_url
                     .as_deref()
                     .unwrap_or(DEFAULT_NEARAI_API_URL),
+                inst.service_type.as_deref().unwrap_or("openclaw"),
             ).await {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
@@ -1835,6 +1877,7 @@ impl AppConfig {
             host_address: "localhost".to_string(),
             openclaw_domain: None,
             openclaw_image: "test:local".to_string(),
+            ironclaw_image: "ironclaw-test:local".to_string(),
             compose_file: std::path::PathBuf::from("/dev/null"),
             dstack_app_id: None,
             dstack_gateway_base: None,

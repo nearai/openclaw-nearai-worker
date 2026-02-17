@@ -1,0 +1,34 @@
+# Per-user IronClaw worker template. Used with:
+#   docker compose -p openclaw-{user_id} -f docker-compose.ironclaw.yml --env-file .../envs/{user_id}.env up -d
+# Env file must set: NEARAI_API_KEY, OPENCLAW_GATEWAY_TOKEN, GATEWAY_PORT, SSH_PORT, OPENCLAW_IMAGE (optional).
+
+services:
+  gateway:
+    image: ${OPENCLAW_IMAGE:-ironclaw-nearai-worker:local}
+    labels:
+      openclaw.managed: "true"
+    environment:
+      HOME: /home/agent
+      TERM: xterm-256color
+      NEARAI_API_KEY: ${NEARAI_API_KEY}
+      NEARAI_API_URL: ${NEARAI_API_URL:-https://cloud-api.near.ai/v1}
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
+      SSH_PUBKEY: ${SSH_PUBKEY:-}
+    volumes:
+      - config:/home/agent/.ironclaw
+      - workspace:/home/agent/workspace
+    ports:
+      - "${GATEWAY_PORT}:18789"
+      - "${SSH_PORT}:2222"
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:18789/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  config:
+  workspace:

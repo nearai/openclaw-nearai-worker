@@ -53,6 +53,7 @@ mod tests {
             image: None,
             image_digest: None,
             nearai_api_url: None,
+            service_type: None,
         }
     }
 
