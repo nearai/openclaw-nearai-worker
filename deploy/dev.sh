@@ -92,6 +92,18 @@ if [ "$NO_BUILD" -eq 0 ]; then
   log_info "Building openclaw-updater:local ..."
   docker build -f updater/Dockerfile -t openclaw-updater:local .
 
+  # Build ironclaw worker if source is available (sibling repo)
+  IRONCLAW_SRC="${IRONCLAW_SRC:-$(cd "$REPO_ROOT/.." && pwd)/ironclaw}"
+  if [ -d "$IRONCLAW_SRC/src" ]; then
+    log_info "Building ironclaw-nearai-worker:local (source: $IRONCLAW_SRC) ..."
+    docker buildx build \
+      --build-context ironclaw="$IRONCLAW_SRC" \
+      -t ironclaw-nearai-worker:local \
+      ./ironclaw-worker
+  else
+    log_warn "Ironclaw source not found at $IRONCLAW_SRC — skipping ironclaw image build"
+  fi
+
   log_info "All images built."
 fi
 
@@ -128,6 +140,12 @@ if [ "$NO_BUILD" -eq 0 ]; then
   log_info "Pushing openclaw-updater to local registry..."
   docker tag openclaw-updater:local localhost:5050/openclaw-updater:latest
   docker push localhost:5050/openclaw-updater:latest
+
+  if docker image inspect ironclaw-nearai-worker:local > /dev/null 2>&1; then
+    log_info "Pushing ironclaw-nearai-worker to local registry..."
+    docker tag ironclaw-nearai-worker:local localhost:5050/ironclaw-nearai-worker:latest
+    docker push localhost:5050/ironclaw-nearai-worker:latest
+  fi
 fi
 
 if [ "$BUILD_ONLY" -eq 1 ]; then
