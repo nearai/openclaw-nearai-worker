@@ -41,7 +41,7 @@ COSIGN_ISSUER="${UPDATER_COSIGN_ISSUER:-https://token.actions.githubusercontent.
 HEALTH_URL="${UPDATER_HEALTH_URL:-http://127.0.0.1:8080/health}"
 HEALTH_TIMEOUT="${UPDATER_HEALTH_TIMEOUT:-60}"
 STATE_FILE="${UPDATER_STATE_FILE:-/app/data/updater-state.json}"
-SELF_CHECK_INTERVAL="${UPDATER_SELF_CHECK_INTERVAL:-288}"  # every 24h at 5min polls
+SELF_CHECK_INTERVAL="${UPDATER_SELF_CHECK_INTERVAL:-1}"  # every poll cycle
 BUNDLED_COMPOSE="/app/compose/docker-compose.dstack.yml"
 
 # ── Logging ───────────────────────────────────────────────────────────
