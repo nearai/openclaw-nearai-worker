@@ -162,42 +162,47 @@ impl AppState {
         .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_down(&self, name: &str) -> Result<(), ApiError> {
+    async fn compose_down(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.down(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.down(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_stop(&self, name: &str) -> Result<(), ApiError> {
+    async fn compose_stop(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.stop(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.stop(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_start(&self, name: &str) -> Result<(), ApiError> {
+    async fn compose_start(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.start(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.start(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_restart(&self, name: &str) -> Result<(), ApiError> {
+    async fn compose_restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.restart(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.restart(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_status(&self, name: &str) -> Result<String, ApiError> {
+    async fn compose_status(&self, name: &str, service_type: Option<&str>) -> Result<String, ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.status(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.status(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
@@ -1049,7 +1054,7 @@ async fn get_instance(
 
     match instance {
         Some(inst) => {
-            let status = state.compose_status(&inst.name).await?;
+            let status = state.compose_status(&inst.name, inst.service_type.as_deref()).await?;
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
@@ -1094,7 +1099,7 @@ async fn list_instances(
     let mut responses = Vec::new();
     for inst in instances {
         let status = state
-            .compose_status(&inst.name)
+            .compose_status(&inst.name, inst.service_type.as_deref())
             .await
             .unwrap_or_else(|_| "unknown".to_string());
         let (url, dashboard_url) =
@@ -1138,14 +1143,13 @@ async fn delete_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    {
+    let inst = {
         let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
+        store.get(&name).cloned()
+    };
+    let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
-    state.compose_down(&name).await?;
+    state.compose_down(&name, inst.service_type.as_deref()).await?;
 
     if let (Some(ref dns), Some(ref domain)) = (&state.dns, &state.config.openclaw_domain) {
         if let Err(e) = dns.delete_txt_record(&name, domain).await {
@@ -1232,7 +1236,7 @@ async fn restart_instance(
             // Simple restart
             yield Ok(sse_stage("container_starting", "Restarting container..."));
 
-            if let Err(e) = state.compose_restart(&name).await {
+            if let Err(e) = state.compose_restart(&name, inst.service_type.as_deref()).await {
                 yield Ok(sse_error(&format!("Failed to restart container: {}", e)));
                 return;
             }
@@ -1267,17 +1271,16 @@ async fn stop_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    {
+    let inst = {
         let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
+        store.get(&name).cloned()
+    };
+    let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
     let stream = async_stream::stream! {
         yield Ok(sse_stage("stopping", "Stopping container..."));
 
-        if let Err(e) = state.compose_stop(&name).await {
+        if let Err(e) = state.compose_stop(&name, inst.service_type.as_deref()).await {
             yield Ok(sse_error(&format!("Failed to stop container: {}", e)));
             return;
         }
@@ -1312,17 +1315,16 @@ async fn start_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    {
+    let inst = {
         let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
+        store.get(&name).cloned()
+    };
+    let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
     let stream = async_stream::stream! {
         yield Ok(sse_stage("container_starting", "Starting container..."));
 
-        if let Err(e) = state.compose_start(&name).await {
+        if let Err(e) = state.compose_start(&name, inst.service_type.as_deref()).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
         }

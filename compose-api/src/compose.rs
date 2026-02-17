@@ -140,33 +140,33 @@ impl ComposeManager {
     }
 
     /// `docker compose -p openclaw-{name} down -v` (removes volumes too)
-    pub fn down(&self, name: &str) -> Result<(), ApiError> {
+    pub fn down(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["down", "-v"], None, None)?;
+        self.compose_cmd(name, &env_path, &["down", "-v"], None, service_type)?;
         self.remove_env_file(name);
         Ok(())
     }
 
-    pub fn stop(&self, name: &str) -> Result<(), ApiError> {
+    pub fn stop(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["stop"], None, None)
+        self.compose_cmd(name, &env_path, &["stop"], None, service_type)
     }
 
-    pub fn start(&self, name: &str) -> Result<(), ApiError> {
+    pub fn start(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["start"], None, None)
+        self.compose_cmd(name, &env_path, &["start"], None, service_type)
     }
 
-    pub fn restart(&self, name: &str) -> Result<(), ApiError> {
+    pub fn restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["restart"], None, None)
+        self.compose_cmd(name, &env_path, &["restart"], None, service_type)
     }
 
     /// Returns the output of `docker compose ps --format json`.
-    pub fn status(&self, name: &str) -> Result<String, ApiError> {
+    pub fn status(&self, name: &str, service_type: Option<&str>) -> Result<String, ApiError> {
         let env_path = self.env_path(name);
         let project = format!("openclaw-{}", name);
-        let compose_file = self.compose_file_for(None);
+        let compose_file = self.compose_file_for(service_type);
 
         let output = Command::new("docker")
             .args([
