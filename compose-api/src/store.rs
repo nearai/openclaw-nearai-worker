@@ -29,6 +29,9 @@ pub struct Instance {
     pub image: Option<String>,
     #[serde(default)]
     pub image_digest: Option<String>,
+    /// "openclaw" (default) or "ironclaw"
+    #[serde(default)]
+    pub service_type: Option<String>,
 }
 
 #[derive(Debug)]
@@ -145,6 +148,7 @@ mod tests {
             active: true,
             image: None,
             image_digest: None,
+            service_type: None,
         }
     }
 

@@ -114,6 +114,7 @@ struct AppConfig {
     host_address: String,
     openclaw_domain: Option<String>,
     openclaw_image: String,
+    ironclaw_image: String,
     compose_file: std::path::PathBuf,
     dstack_app_id: Option<String>,
     dstack_gateway_base: Option<String>,
@@ -134,6 +135,7 @@ impl AppState {
         ssh_pubkey: &str,
         image: &str,
         nearai_api_url: &str,
+        service_type: &str,
     ) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
@@ -142,6 +144,7 @@ impl AppState {
         let ssh_pubkey = ssh_pubkey.to_string();
         let image = image.to_string();
         let nearai_api_url = nearai_api_url.to_string();
+        let service_type = service_type.to_string();
         tokio::task::spawn_blocking(move || {
             compose.up(&compose::InstanceConfig {
                 name: &name,
@@ -152,48 +155,54 @@ impl AppState {
                 ssh_pubkey: &ssh_pubkey,
                 image: &image,
                 nearai_api_url: &nearai_api_url,
+                service_type: &service_type,
             })
         })
         .await
         .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_down(&self, name: &str) -> Result<(), ApiError> {
+    async fn compose_down(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.down(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.down(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_stop(&self, name: &str) -> Result<(), ApiError> {
+    async fn compose_stop(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.stop(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.stop(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_start(&self, name: &str) -> Result<(), ApiError> {
+    async fn compose_start(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.start(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.start(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_restart(&self, name: &str) -> Result<(), ApiError> {
+    async fn compose_restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.restart(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.restart(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_status(&self, name: &str) -> Result<String, ApiError> {
+    async fn compose_status(&self, name: &str, service_type: Option<&str>) -> Result<String, ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.status(&name))
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.status(&name, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
@@ -299,6 +308,8 @@ async fn main() -> anyhow::Result<()> {
 
     let compose_file = std::env::var("COMPOSE_FILE")
         .unwrap_or_else(|_| "/app/docker-compose.worker.yml".to_string());
+    let ironclaw_compose_file = std::env::var("IRONCLAW_COMPOSE_FILE")
+        .unwrap_or_else(|_| "/app/docker-compose.ironclaw.yml".to_string());
 
     let dstack_app_id = fetch_dstack_app_id().await;
     if let Some(ref app_id) = dstack_app_id {
@@ -319,7 +330,9 @@ async fn main() -> anyhow::Result<()> {
         openclaw_domain: std::env::var("OPENCLAW_DOMAIN").ok(),
         openclaw_image: std::env::var("OPENCLAW_IMAGE")
             .unwrap_or_else(|_| "openclaw-nearai-worker:local".to_string()),
-        compose_file: std::path::PathBuf::from(compose_file),
+        ironclaw_image: std::env::var("IRONCLAW_IMAGE")
+            .unwrap_or_else(|_| "ironclaw-nearai-worker:local".to_string()),
+        compose_file: std::path::PathBuf::from(&compose_file),
         dstack_app_id,
         dstack_gateway_base,
         nginx_map_path: PathBuf::from(
@@ -347,8 +360,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let mut compose_files = std::collections::HashMap::new();
+    compose_files.insert("openclaw".to_string(), config.compose_file.clone());
+    let ironclaw_path = std::path::PathBuf::from(&ironclaw_compose_file);
+    if ironclaw_path.exists() {
+        compose_files.insert("ironclaw".to_string(), ironclaw_path);
+        tracing::info!("IronClaw compose template loaded: {}", ironclaw_compose_file);
+    } else {
+        tracing::info!(
+            "IronClaw compose template not found at {}, ironclaw service type disabled",
+            ironclaw_compose_file
+        );
+    }
+
     let compose = Arc::new(ComposeManager::new(
-        config.compose_file.clone(),
+        compose_files,
         std::path::PathBuf::from("data/envs"),
     )?);
 
@@ -500,6 +526,9 @@ struct CreateInstanceRequest {
     /// Optional Docker image reference (defaults to server-configured image)
     #[serde(default)]
     image: Option<String>,
+    /// Service type: "openclaw" (default) or "ironclaw"
+    #[serde(default)]
+    service_type: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -835,13 +864,28 @@ async fn create_instance(
         return Err(ApiError::BadRequest("ssh_pubkey is required".into()));
     }
 
-    // Resolve image
+    // Resolve service type
+    let service_type = req
+        .service_type
+        .as_deref()
+        .unwrap_or("openclaw")
+        .to_string();
+    if service_type != "openclaw" && service_type != "ironclaw" {
+        return Err(ApiError::BadRequest(
+            "service_type must be 'openclaw' or 'ironclaw'".into(),
+        ));
+    }
+
+    // Resolve image based on service type
     let image = match &req.image {
         Some(img) => {
             validate_image(img)?;
             img.trim().to_string()
         }
-        None => state.config.openclaw_image.clone(),
+        None => match service_type.as_str() {
+            "ironclaw" => state.config.ironclaw_image.clone(),
+            _ => state.config.openclaw_image.clone(),
+        },
     };
 
     // Defense-in-depth: reject newlines at the API boundary
@@ -917,6 +961,7 @@ async fn create_instance(
         active: true,
         image: Some(image.clone()),
         image_digest: None,
+        service_type: Some(service_type.clone()),
     };
 
     // Save to store before streaming so it's persisted immediately
@@ -942,6 +987,7 @@ async fn create_instance(
             &ssh_pubkey,
             &image,
             &nearai_api_url,
+            &service_type,
         ).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
@@ -1008,7 +1054,7 @@ async fn get_instance(
 
     match instance {
         Some(inst) => {
-            let status = state.compose_status(&inst.name).await?;
+            let status = state.compose_status(&inst.name, inst.service_type.as_deref()).await?;
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
@@ -1053,7 +1099,7 @@ async fn list_instances(
     let mut responses = Vec::new();
     for inst in instances {
         let status = state
-            .compose_status(&inst.name)
+            .compose_status(&inst.name, inst.service_type.as_deref())
             .await
             .unwrap_or_else(|_| "unknown".to_string());
         let (url, dashboard_url) =
@@ -1097,14 +1143,13 @@ async fn delete_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    {
+    let inst = {
         let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
+        store.get(&name).cloned()
+    };
+    let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
-    state.compose_down(&name).await?;
+    state.compose_down(&name, inst.service_type.as_deref()).await?;
 
     if let (Some(ref dns), Some(ref domain)) = (&state.dns, &state.config.openclaw_domain) {
         if let Err(e) = dns.delete_txt_record(&name, domain).await {
@@ -1172,6 +1217,7 @@ async fn restart_instance(
                 inst.nearai_api_url
                     .as_deref()
                     .unwrap_or(DEFAULT_NEARAI_API_URL),
+                inst.service_type.as_deref().unwrap_or("openclaw"),
             ).await {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
@@ -1190,7 +1236,7 @@ async fn restart_instance(
             // Simple restart
             yield Ok(sse_stage("container_starting", "Restarting container..."));
 
-            if let Err(e) = state.compose_restart(&name).await {
+            if let Err(e) = state.compose_restart(&name, inst.service_type.as_deref()).await {
                 yield Ok(sse_error(&format!("Failed to restart container: {}", e)));
                 return;
             }
@@ -1225,17 +1271,16 @@ async fn stop_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    {
+    let inst = {
         let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
+        store.get(&name).cloned()
+    };
+    let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
     let stream = async_stream::stream! {
         yield Ok(sse_stage("stopping", "Stopping container..."));
 
-        if let Err(e) = state.compose_stop(&name).await {
+        if let Err(e) = state.compose_stop(&name, inst.service_type.as_deref()).await {
             yield Ok(sse_error(&format!("Failed to stop container: {}", e)));
             return;
         }
@@ -1270,17 +1315,16 @@ async fn start_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    {
+    let inst = {
         let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
+        store.get(&name).cloned()
+    };
+    let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
     let stream = async_stream::stream! {
         yield Ok(sse_stage("container_starting", "Starting container..."));
 
-        if let Err(e) = state.compose_start(&name).await {
+        if let Err(e) = state.compose_start(&name, inst.service_type.as_deref()).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
         }
@@ -1835,6 +1879,7 @@ impl AppConfig {
             host_address: "localhost".to_string(),
             openclaw_domain: None,
             openclaw_image: "test:local".to_string(),
+            ironclaw_image: "ironclaw-test:local".to_string(),
             compose_file: std::path::PathBuf::from("/dev/null"),
             dstack_app_id: None,
             dstack_gateway_base: None,

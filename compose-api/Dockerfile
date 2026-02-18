@@ -46,8 +46,9 @@ WORKDIR /app
 # Copy the binary from builder
 COPY --from=builder /app/target/release/openclaw-compose-api /app/openclaw-compose-api
 
-# Bundle the worker compose template
+# Bundle the worker compose templates
 COPY docker-compose.worker.yml /app/docker-compose.worker.yml
+COPY docker-compose.ironclaw.yml /app/docker-compose.ironclaw.yml
 
 # Create data and envs directories
 RUN mkdir -p /app/data/envs

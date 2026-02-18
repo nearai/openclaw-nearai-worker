@@ -39,9 +39,22 @@ jobs:
             context: .
             dockerfile: updater/Dockerfile
             build_script: false
+          - name: ironclaw-nearai-worker
+            context: ironclaw-worker
+            dockerfile: ironclaw-worker/Dockerfile
+            build_script: false
+            extra_repo: nearai/ironclaw
+            build_contexts: ironclaw=./ironclaw-src
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Checkout ironclaw source
+        if: matrix.extra_repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.extra_repo }}
+          path: ironclaw-src
 
       - name: Log in to Docker registry
         uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
@@ -110,6 +123,7 @@ jobs:
           tags: ${{ env.IMAGE_REFERENCE }}
           build-args: |
             GIT_COMMIT=${{ github.sha }}
+          build-contexts: ${{ matrix.build_contexts }}
 
       - name: Get image digest (standard)
         if: ${{ !matrix.build_script }}

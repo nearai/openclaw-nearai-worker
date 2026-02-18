@@ -13,5 +13,8 @@ compose-api/target/
 # Runtime data
 compose-api/data/
 
+# Test scripts
+test-e2e.sh
+
 # Reference repos
 dstack/

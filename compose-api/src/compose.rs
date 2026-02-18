@@ -22,34 +22,52 @@ pub struct InstanceConfig<'a> {
     pub ssh_pubkey: &'a str,
     pub image: &'a str,
     pub nearai_api_url: &'a str,
+    pub service_type: &'a str,
 }
 
 /// Manages one Docker Compose project per worker via the `docker compose` CLI.
 pub struct ComposeManager {
-    /// Path to the parameterized worker template (docker-compose.worker.yml).
-    compose_file: PathBuf,
+    /// Compose templates keyed by service type ("openclaw", "ironclaw", etc.).
+    compose_files: HashMap<String, PathBuf>,
     /// Directory where per-instance .env files are written (e.g. data/envs/).
     env_dir: PathBuf,
 }
 
 impl ComposeManager {
-    pub fn new(compose_file: PathBuf, env_dir: PathBuf) -> Result<Self, ApiError> {
+    pub fn new(compose_files: HashMap<String, PathBuf>, env_dir: PathBuf) -> Result<Self, ApiError> {
         // Ensure the env directory exists
         std::fs::create_dir_all(&env_dir)
             .map_err(|e| ApiError::Internal(format!("Failed to create env dir: {}", e)))?;
 
-        // Validate that the compose file exists
-        if !compose_file.exists() {
-            return Err(ApiError::Internal(format!(
-                "Compose file not found: {}",
-                compose_file.display()
-            )));
+        // Validate that compose files exist
+        for (name, path) in &compose_files {
+            if !path.exists() {
+                return Err(ApiError::Internal(format!(
+                    "Compose file not found for '{}': {}",
+                    name,
+                    path.display()
+                )));
+            }
+        }
+
+        if !compose_files.contains_key("openclaw") {
+            return Err(ApiError::Internal(
+                "Default 'openclaw' compose file must be provided".to_string(),
+            ));
         }
 
         Ok(Self {
-            compose_file,
+            compose_files,
             env_dir,
         })
+    }
+
+    /// Resolve the compose file for a given service type, falling back to openclaw.
+    fn compose_file_for(&self, service_type: Option<&str>) -> &Path {
+        service_type
+            .and_then(|st| self.compose_files.get(st))
+            .or_else(|| self.compose_files.get("openclaw"))
+            .expect("default compose file must exist")
     }
 
     fn env_path(&self, name: &str) -> PathBuf {
@@ -102,6 +120,7 @@ impl ComposeManager {
         vars.insert("SSH_PORT".into(), cfg.ssh_port.to_string());
         vars.insert("OPENCLAW_IMAGE".into(), cfg.image.to_string());
         vars.insert("SSH_PUBKEY".into(), cfg.ssh_pubkey.into());
+        vars.insert("SERVICE_TYPE".into(), cfg.service_type.to_string());
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
         // Pull from registry for remote images (contain '/') or digest-pinned references;
@@ -116,36 +135,38 @@ impl ComposeManager {
             &env_path,
             &["up", "-d", "--pull", pull_policy],
             Some(&vars),
+            Some(cfg.service_type),
         )
     }
 
     /// `docker compose -p openclaw-{name} down -v` (removes volumes too)
-    pub fn down(&self, name: &str) -> Result<(), ApiError> {
+    pub fn down(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["down", "-v"], None)?;
+        self.compose_cmd(name, &env_path, &["down", "-v"], None, service_type)?;
         self.remove_env_file(name);
         Ok(())
     }
 
-    pub fn stop(&self, name: &str) -> Result<(), ApiError> {
+    pub fn stop(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["stop"], None)
+        self.compose_cmd(name, &env_path, &["stop"], None, service_type)
     }
 
-    pub fn start(&self, name: &str) -> Result<(), ApiError> {
+    pub fn start(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["start"], None)
+        self.compose_cmd(name, &env_path, &["start"], None, service_type)
     }
 
-    pub fn restart(&self, name: &str) -> Result<(), ApiError> {
+    pub fn restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["restart"], None)
+        self.compose_cmd(name, &env_path, &["restart"], None, service_type)
     }
 
     /// Returns the output of `docker compose ps --format json`.
-    pub fn status(&self, name: &str) -> Result<String, ApiError> {
+    pub fn status(&self, name: &str, service_type: Option<&str>) -> Result<String, ApiError> {
         let env_path = self.env_path(name);
         let project = format!("openclaw-{}", name);
+        let compose_file = self.compose_file_for(service_type);
 
         let output = Command::new("docker")
             .args([
@@ -153,7 +174,7 @@ impl ComposeManager {
                 "-p",
                 &project,
                 "-f",
-                self.compose_file.to_str().unwrap(),
+                compose_file.to_str().unwrap(),
                 "--env-file",
                 env_path.to_str().unwrap(),
                 "ps",
@@ -388,6 +409,10 @@ impl ComposeManager {
             .cloned()
             .filter(|s| !s.is_empty());
         let image_env = env_map.get("OPENCLAW_IMAGE").cloned();
+        let service_type = env_map
+            .get("SERVICE_TYPE")
+            .cloned()
+            .filter(|s| !s.is_empty());
 
         // Parse port bindings from .HostConfig.PortBindings
         let port_bindings = v.pointer("/HostConfig/PortBindings");
@@ -435,6 +460,7 @@ impl ComposeManager {
             active,
             image,
             image_digest,
+            service_type,
         })
     }
 
@@ -472,6 +498,9 @@ impl ComposeManager {
         if let Some(ref image) = inst.image {
             vars.insert("OPENCLAW_IMAGE".into(), image.clone());
         }
+        if let Some(ref st) = inst.service_type {
+            vars.insert("SERVICE_TYPE".into(), st.clone());
+        }
         self.write_env_file(&inst.name, &vars)
     }
 
@@ -483,8 +512,10 @@ impl ComposeManager {
         env_path: &Path,
         args: &[&str],
         env_vars: Option<&HashMap<String, String>>,
+        service_type: Option<&str>,
     ) -> Result<(), ApiError> {
         let project = format!("openclaw-{}", name);
+        let compose_file = self.compose_file_for(service_type);
 
         let mut cmd = Command::new("docker");
         cmd.args([
@@ -492,7 +523,7 @@ impl ComposeManager {
             "-p",
             &project,
             "-f",
-            self.compose_file.to_str().unwrap(),
+            compose_file.to_str().unwrap(),
             "--env-file",
             env_path.to_str().unwrap(),
         ]);
