@@ -60,9 +60,9 @@
         "primary": "nearai/zai-org/GLM-4.7"
       },
       "models": {
-        "nearai/zai-org/GLM-4.7": { "params": { "temperature": 1.0, "top_p": 0.95 } },
-        "nearai/deepseek-ai/DeepSeek-V3.1": { "params": { "temperature": 0.7 } },
-        "nearai/Qwen/Qwen3-30B-A3B-Instruct-2507": { "params": { "temperature": 0.7 } }
+        "nearai/zai-org/GLM-4.7": { "streaming": false, "params": { "temperature": 1.0, "top_p": 0.95 } },
+        "nearai/deepseek-ai/DeepSeek-V3.1": { "streaming": false, "params": { "temperature": 0.7 } },
+        "nearai/Qwen/Qwen3-30B-A3B-Instruct-2507": { "streaming": false, "params": { "temperature": 0.7 } }
       },
       "workspace": "/home/agent/openclaw",
       "contextTokens": 115200,
@@ -78,6 +78,9 @@
       "humanDelay": { "mode": "natural" },
       "typingMode": "thinking"
     }
+  },
+  "update": {
+    "checkOnStart": false
   },
   "gateway": {
     "mode": "local",
