@@ -5,6 +5,7 @@
 services:
   gateway:
     image: ${OPENCLAW_IMAGE:-openclaw-nearai-worker:local}
+    init: true
     labels:
       openclaw.managed: "true"
     environment:
@@ -17,13 +18,13 @@ services:
       OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
       OPENCLAW_AUTO_APPROVE_DEVICES: ${OPENCLAW_AUTO_APPROVE_DEVICES:-1}
       SSH_PUBKEY: ${SSH_PUBKEY:-}
+    command: ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789"]
     volumes:
       - config:/home/agent/.openclaw
       - workspace:/home/agent/openclaw
     ports:
       - "${GATEWAY_PORT}:18789"
       - "${SSH_PORT}:2222"
-    init: true
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:18789/ || exit 1"]
@@ -31,8 +32,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    command:
-      ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789", "--verbose"]
 
 volumes:
   config:

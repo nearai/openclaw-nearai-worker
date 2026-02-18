@@ -35,17 +35,13 @@ RUN apt-get update && \
       nano \
       file \
       login \
-      systemd \
-      dbus \
-      libpam-systemd \
       sudo && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Create non-root user for OpenClaw agents
 # Use UID 1001 to avoid conflict with default UID 1000
-RUN useradd -m -u 1001 -s /bin/bash agent && \
-    echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
+RUN useradd -m -u 1001 -s /bin/bash agent
 
 # Global shell for the image (matches agent login shell; used by pnpm setup etc.)
 ENV SHELL=/bin/bash
@@ -98,25 +94,19 @@ RUN grep -q 'nonStreamParams' /home/agent/.npm-global/lib/node_modules/openclaw/
 # Switch back to root for final setup
 USER root
 
-# Copy entrypoint script, config template, workspace bootstrap files, and systemd service
+# Copy entrypoint script, config template, and workspace bootstrap files
 COPY entrypoint.sh /app/entrypoint.sh
 COPY openclaw.json.template /app/openclaw.json.template
 COPY workspace/ /app/workspace/
-COPY openclaw-gateway.service /etc/systemd/system/openclaw-gateway.service
-RUN chmod +x /app/entrypoint.sh && \
-    systemctl enable openclaw-gateway.service
+RUN chmod +x /app/entrypoint.sh
 
-# Signal systemd that it's running in a container
-ENV container=docker
 ENV NODE_ENV=production
 ENV PNPM_HOME="/home/agent/.local/share/pnpm"
 ENV PATH="/home/agent/.npm-global/bin:/home/agent/.local/share/pnpm:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
-# Entrypoint runs setup as root, then exec's /lib/systemd/systemd as PID 1
 WORKDIR /home/agent
 
 # Expose ports
 EXPOSE 18789 18790 2222
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-# Tell Docker to send SIGRTMIN+3 for graceful systemd shutdown (systemd ignores SIGTERM)
-STOPSIGNAL RTMIN+3
+CMD ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789"]

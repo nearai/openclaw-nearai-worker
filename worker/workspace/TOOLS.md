@@ -20,6 +20,13 @@ Use `openclaw` to manage configuration, channels, skills, and more.
 
 If you're unsure about a command's syntax, try `<command> --help` to see what's available. Don't guess flags or arguments.
 
+## Gateway Management
+
+- `openclaw gateway restart`, `stop`, and `start` do **not** work — there is no systemd in this container.
+- To restart the gateway: `pkill -u agent -x openclaw` — this kills only the agent-owned parent openclaw process (which brings down the gateway child). The entrypoint restart loop relaunches it within ~5 seconds. Do NOT use `pkill -f 'openclaw gateway run'` — it matches root-owned processes (`runuser`, entrypoint) which you cannot kill.
+- Most config changes (models, channels, plugins) require a gateway restart to take effect.
+- Exception: the per-model `streaming` setting in `openclaw.json` is read on every API call, so it takes effect immediately without restart.
+
 ## Container Environment
 
 - OpenClaw is installed globally. Do NOT run `pnpm install`, `pnpm build`, `npm install`, or any build commands.

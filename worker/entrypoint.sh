@@ -43,7 +43,7 @@ setup_ssh() {
     passwd -d agent 2>/dev/null || usermod -U agent 2>/dev/null || true
 
     # Start SSH daemon on port 2222 (non-privileged); listen on all interfaces for external access
-    # sshd forks/daemonizes, so the child process survives the exec into systemd below
+    # sshd forks/daemonizes, so the child process keeps running after entrypoint enters the restart loop
     echo "Starting SSH daemon on port 2222..."
     SSHD_OUTPUT=$(/usr/sbin/sshd -f /dev/null \
       -o Port=2222 \
@@ -68,15 +68,6 @@ setup_ssh() {
 }
 
 setup_ssh
-
-# ============================================
-# systemd User Session Setup
-# ============================================
-# Enable linger so systemd-logind starts a user instance for agent automatically.
-# This makes systemctl --user work (used by openclaw gateway install/restart/start/stop).
-# libpam-systemd creates /run/user/1001 (XDG_RUNTIME_DIR) when the user session starts.
-mkdir -p /var/lib/systemd/linger
-touch /var/lib/systemd/linger/agent
 
 # ============================================
 # OpenClaw Configuration
@@ -144,19 +135,6 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
   chmod 600 /home/agent/.openclaw/openclaw.json
   echo "Config file created at /home/agent/.openclaw/openclaw.json"
 fi
-
-# Write gateway environment file for the systemd service
-# The openclaw-gateway.service reads this via EnvironmentFile=
-cat > /home/agent/.openclaw/gateway.env <<EOF
-PATH=/home/agent/.npm-global/bin:/home/agent/.local/share/pnpm:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-HOME=/home/agent
-NODE_ENV=production
-PNPM_HOME=/home/agent/.local/share/pnpm
-SHELL=/bin/bash
-OPENCLAW_GATEWAY_BIND=${OPENCLAW_GATEWAY_BIND:-lan}
-EOF
-chown agent:agent /home/agent/.openclaw/gateway.env
-chmod 600 /home/agent/.openclaw/gateway.env
 
 # Create workspace directory if it doesn't exist
 # Note: Directory is already created and owned by agent in Dockerfile, but ensure it exists
@@ -268,8 +246,17 @@ chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
 
 start_auto_approve_daemon
 
-# Hand off to systemd as PID 1
-# systemd manages the openclaw-gateway.service (Restart=always, RestartSec=5)
-# The auto-approve daemon (forked subshell) and sshd (daemonized) survive the exec
-echo "Starting systemd as PID 1..."
-exec /lib/systemd/systemd
+# Execute the command with automatic restart (openclaw is installed globally)
+# The loop keeps the container alive and restarts the gateway if it exits
+RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
+
+while true; do
+  echo "Starting: $*"
+  # Fix ownership before each launch — subdirs may have been created as root
+  chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw 2>/dev/null || true
+  # The -p flag preserves environment variables (including PATH set in Dockerfile)
+  runuser -p -u agent -- "$@" || true
+  EXIT_CODE=$?
+  echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."
+  sleep "$RESTART_DELAY"
+done
