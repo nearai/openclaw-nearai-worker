@@ -2,6 +2,7 @@ services:
   openclaw-gateway:
     build: ../worker
     image: openclaw-nearai-worker:local
+    init: true
     environment:
       HOME: /home/agent
       TERM: xterm-256color
@@ -13,8 +14,11 @@ services:
       OPENCLAW_FORCE_CONFIG_REGEN: ${OPENCLAW_FORCE_CONFIG_REGEN:-0}
       # Optional: Gateway bind address — "lan" (default) or "loopback". See README security section.
       OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
+      # Optional: Auto-approve first device pairing (set to "1" to enable)
+      OPENCLAW_AUTO_APPROVE_DEVICES: ${OPENCLAW_AUTO_APPROVE_DEVICES:-1}
       # Optional: SSH public key for key-based login (enables SSH server on port 2222; required for external SSH).
       SSH_PUBKEY: ${SSH_PUBKEY:-}
+    command: ["openclaw", "gateway", "run", "--bind", "${OPENCLAW_GATEWAY_BIND:-lan}", "--port", "18789", "--verbose"]
     volumes:
       - openclaw-config:/home/agent/.openclaw
       - openclaw-workspace:/home/agent/openclaw
@@ -24,7 +28,6 @@ services:
       - "18790:18790"
       # SSH (port 2222)
       - "2222:2222"
-    init: true
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:18789/ || exit 1"]
@@ -32,17 +35,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    command:
-      [
-        "openclaw",
-        "gateway",
-        "run",
-        "--bind",
-        "${OPENCLAW_GATEWAY_BIND:-lan}",
-        "--port",
-        "18789",
-        "--verbose"
-      ]
 
 volumes:
   openclaw-config:

@@ -41,8 +41,7 @@ RUN apt-get update && \
 
 # Create non-root user for OpenClaw agents
 # Use UID 1001 to avoid conflict with default UID 1000
-RUN useradd -m -u 1001 -s /bin/bash agent && \
-    echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
+RUN useradd -m -u 1001 -s /bin/bash agent
 
 # Global shell for the image (matches agent login shell; used by pnpm setup etc.)
 ENV SHELL=/bin/bash
@@ -76,7 +75,7 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/
 # This ensures they are in the agent user's PATH (npm config is set in the same RUN instruction below)
 USER agent
 RUN npm config set prefix "/home/agent/.npm-global" && \
-    npm install -g pnpm bun openclaw@2026.2.1 && \
+    npm install -g pnpm bun openclaw@2026.2.15 && \
     /home/agent/.npm-global/bin/pnpm setup
 
 # Workaround: NEAR AI streaming bug truncates tool call arguments.
@@ -88,6 +87,7 @@ RUN node /tmp/patch-streaming.js && rm /tmp/patch-streaming.js
 # Verify patch applied correctly — fail build if markers are missing
 RUN grep -q 'nonStreamParams' /home/agent/.npm-global/lib/node_modules/openclaw/node_modules/@mariozechner/pi-ai/dist/providers/openai-completions.js \
     && grep -q 'stream: false' /home/agent/.npm-global/lib/node_modules/openclaw/node_modules/@mariozechner/pi-ai/dist/providers/openai-completions.js \
+    && grep -q '_shouldStream' /home/agent/.npm-global/lib/node_modules/openclaw/node_modules/@mariozechner/pi-ai/dist/providers/openai-completions.js \
     && echo "patch-streaming: verification passed" \
     || (echo "patch-streaming: verification FAILED — patched markers not found" >&2 && exit 1)
 
@@ -103,7 +103,6 @@ RUN chmod +x /app/entrypoint.sh
 ENV NODE_ENV=production
 ENV PNPM_HOME="/home/agent/.local/share/pnpm"
 ENV PATH="/home/agent/.npm-global/bin:/home/agent/.local/share/pnpm:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
-# Run entrypoint as root so it can fix volume ownership; main process drops to agent via runuser
 WORKDIR /home/agent
 
 # Expose ports
