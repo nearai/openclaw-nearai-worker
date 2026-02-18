@@ -45,6 +45,10 @@ jobs:
             build_script: false
             extra_repo: nearai/ironclaw
             build_contexts: ironclaw=./ironclaw-src
+          - name: openclaw-ingress
+            context: ingress
+            dockerfile: ingress/Dockerfile
+            build_script: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

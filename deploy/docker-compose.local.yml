@@ -6,19 +6,15 @@ services:
     entrypoint: ["/bin/sh", "-c", "mkdir -p /etc/letsencrypt/live && ln -sfn ${OPENCLAW_DOMAIN} '/etc/letsencrypt/live/*.${OPENCLAW_DOMAIN}'"]
     restart: "no"
 
-  dstack-ingress:
-    image: ${INGRESS_IMAGE:-dstacktee/dstack-ingress:1.2@sha256:549d6864ccbde3f35622a4bfbbc54911363650de84f37698d72d85ec4714d6fd}
-    container_name: dstack-ingress
+  nginx:
+    image: ${INGRESS_IMAGE:-openclaw-ingress:local}
+    container_name: nginx
     network_mode: host
     environment:
-      - DOMAINS=*.${OPENCLAW_DOMAIN}
+      - OPENCLAW_DOMAIN=${OPENCLAW_DOMAIN}
       - CERTBOT_EMAIL=${CERTBOT_EMAIL}
-      - DNS_PROVIDER=cloudflare
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
     volumes:
-      - /var/run/dstack.sock:/var/run/dstack.sock
-      - /var/run/tappd.sock:/var/run/tappd.sock
       - cert-data:/etc/letsencrypt
       - nginx-dynamic:/data/nginx
     configs:
@@ -43,11 +39,8 @@ services:
       - OPENCLAW_DOMAIN=${OPENCLAW_DOMAIN}
       - OPENCLAW_IMAGE=${OPENCLAW_IMAGE}
       - IRONCLAW_IMAGE=${IRONCLAW_IMAGE:-ironclaw-nearai-worker:local}
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID}
-      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN}
       - NGINX_MAP_PATH=/data/nginx/backends.map
-      - INGRESS_CONTAINER_NAME=dstack-ingress
+      - INGRESS_CONTAINER_NAME=nginx
       - COMPOSE_FILE=/app/docker-compose.worker.yml
       - LISTEN_ADDR=0.0.0.0:8080
       - BACKUP_S3_BUCKET=${BACKUP_S3_BUCKET:-}
@@ -63,7 +56,7 @@ services:
       start_period: 120s
     restart: unless-stopped
     depends_on:
-      - dstack-ingress
+      - nginx
 
   openclaw-updater:
     image: ${UPDATER_IMAGE:-openclaw-updater:local}
