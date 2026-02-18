@@ -39,10 +39,10 @@ const replacement = `// PATCHED: per-model streaming config
                 const _modelCfg = _models[params.model] || _models['nearai/' + params.model] || {};
                 if (_modelCfg.streaming === true) _shouldStream = true;
             } catch(_e) { /* config read failed, stay non-streaming */ }
-            var openaiStream;
-            var currentBlock = null;
-            var blocks;
-            var blockIndex;
+            let openaiStream;
+            let currentBlock = null;
+            let blocks;
+            let blockIndex;
             if (_shouldStream) {
                 // STREAMING PATH: original pi-ai behavior
                 openaiStream = await client.chat.completions.create(params, { signal: options?.signal });
@@ -59,9 +59,8 @@ const replacement = `// PATCHED: per-model streaming config
                 blockIndex = () => blocks.length - 1;
                 if (completion.usage) {
                     const cachedTokens = completion.usage.prompt_tokens_details?.cached_tokens || 0;
-                    const reasoningTokens = completion.usage.completion_tokens_details?.reasoning_tokens || 0;
                     const inp = (completion.usage.prompt_tokens || 0) - cachedTokens;
-                    const out = (completion.usage.completion_tokens || 0) + reasoningTokens;
+                    const out = completion.usage.completion_tokens || 0;
                     output.usage = { input: inp, output: out, cacheRead: cachedTokens, cacheWrite: 0, totalTokens: inp + out + cachedTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
                 }
                 const _choice = completion.choices?.[0];

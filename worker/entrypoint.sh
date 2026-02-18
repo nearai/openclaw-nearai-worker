@@ -255,8 +255,7 @@ while true; do
   # Fix ownership before each launch — subdirs may have been created as root
   chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw 2>/dev/null || true
   # The -p flag preserves environment variables (including PATH set in Dockerfile)
-  runuser -p -u agent -- "$@" || true
-  EXIT_CODE=$?
+  runuser -p -u agent -- "$@" && EXIT_CODE=$? || EXIT_CODE=$?
   echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."
   sleep "$RESTART_DELAY"
 done
