@@ -18,12 +18,15 @@ WORKDIR /app
 # Copy manifests and build script for dependency caching
 COPY --from=ironclaw Cargo.toml Cargo.lock* build.rs ./
 
-# Dummy main.rs and examples to cache dependencies
-RUN mkdir -p src examples && \
+# Stub workspace members and examples for dependency caching
+# (ironclaw's Cargo.toml declares benchmarks as a workspace member)
+COPY --from=ironclaw benchmarks/Cargo.toml benchmarks/Cargo.toml
+RUN mkdir -p src examples benchmarks/src && \
     echo "fn main() {}" > src/main.rs && \
-    echo "fn main() {}" > examples/test_heartbeat.rs
+    echo "fn main() {}" > examples/test_heartbeat.rs && \
+    echo "fn main() {}" > benchmarks/src/main.rs
 RUN cargo build --release --no-default-features --features libsql --bin ironclaw 2>/dev/null || true
-RUN rm -rf src examples
+RUN rm -rf src examples benchmarks/src
 
 # Bust cache for fresh code
 ARG CACHEBUST=0
@@ -33,8 +36,10 @@ RUN echo "cachebust=$CACHEBUST"
 COPY --from=ironclaw src ./src
 COPY --from=ironclaw wit ./wit
 
-# Cargo.toml references examples/ which aren't in the Docker context; stub them out
-RUN mkdir -p examples && echo "fn main() {}" > examples/test_heartbeat.rs
+# Stub workspace members and examples that aren't needed for the binary build
+RUN mkdir -p examples benchmarks/src && \
+    echo "fn main() {}" > examples/test_heartbeat.rs && \
+    echo "fn main() {}" > benchmarks/src/main.rs
 
 # Build the real binary
 RUN touch src/main.rs && \
