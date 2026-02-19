@@ -210,22 +210,19 @@ docker compose -f deploy/docker-compose.yml exec openclaw-gateway openclaw model
 The configuration is automatically generated from environment variables on first run. The entrypoint script creates `/home/agent/.openclaw/openclaw.json` with:
 
 - **NEAR AI Cloud** as the model provider
-- **GLM-4.7** (`zai-org/GLM-4.7`) as the default primary model
-- Three models available for agents: GLM-4.7, DeepSeek V3.1, and Qwen3 30B A3B Instruct
+- **auto** (`nearai/auto`) as the default primary model, letting NEAR AI Cloud route to the best available model
 
 ### Available Models
 
-The worker is preconfigured with the following models from NEAR AI Cloud. You can use any of them when sending requests to the gateway or when configuring agents.
+The worker is preconfigured to use NEAR AI Cloud's `auto` routing, which automatically selects the best available model for each request.
 
-| Model | ID | Context | Reasoning | Description |
-|-------|-----|---------|-----------|-------------|
-| **GLM-4.7** (default) | `nearai/zai-org/GLM-4.7` | 200K tokens | Yes | Z.ai GLM 4.7 — strong agentic coding, tool use, and reasoning. Default primary model. |
-| **DeepSeek V3.1** | `nearai/deepseek-ai/DeepSeek-V3.1` | 128K tokens | No | Hybrid model with thinking and non-thinking modes. Good for complex reasoning and tool use. |
-| **Qwen3 30B A3B Instruct** | `nearai/Qwen/Qwen3-30B-A3B-Instruct-2507` | 262K tokens | No | MoE model with long context. Efficient for instruction following and multilingual tasks. |
+| Model | ID | Description |
+|-------|-----|-------------|
+| **auto** (default) | `nearai/auto` | NEAR AI Cloud model routing — automatically selects the best available model. |
 
 **Using a specific model**
 
-- **Primary model**: The default primary model is GLM-4.7. To change it, edit `openclaw.json` (or the template) and set `agents.defaults.model.primary` to one of the IDs above (e.g. `nearai/deepseek-ai/DeepSeek-V3.1`).
+- **Primary model**: The default is `nearai/auto`. To use a specific NEAR AI model, edit `openclaw.json` (or the template) and set `agents.defaults.model.primary` to a specific model ID, then add the model to `models.providers.nearai.models`.
 - **Per-request**: When calling the gateway API (chat completions or responses), specify the `model` parameter in your request body with the desired model ID.
 - **List at runtime**: Run `openclaw models list` inside the container to see all configured models and their IDs.
 
