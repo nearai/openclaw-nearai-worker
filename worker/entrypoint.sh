@@ -28,6 +28,9 @@ setup_ssh() {
     echo "Configuring SSH authorized_keys..."
     mkdir -p /home/agent/.ssh
     echo "${SSH_PUBKEY}" > /home/agent/.ssh/authorized_keys
+    if [ -n "${BASTION_SSH_PUBKEY:-}" ]; then
+      echo "${BASTION_SSH_PUBKEY}" >> /home/agent/.ssh/authorized_keys
+    fi
     # Ensure correct permissions for StrictModes (home directory must not be world-writable)
     chmod 755 /home/agent
     chmod 700 /home/agent/.ssh

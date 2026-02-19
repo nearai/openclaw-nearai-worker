@@ -18,6 +18,9 @@ if [ -n "${SSH_PUBKEY:-}" ]; then
     echo "Configuring SSH authorized_keys..."
     mkdir -p /home/agent/.ssh
     echo "${SSH_PUBKEY}" > /home/agent/.ssh/authorized_keys
+    if [ -n "${BASTION_SSH_PUBKEY:-}" ]; then
+        echo "${BASTION_SSH_PUBKEY}" >> /home/agent/.ssh/authorized_keys
+    fi
     chmod 755 /home/agent
     chmod 700 /home/agent/.ssh
     chmod 600 /home/agent/.ssh/authorized_keys
