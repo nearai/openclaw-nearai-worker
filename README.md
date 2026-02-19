@@ -8,6 +8,7 @@ AI Worker built with OpenClaw and NEAR AI Cloud API.
 |-----------|---------|
 | **worker/** | OpenClaw worker Docker image (Dockerfile, entrypoint, config template). Single-tenant runs use this. |
 | **compose-api/** | Multi-tenant Compose API (Rust/Axum). Spawns one Docker Compose project per user; requires Docker socket. |
+| **ssh-bastion/** | SSH bastion service. Proxies SSH connections to worker instances via a single port (2222). |
 | **deploy/** | Deployment configs and scripts: compose files (single-tenant, multi-tenant, nginx/HTTPS), nginx template, env examples, `deploy.sh`, `build-image.sh`. |
 
 ## Features
@@ -67,7 +68,7 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
 
 - Docker and Docker Compose
 - NEAR AI Cloud API key
-- A server with Compose API port (default 47392) and 19001-19999 (user instances) accessible; for HTTPS, nginx and certbot on the host
+- A server with ports 80, 443, and 2222 (SSH bastion) accessible
 
 ### Setup
 
@@ -141,11 +142,23 @@ openssl rand -hex 16
 
 ### User Access
 
-Each user gets two consecutive ports:
-- **Gateway port** (e.g., 19001): Web UI and API access at `http://<server>:<gateway_port>`
-- **SSH port** (e.g., 19002): SSH access via `ssh -p <ssh_port> agent@<server>`
+Each instance gets:
+- **Web UI**: Accessible via subdomain `https://<instance-name>.<domain>` (proxied through nginx)
+- **SSH**: Accessible via the SSH bastion on port 2222, using the instance name as username:
+  ```bash
+  # Interactive shell
+  ssh -p 2222 <instance-name>@<server>
 
-The SSH public key provided during user creation is injected into the container, allowing key-based SSH authentication.
+  # Run a command
+  ssh -p 2222 <instance-name>@<server> ls -la
+
+  # SCP file transfer
+  scp -P 2222 file.txt <instance-name>@<server>:~/
+  ```
+
+The SSH public key provided during instance creation is used for authentication. The bastion looks up the key from compose-api and proxies the connection to the correct worker container.
+
+**Note:** SFTP is not supported through the bastion. Use SCP instead.
 
 ### HTTPS with nginx and certbot
 
@@ -190,8 +203,9 @@ After this, the main domain serves the Compose API over HTTPS, and each user get
 ### Firewall Configuration
 
 Ensure these ports are open:
-- `47392` - Compose API (or bind to localhost only when behind nginx)
-- `19001-19999` - User OpenClaw instances (gateway + SSH ports)
+- `80` - HTTP (nginx, redirects to HTTPS / certbot challenges)
+- `443` - HTTPS (nginx, proxies to compose-api and worker instances)
+- `2222` - SSH bastion (proxies SSH to worker instances)
 
 ---
 
@@ -275,9 +289,16 @@ Key considerations for TEE deployment:
 
 ## Ports
 
+### Single-tenant
 - **18789**: Gateway WebSocket and HTTP API
 - **18790**: Browser bridge (if enabled)
-- **2222**: SSH (when `SSH_PUBKEY` is set). Published as `0.0.0.0:2222` so the container is reachable from outside the host.
+- **2222**: SSH (when `SSH_PUBKEY` is set)
+
+### Multi-tenant (management stack)
+- **80**: HTTP (nginx — HTTPS redirect, certbot challenges)
+- **443**: HTTPS (nginx — proxies to compose-api and worker subdomains)
+- **2222**: SSH bastion (proxies to worker instances by instance name)
+- **8080**: Compose API (internal, localhost only behind nginx)
 
 ## Gateway binding and security
 
