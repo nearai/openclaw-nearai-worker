@@ -49,6 +49,10 @@ jobs:
             context: ingress
             dockerfile: ingress/Dockerfile
             build_script: false
+          - name: openclaw-ssh-bastion
+            context: ssh-bastion
+            dockerfile: ssh-bastion/Dockerfile
+            build_script: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
