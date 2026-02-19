@@ -152,13 +152,13 @@ Each instance gets:
   # Run a command
   ssh -p 2222 <instance-name>@<server> ls -la
 
-  # SCP file transfer
-  scp -P 2222 file.txt <instance-name>@<server>:~/
+  # SCP file transfer (use -O for legacy SCP protocol)
+  scp -O -P 2222 file.txt <instance-name>@<server>:~/
   ```
 
 The SSH public key provided during instance creation is used for authentication. The bastion looks up the key from compose-api and proxies the connection to the correct worker container.
 
-**Note:** SFTP is not supported through the bastion. Use SCP instead.
+**Note:** SFTP is not supported through the bastion. Use SCP with `-O` (legacy protocol) instead.
 
 ### HTTPS with nginx and certbot
 
