@@ -4,7 +4,9 @@
 # Must print authorized_keys lines to stdout. Empty output = deny.
 
 INSTANCE_NAME="$1"
-API_URL="http://127.0.0.1:${COMPOSE_API_PORT:-8080}"
+BASTION_DIR="/app/data/bastion"
+API_URL=$(cat "$BASTION_DIR/api-url" 2>/dev/null) || exit 0
+ADMIN_TOKEN=$(cat "$BASTION_DIR/admin-token" 2>/dev/null) || exit 0
 
 RESULT=$(curl -sf "${API_URL}/instances/${INSTANCE_NAME}" \
     -H "Authorization: Bearer ${ADMIN_TOKEN}" 2>/dev/null) || exit 0

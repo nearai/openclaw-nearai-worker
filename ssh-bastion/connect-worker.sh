@@ -3,8 +3,10 @@
 # $USER is the SSH username (instance name).
 # $SSH_ORIGINAL_COMMAND is set when the client ran "ssh host command" or scp.
 
-API_URL="http://127.0.0.1:${COMPOSE_API_PORT:-8080}"
-BASTION_KEY="/app/data/bastion/id_ed25519"
+BASTION_DIR="/app/data/bastion"
+API_URL=$(cat "$BASTION_DIR/api-url" 2>/dev/null)
+ADMIN_TOKEN=$(cat "$BASTION_DIR/admin-token" 2>/dev/null)
+BASTION_KEY="$BASTION_DIR/id_ed25519"
 
 RESULT=$(curl -sf "${API_URL}/instances/${USER}" \
     -H "Authorization: Bearer ${ADMIN_TOKEN}" 2>/dev/null)
