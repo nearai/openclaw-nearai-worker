@@ -9,6 +9,20 @@
         "api": "openai-completions",
         "models": [
           {
+            "id": "zai-org/GLM-5-FP8",
+            "name": "GLM-5",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": {
+              "input": 0.85,
+              "output": 3.3,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 115200,
+            "maxTokens": 8192
+          },
+          {
             "id": "zai-org/GLM-4.7",
             "name": "GLM-4.7",
             "reasoning": true,
@@ -57,12 +71,13 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "nearai/zai-org/GLM-4.7"
+        "primary": "nearai/zai-org/GLM-5-FP8"
       },
       "models": {
-        "nearai/zai-org/GLM-4.7": { "streaming": false, "params": { "temperature": 1.0, "top_p": 0.95 } },
-        "nearai/deepseek-ai/DeepSeek-V3.1": { "streaming": false, "params": { "temperature": 0.7 } },
-        "nearai/Qwen/Qwen3-30B-A3B-Instruct-2507": { "streaming": false, "params": { "temperature": 0.7 } }
+        "nearai/zai-org/GLM-5-FP8": { "params": { "temperature": 1.0, "top_p": 0.95 } },
+        "nearai/zai-org/GLM-4.7": { "params": { "temperature": 1.0, "top_p": 0.95 } },
+        "nearai/deepseek-ai/DeepSeek-V3.1": { "params": { "temperature": 0.7 } },
+        "nearai/Qwen/Qwen3-30B-A3B-Instruct-2507": { "params": { "temperature": 0.7 } }
       },
       "workspace": "/home/agent/openclaw",
       "contextTokens": 115200,

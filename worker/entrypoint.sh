@@ -124,16 +124,30 @@ if [ ! -f /home/agent/.openclaw/openclaw.json ] || [ "${FORCE_REGEN}" = "1" ]; t
 
   # Use envsubst to substitute environment variables in the template
   # OpenClaw supports ${VAR_NAME} syntax natively, so we can use the template directly
+  # Write to tmp file then mv to prevent symlink attacks (entrypoint runs as root,
+  # but /home/agent/.openclaw is agent-owned — a symlink there could overwrite system files)
   if command -v envsubst >/dev/null 2>&1; then
-    envsubst < /app/openclaw.json.template > /home/agent/.openclaw/openclaw.json
+    envsubst < /app/openclaw.json.template > /home/agent/.openclaw/openclaw.json.tmp
   else
     echo "Error: envsubst command not found (gettext-base package required)" >&2
     exit 1
   fi
 
-  chown agent:agent /home/agent/.openclaw/openclaw.json
-  chmod 600 /home/agent/.openclaw/openclaw.json
+  chown agent:agent /home/agent/.openclaw/openclaw.json.tmp
+  chmod 600 /home/agent/.openclaw/openclaw.json.tmp
+  mv -f /home/agent/.openclaw/openclaw.json.tmp /home/agent/.openclaw/openclaw.json
   echo "Config file created at /home/agent/.openclaw/openclaw.json"
+fi
+
+# Generate streaming config if it doesn't exist (separate from openclaw.json to avoid schema conflicts)
+if [ ! -f /home/agent/.openclaw/streaming.json ] || [ "${FORCE_REGEN}" = "1" ]; then
+  if [ -f /app/streaming.json ]; then
+    cp /app/streaming.json /home/agent/.openclaw/streaming.json.tmp
+    chown agent:agent /home/agent/.openclaw/streaming.json.tmp
+    chmod 600 /home/agent/.openclaw/streaming.json.tmp
+    mv -f /home/agent/.openclaw/streaming.json.tmp /home/agent/.openclaw/streaming.json
+    echo "Streaming config created at /home/agent/.openclaw/streaming.json"
+  fi
 fi
 
 # Create workspace directory if it doesn't exist
@@ -246,6 +260,33 @@ chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw
 
 start_auto_approve_daemon
 
+# Config integrity check — restore from template if critical keys are clobbered
+# (e.g., AI agent used config.patch/exec to modify openclaw.json and stripped defaults)
+validate_config() {
+  local cfg="/home/agent/.openclaw/openclaw.json"
+  if [ ! -f "$cfg" ]; then
+    echo "Warning: Config file missing" >&2
+    return 1
+  fi
+  local primary
+  primary=$(jq -r '.agents.defaults.model.primary // empty' "$cfg" 2>/dev/null) || true
+  if [ -z "$primary" ]; then
+    echo "Warning: agents.defaults.model.primary is missing — config may be clobbered" >&2
+    return 1
+  fi
+  return 0
+}
+
+restore_config() {
+  echo "Restoring config from template..."
+  export OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
+  envsubst < /app/openclaw.json.template > /home/agent/.openclaw/openclaw.json.tmp
+  chown agent:agent /home/agent/.openclaw/openclaw.json.tmp
+  chmod 600 /home/agent/.openclaw/openclaw.json.tmp
+  mv -f /home/agent/.openclaw/openclaw.json.tmp /home/agent/.openclaw/openclaw.json
+  echo "Config restored from template"
+}
+
 # Execute the command with automatic restart (openclaw is installed globally)
 # The loop keeps the container alive and restarts the gateway if it exits
 RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
@@ -254,6 +295,10 @@ while true; do
   echo "Starting: $*"
   # Fix ownership before each launch — subdirs may have been created as root
   chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw 2>/dev/null || true
+  # Validate config integrity before each launch
+  if ! validate_config; then
+    restore_config
+  fi
   # The -p flag preserves environment variables (including PATH set in Dockerfile)
   runuser -p -u agent -- "$@" && EXIT_CODE=$? || EXIT_CODE=$?
   echo "Process exited with code $EXIT_CODE. Restarting in ${RESTART_DELAY}s..."

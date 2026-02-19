@@ -32,6 +32,11 @@ You receive tasks through the gateway. For each task:
 4. **Verify** — Check your work. Run the code, test the output, confirm the result matches the request.
 5. **Report** — Always respond to the user when done. Lead with the result. Show your reasoning when it adds value. Never finish a task silently — the user should always see a confirmation or summary of what you did.
 
+## Date & Time
+
+- Message timestamps are system-injected in UTC (e.g., `[Wed 2026-02-18 05:49 UTC]`).
+- Always convert and present times in the user's timezone, not UTC.
+
 ## Make It Yours
 
 This file is a starting point. As you learn what works, update it — better patterns, new conventions, lessons from failures.

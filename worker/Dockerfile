@@ -97,6 +97,7 @@ USER root
 # Copy entrypoint script, config template, and workspace bootstrap files
 COPY entrypoint.sh /app/entrypoint.sh
 COPY openclaw.json.template /app/openclaw.json.template
+COPY streaming.json /app/streaming.json
 COPY workspace/ /app/workspace/
 RUN chmod +x /app/entrypoint.sh
 

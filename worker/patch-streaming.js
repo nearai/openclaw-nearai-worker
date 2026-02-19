@@ -34,10 +34,8 @@ const replacement = `// PATCHED: per-model streaming config
             let _shouldStream = false;
             try {
                 const _fs = require('fs');
-                const _cfg = JSON.parse(_fs.readFileSync('/home/agent/.openclaw/openclaw.json', 'utf8'));
-                const _models = _cfg.agents?.defaults?.models || {};
-                const _modelCfg = _models[params.model] || _models['nearai/' + params.model] || {};
-                if (_modelCfg.streaming === true) _shouldStream = true;
+                const _streamCfg = JSON.parse(_fs.readFileSync('/home/agent/.openclaw/streaming.json', 'utf8'));
+                _shouldStream = (_streamCfg[params.model] ?? _streamCfg['nearai/' + params.model]) === true;
             } catch(_e) { /* config read failed, stay non-streaming */ }
             let openaiStream;
             let currentBlock = null;
