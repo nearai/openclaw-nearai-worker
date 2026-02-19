@@ -18,6 +18,7 @@ services:
       OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND:-lan}
       OPENCLAW_AUTO_APPROVE_DEVICES: ${OPENCLAW_AUTO_APPROVE_DEVICES:-1}
       SSH_PUBKEY: ${SSH_PUBKEY:-}
+      BASTION_SSH_PUBKEY: ${BASTION_SSH_PUBKEY:-}
     command: ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789"]
     volumes:
       - config:/home/agent/.openclaw

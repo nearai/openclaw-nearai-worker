@@ -116,6 +116,8 @@ struct AppConfig {
     nginx_map_path: PathBuf,
     ingress_container_name: String,
     env_override_file: Option<PathBuf>,
+    bastion_ssh_pubkey: Option<String>,
+    bastion_ssh_port: Option<u16>,
 }
 
 impl AppState {
@@ -140,6 +142,7 @@ impl AppState {
         let image = image.to_string();
         let nearai_api_url = nearai_api_url.to_string();
         let service_type = service_type.to_string();
+        let bastion_ssh_pubkey = self.config.bastion_ssh_pubkey.clone();
         tokio::task::spawn_blocking(move || {
             compose.up(&compose::InstanceConfig {
                 name: &name,
@@ -151,6 +154,7 @@ impl AppState {
                 image: &image,
                 nearai_api_url: &nearai_api_url,
                 service_type: &service_type,
+                bastion_ssh_pubkey: bastion_ssh_pubkey.as_deref(),
             })
         })
         .await
@@ -306,6 +310,28 @@ async fn main() -> anyhow::Result<()> {
     let ironclaw_compose_file = std::env::var("IRONCLAW_COMPOSE_FILE")
         .unwrap_or_else(|_| "/app/docker-compose.ironclaw.yml".to_string());
 
+    let bastion_ssh_pubkey = {
+        let path = std::env::var("BASTION_SSH_PUBKEY_PATH")
+            .unwrap_or_else(|_| "/app/data/bastion/id_ed25519.pub".to_string());
+        match std::fs::read_to_string(&path) {
+            Ok(key) => {
+                let key = key.trim().to_string();
+                tracing::info!("Loaded bastion SSH public key from {}", path);
+                Some(key)
+            }
+            Err(_) => {
+                tracing::info!(
+                    "Bastion SSH public key not found at {} (bastion not deployed)",
+                    path
+                );
+                None
+            }
+        }
+    };
+    let bastion_ssh_port: Option<u16> = std::env::var("BASTION_SSH_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok());
+
     let config = Arc::new(AppConfig {
         admin_token: secrecy::SecretString::from(admin_token),
         host_address: std::env::var("OPENCLAW_HOST_ADDRESS")
@@ -323,6 +349,8 @@ async fn main() -> anyhow::Result<()> {
         ingress_container_name: std::env::var("INGRESS_CONTAINER_NAME")
             .unwrap_or_else(|_| "nginx".to_string()),
         env_override_file: std::env::var("ENV_OVERRIDE_FILE").ok().map(PathBuf::from),
+        bastion_ssh_pubkey,
+        bastion_ssh_port,
     });
 
     let mut compose_files = std::collections::HashMap::new();
@@ -341,6 +369,7 @@ async fn main() -> anyhow::Result<()> {
     let compose = Arc::new(ComposeManager::new(
         compose_files,
         std::path::PathBuf::from("data/envs"),
+        config.bastion_ssh_pubkey.clone(),
     )?);
 
     let mut instance_store = InstanceStore::new();
@@ -514,6 +543,7 @@ struct InstanceResponse {
     gateway_port: u16,
     ssh_port: u16,
     ssh_command: String,
+    ssh_pubkey: String,
     image: String,
     image_digest: Option<String>,
     status: String,
@@ -680,8 +710,12 @@ fn generate_urls(
     }
 }
 
-fn generate_ssh_command(config: &AppConfig, ssh_port: u16) -> String {
-    format!("ssh -p {} agent@{}", ssh_port, config.host_address)
+fn generate_ssh_command(config: &AppConfig, name: &str, ssh_port: u16) -> String {
+    if let Some(bastion_port) = config.bastion_ssh_port {
+        format!("ssh -p {} {}@{}", bastion_port, name, config.host_address)
+    } else {
+        format!("ssh -p {} agent@{}", ssh_port, config.host_address)
+    }
 }
 
 // ── SSE helpers ──────────────────────────────────────────────────────
@@ -880,7 +914,7 @@ async fn create_instance(
     };
 
     let (url, dashboard_url) = generate_urls(&state.config, &name, gateway_port, &token);
-    let ssh_command = generate_ssh_command(&state.config, ssh_port);
+    let ssh_command = generate_ssh_command(&state.config, &name, ssh_port);
 
     let info = InstanceInfo {
         name: name.clone(),
@@ -993,19 +1027,20 @@ async fn get_instance(
             let status = state.compose_status(&inst.name, inst.service_type.as_deref()).await?;
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
-            let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
+            let ssh_command = generate_ssh_command(&state.config, &inst.name, inst.ssh_port);
             let image = inst
                 .image
                 .clone()
                 .unwrap_or_else(|| state.config.openclaw_image.clone());
             Ok(Json(InstanceResponse {
-                name: inst.name,
+                name: inst.name.clone(),
                 token: inst.token,
                 url,
                 dashboard_url,
                 gateway_port: inst.gateway_port,
                 ssh_port: inst.ssh_port,
                 ssh_command,
+                ssh_pubkey: inst.ssh_pubkey,
                 image,
                 image_digest: inst.image_digest.clone(),
                 status,
@@ -1040,19 +1075,20 @@ async fn list_instances(
             .unwrap_or_else(|_| "unknown".to_string());
         let (url, dashboard_url) =
             generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
-        let ssh_command = generate_ssh_command(&state.config, inst.ssh_port);
+        let ssh_command = generate_ssh_command(&state.config, &inst.name, inst.ssh_port);
         let image = inst
             .image
             .clone()
             .unwrap_or_else(|| state.config.openclaw_image.clone());
         responses.push(InstanceResponse {
-            name: inst.name,
+            name: inst.name.clone(),
             token: inst.token,
             url,
             dashboard_url,
             gateway_port: inst.gateway_port,
             ssh_port: inst.ssh_port,
             ssh_command,
+            ssh_pubkey: inst.ssh_pubkey,
             image,
             image_digest: inst.image_digest.clone(),
             status,
@@ -1779,6 +1815,8 @@ impl AppConfig {
             nginx_map_path: PathBuf::from("/tmp/test.map"),
             ingress_container_name: "test-ingress".to_string(),
             env_override_file: None,
+            bastion_ssh_pubkey: None,
+            bastion_ssh_port: None,
         }
     }
 }
@@ -1919,8 +1957,16 @@ mod tests {
     #[test]
     fn test_generate_ssh_command() {
         let config = AppConfig::test_default();
-        let cmd = generate_ssh_command(&config, 19002);
+        let cmd = generate_ssh_command(&config, "brave-tiger", 19002);
         assert_eq!(cmd, "ssh -p 19002 agent@localhost");
+    }
+
+    #[test]
+    fn test_generate_ssh_command_with_bastion() {
+        let mut config = AppConfig::test_default();
+        config.bastion_ssh_port = Some(2222);
+        let cmd = generate_ssh_command(&config, "brave-tiger", 19002);
+        assert_eq!(cmd, "ssh -p 2222 brave-tiger@localhost");
     }
 
     // ── is_valid_instance_name ───────────────────────────────────────
