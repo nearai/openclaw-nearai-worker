@@ -23,7 +23,7 @@ if [ -z "$SSH_PORT" ]; then
     exit 1
 fi
 
-SSH_OPTS="-i ${BASTION_KEY} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p ${SSH_PORT}"
+SSH_OPTS="-i ${BASTION_KEY} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o EscapeChar=none -p ${SSH_PORT}"
 
 if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
     # Remote command or scp
