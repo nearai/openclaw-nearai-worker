@@ -32,6 +32,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/run/dstack.sock:/var/run/dstack.sock
       - management-data:/app/data
+      - bastion-data:/app/data/bastion:ro
       - nginx-dynamic:/data/nginx
       - cert-data:/etc/letsencrypt
     environment:
@@ -64,7 +65,7 @@ services:
     image: ${BASTION_IMAGE:-openclaw-ssh-bastion:local}
     network_mode: host
     volumes:
-      - management-data:/app/data
+      - bastion-data:/app/data/bastion
     environment:
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - BASTION_SSH_PORT=${BASTION_SSH_PORT:-2222}
@@ -170,4 +171,5 @@ volumes:
   cert-data:
   nginx-dynamic:
   management-data:
+  bastion-data:
   compose-files:
