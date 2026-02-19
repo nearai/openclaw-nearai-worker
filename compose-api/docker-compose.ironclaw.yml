@@ -14,6 +14,7 @@ services:
       NEARAI_API_URL: ${NEARAI_API_URL:-https://cloud-api.near.ai/v1}
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
       SSH_PUBKEY: ${SSH_PUBKEY:-}
+      BASTION_SSH_PUBKEY: ${BASTION_SSH_PUBKEY:-}
     volumes:
       - config:/home/agent/.ironclaw
       - workspace:/home/agent/workspace

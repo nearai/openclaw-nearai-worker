@@ -23,6 +23,7 @@ pub struct InstanceConfig<'a> {
     pub image: &'a str,
     pub nearai_api_url: &'a str,
     pub service_type: &'a str,
+    pub bastion_ssh_pubkey: Option<&'a str>,
 }
 
 /// Manages one Docker Compose project per worker via the `docker compose` CLI.
@@ -31,10 +32,16 @@ pub struct ComposeManager {
     compose_files: HashMap<String, PathBuf>,
     /// Directory where per-instance .env files are written (e.g. data/envs/).
     env_dir: PathBuf,
+    /// SSH public key of the bastion host (injected into worker authorized_keys).
+    bastion_ssh_pubkey: Option<String>,
 }
 
 impl ComposeManager {
-    pub fn new(compose_files: HashMap<String, PathBuf>, env_dir: PathBuf) -> Result<Self, ApiError> {
+    pub fn new(
+        compose_files: HashMap<String, PathBuf>,
+        env_dir: PathBuf,
+        bastion_ssh_pubkey: Option<String>,
+    ) -> Result<Self, ApiError> {
         // Ensure the env directory exists
         std::fs::create_dir_all(&env_dir)
             .map_err(|e| ApiError::Internal(format!("Failed to create env dir: {}", e)))?;
@@ -59,6 +66,7 @@ impl ComposeManager {
         Ok(Self {
             compose_files,
             env_dir,
+            bastion_ssh_pubkey,
         })
     }
 
@@ -120,6 +128,9 @@ impl ComposeManager {
         vars.insert("SSH_PORT".into(), cfg.ssh_port.to_string());
         vars.insert("OPENCLAW_IMAGE".into(), cfg.image.to_string());
         vars.insert("SSH_PUBKEY".into(), cfg.ssh_pubkey.into());
+        if let Some(bastion_key) = cfg.bastion_ssh_pubkey {
+            vars.insert("BASTION_SSH_PUBKEY".into(), bastion_key.into());
+        }
         vars.insert("SERVICE_TYPE".into(), cfg.service_type.to_string());
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
@@ -495,6 +506,9 @@ impl ComposeManager {
         vars.insert("GATEWAY_PORT".into(), inst.gateway_port.to_string());
         vars.insert("SSH_PORT".into(), inst.ssh_port.to_string());
         vars.insert("SSH_PUBKEY".into(), inst.ssh_pubkey.clone());
+        if let Some(ref bastion_key) = self.bastion_ssh_pubkey {
+            vars.insert("BASTION_SSH_PUBKEY".into(), bastion_key.clone());
+        }
         if let Some(ref image) = inst.image {
             vars.insert("OPENCLAW_IMAGE".into(), image.clone());
         }
