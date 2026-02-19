@@ -23,7 +23,6 @@ use utoipa_scalar::{Scalar, Servable};
 
 mod backup;
 mod compose;
-mod dns;
 mod error;
 mod names;
 mod nginx_conf;
@@ -31,7 +30,6 @@ mod store;
 
 use backup::BackupManager;
 use compose::{ComposeManager, DEFAULT_NEARAI_API_URL};
-use dns::CloudflareDns;
 use error::ApiError;
 use store::{Instance, InstanceStore};
 
@@ -105,7 +103,6 @@ struct AppState {
     compose: Arc<ComposeManager>,
     store: Arc<RwLock<InstanceStore>>,
     config: Arc<AppConfig>,
-    dns: Option<Arc<CloudflareDns>>,
     backup: Option<Arc<BackupManager>>,
 }
 
@@ -116,8 +113,6 @@ struct AppConfig {
     openclaw_image: String,
     ironclaw_image: String,
     compose_file: std::path::PathBuf,
-    dstack_app_id: Option<String>,
-    dstack_gateway_base: Option<String>,
     nginx_map_path: PathBuf,
     ingress_container_name: String,
     env_override_file: Option<PathBuf>,
@@ -311,18 +306,6 @@ async fn main() -> anyhow::Result<()> {
     let ironclaw_compose_file = std::env::var("IRONCLAW_COMPOSE_FILE")
         .unwrap_or_else(|_| "/app/docker-compose.ironclaw.yml".to_string());
 
-    let dstack_app_id = fetch_dstack_app_id().await;
-    if let Some(ref app_id) = dstack_app_id {
-        tracing::info!("dstack APP_ID: {}", app_id);
-    }
-
-    let dstack_gateway_base = std::env::var("GATEWAY_DOMAIN")
-        .ok()
-        .and_then(|d| d.split_once('.').map(|(_, base)| base.to_string()));
-    if let Some(ref base) = dstack_gateway_base {
-        tracing::info!("dstack gateway base: {}", base);
-    }
-
     let config = Arc::new(AppConfig {
         admin_token: secrecy::SecretString::from(admin_token),
         host_address: std::env::var("OPENCLAW_HOST_ADDRESS")
@@ -333,32 +316,14 @@ async fn main() -> anyhow::Result<()> {
         ironclaw_image: std::env::var("IRONCLAW_IMAGE")
             .unwrap_or_else(|_| "ironclaw-nearai-worker:local".to_string()),
         compose_file: std::path::PathBuf::from(&compose_file),
-        dstack_app_id,
-        dstack_gateway_base,
         nginx_map_path: PathBuf::from(
             std::env::var("NGINX_MAP_PATH")
                 .unwrap_or_else(|_| "/data/nginx/backends.map".to_string()),
         ),
         ingress_container_name: std::env::var("INGRESS_CONTAINER_NAME")
-            .unwrap_or_else(|_| "dstack-ingress".to_string()),
+            .unwrap_or_else(|_| "nginx".to_string()),
         env_override_file: std::env::var("ENV_OVERRIDE_FILE").ok().map(PathBuf::from),
     });
-
-    let dns = match (
-        std::env::var("CLOUDFLARE_API_TOKEN").ok(),
-        std::env::var("CLOUDFLARE_ZONE_ID").ok(),
-    ) {
-        (Some(token), Some(zone_id)) => {
-            tracing::info!("Cloudflare DNS client initialized");
-            Some(Arc::new(CloudflareDns::new(&token, &zone_id)))
-        }
-        _ => {
-            tracing::info!(
-                "Cloudflare DNS not configured (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ZONE_ID not set)"
-            );
-            None
-        }
-    };
 
     let mut compose_files = std::collections::HashMap::new();
     compose_files.insert("openclaw".to_string(), config.compose_file.clone());
@@ -416,22 +381,10 @@ async fn main() -> anyhow::Result<()> {
         compose,
         store,
         config,
-        dns,
         backup,
     };
 
     update_nginx_now(&state).await;
-
-    // Ensure the "api" subdomain DNS record exists so the dstack gateway routes to us
-    if let (Some(ref dns), Some(ref domain), Some(ref app_id)) = (
-        &state.dns,
-        &state.config.openclaw_domain,
-        &state.config.dstack_app_id,
-    ) {
-        if let Err(e) = dns.ensure_txt_record("api", domain, app_id, 443).await {
-            tracing::warn!("Failed to create DNS record for api.{}: {}", domain, e);
-        }
-    }
 
     if state.config.openclaw_domain.is_some() {
         let sync_state = state.clone();
@@ -727,16 +680,8 @@ fn generate_urls(
     }
 }
 
-/// Generate SSH command — uses TLS-tunneled proxy through dstack gateway when available,
-/// otherwise falls back to direct SSH.
 fn generate_ssh_command(config: &AppConfig, ssh_port: u16) -> String {
-    match (&config.dstack_app_id, &config.dstack_gateway_base) {
-        (Some(app_id), Some(base)) => format!(
-            "ssh -o ProxyCommand=\"openssl s_client -quiet -connect %h:443 -servername %h\" agent@{}-{}.{}",
-            app_id, ssh_port, base
-        ),
-        _ => format!("ssh -p {} agent@{}", ssh_port, config.host_address),
-    }
+    format!("ssh -p {} agent@{}", ssh_port, config.host_address)
 }
 
 // ── SSE helpers ──────────────────────────────────────────────────────
@@ -996,15 +941,6 @@ async fn create_instance(
         yield Ok(sse_stage("configuring_routing", "Updating nginx routing table..."));
         update_nginx_now(&state).await;
 
-        yield Ok(sse_stage("updating_dns", "Creating DNS record for subdomain..."));
-        if let (Some(ref dns), Some(ref domain), Some(ref app_id)) =
-            (&state.dns, &state.config.openclaw_domain, &state.config.dstack_app_id)
-        {
-            if let Err(e) = dns.ensure_txt_record(&name, domain, app_id, 443).await {
-                tracing::warn!("Failed to create DNS record for {}: {}", name, e);
-            }
-        }
-
         // Resolve the image digest now that the container is running
         let image_digest = state.compose_resolve_image_digest(&name).await;
         if let Some(ref digest) = image_digest {
@@ -1150,12 +1086,6 @@ async fn delete_instance(
     let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
     state.compose_down(&name, inst.service_type.as_deref()).await?;
-
-    if let (Some(ref dns), Some(ref domain)) = (&state.dns, &state.config.openclaw_domain) {
-        if let Err(e) = dns.delete_txt_record(&name, domain).await {
-            tracing::warn!("Failed to delete DNS record for {}: {}", name, e);
-        }
-    }
 
     {
         let mut store = state.store.write().await;
@@ -1835,41 +1765,6 @@ async fn fetch_dstack_quote(report_data: &[u8; 64]) -> Result<serde_json::Value,
     })
 }
 
-async fn fetch_dstack_app_id() -> Option<String> {
-    let sock_path = "/var/run/dstack.sock";
-    if !std::path::Path::new(sock_path).exists() {
-        tracing::info!("dstack.sock not found, skipping APP_ID fetch");
-        return None;
-    }
-
-    let output = tokio::process::Command::new("curl")
-        .args(["--unix-socket", sock_path, "-s", "http://localhost/Info"])
-        .output()
-        .await;
-
-    match output {
-        Ok(o) if o.status.success() => {
-            let body = String::from_utf8_lossy(&o.stdout);
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(app_id) = v.get("app_id").and_then(|v| v.as_str()) {
-                    return Some(app_id.to_string());
-                }
-            }
-            tracing::warn!("dstack /Info response missing app_id: {}", body);
-            None
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            tracing::warn!("Failed to fetch dstack APP_ID: {}", stderr);
-            None
-        }
-        Err(e) => {
-            tracing::warn!("Failed to run curl for dstack APP_ID: {}", e);
-            None
-        }
-    }
-}
-
 // Expose AppConfig fields for generate_urls/generate_ssh_command tests
 #[cfg(test)]
 impl AppConfig {
@@ -1881,8 +1776,6 @@ impl AppConfig {
             openclaw_image: "test:local".to_string(),
             ironclaw_image: "ironclaw-test:local".to_string(),
             compose_file: std::path::PathBuf::from("/dev/null"),
-            dstack_app_id: None,
-            dstack_gateway_base: None,
             nginx_map_path: PathBuf::from("/tmp/test.map"),
             ingress_container_name: "test-ingress".to_string(),
             env_override_file: None,
@@ -1895,9 +1788,6 @@ async fn background_sync_loop(state: AppState) {
         Some(d) => d.clone(),
         None => return,
     };
-
-    let mut dns_tick: u32 = 0;
-    const DNS_SYNC_INTERVAL: u32 = 12;
 
     // Scheduled backups every 6 hours (6 * 60 * 60 / 5 = 4320 ticks at 5s interval)
     let mut backup_tick: u32 = 0;
@@ -1917,17 +1807,6 @@ async fn background_sync_loop(state: AppState) {
             nginx_conf::write_backends_map(&instances, &domain, &state.config.nginx_map_path);
         if changed {
             nginx_conf::reload_nginx(&state.config.ingress_container_name);
-        }
-
-        dns_tick += 1;
-        if dns_tick >= DNS_SYNC_INTERVAL {
-            dns_tick = 0;
-            if let (Some(ref dns), Some(ref app_id)) = (&state.dns, &state.config.dstack_app_id) {
-                let names: Vec<String> = instances.iter().map(|i| i.name.clone()).collect();
-                if let Err(e) = dns.sync_all_records(&names, &domain, app_id, 443).await {
-                    tracing::warn!("DNS sync failed: {}", e);
-                }
-            }
         }
 
         backup_tick += 1;
@@ -2038,20 +1917,10 @@ mod tests {
     // ── generate_ssh_command ─────────────────────────────────────────
 
     #[test]
-    fn test_generate_ssh_command_without_dstack() {
+    fn test_generate_ssh_command() {
         let config = AppConfig::test_default();
         let cmd = generate_ssh_command(&config, 19002);
         assert_eq!(cmd, "ssh -p 19002 agent@localhost");
-    }
-
-    #[test]
-    fn test_generate_ssh_command_with_dstack() {
-        let mut config = AppConfig::test_default();
-        config.dstack_app_id = Some("app123".to_string());
-        config.dstack_gateway_base = Some("gw.example.com".to_string());
-        let cmd = generate_ssh_command(&config, 19002);
-        assert!(cmd.contains("app123-19002.gw.example.com"));
-        assert!(cmd.contains("ProxyCommand"));
     }
 
     // ── is_valid_instance_name ───────────────────────────────────────
