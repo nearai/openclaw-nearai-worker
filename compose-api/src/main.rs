@@ -711,7 +711,8 @@ fn generate_urls(
 }
 
 fn generate_ssh_command(config: &AppConfig, name: &str, ssh_port: u16) -> String {
-    format!("ssh -p {} {}@{}", ssh_port, name, config.host_address)
+    let host = config.openclaw_domain.as_deref().unwrap_or(&config.host_address);
+    format!("ssh -p {} {}@{}", ssh_port, name, host)
 }
 
 // ── SSE helpers ──────────────────────────────────────────────────────
@@ -1963,6 +1964,14 @@ mod tests {
         config.bastion_ssh_port = Some(2222);
         let cmd = generate_ssh_command(&config, "brave-tiger", 19002);
         assert_eq!(cmd, "ssh -p 19002 brave-tiger@localhost");
+    }
+
+    #[test]
+    fn test_generate_ssh_command_with_domain() {
+        let mut config = AppConfig::test_default();
+        config.openclaw_domain = Some("agent0.near.ai".into());
+        let cmd = generate_ssh_command(&config, "brave-tiger", 19002);
+        assert_eq!(cmd, "ssh -p 19002 brave-tiger@agent0.near.ai");
     }
 
     // ── is_valid_instance_name ───────────────────────────────────────
