@@ -9,8 +9,11 @@ permissions:
   actions: write
 
 jobs:
-  ironclaw:
+  check-ironclaw:
     runs-on: ubuntu-latest
+    outputs:
+      new_release: ${{ steps.cache.outputs.cache-hit != 'true' }}
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - name: Get latest ironclaw release tag
         id: release
@@ -28,17 +31,16 @@ jobs:
           path: .ironclaw-release-marker
           key: ironclaw-release-${{ steps.release.outputs.tag }}
 
-      - name: Trigger build for new release
+      - name: Save marker for cache
         if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          echo "${{ steps.release.outputs.tag }}" > .ironclaw-release-marker
-          gh workflow run build.yml --repo ${{ github.repository }}
-          echo "Triggered build for ironclaw ${{ steps.release.outputs.tag }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${{ steps.release.outputs.tag }}" > .ironclaw-release-marker
 
-  openclaw:
+  check-openclaw:
     runs-on: ubuntu-latest
+    outputs:
+      new_release: ${{ steps.cache.outputs.cache-hit != 'true' }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Get latest openclaw release tag
         id: release
@@ -58,12 +60,26 @@ jobs:
           path: .openclaw-release-marker
           key: openclaw-release-${{ steps.release.outputs.tag }}
 
-      - name: Trigger build for new release
+      - name: Save marker for cache
         if: steps.cache.outputs.cache-hit != 'true'
+        run: echo "${{ steps.release.outputs.tag }}" > .openclaw-release-marker
+
+  trigger-build:
+    needs: [check-ironclaw, check-openclaw]
+    if: needs.check-ironclaw.outputs.new_release == 'true' || needs.check-openclaw.outputs.new_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger single build
         run: |
-          echo "${{ steps.release.outputs.tag }}" > .openclaw-release-marker
-          gh workflow run build.yml --repo ${{ github.repository }} \
-            -f openclaw_version=${{ steps.release.outputs.version }}
-          echo "Triggered build for openclaw ${{ steps.release.outputs.tag }}"
+          ARGS=""
+          if [[ "${{ needs.check-openclaw.outputs.new_release }}" == "true" ]]; then
+            ARGS="-f openclaw_version=${{ needs.check-openclaw.outputs.version }}"
+          fi
+
+          gh workflow run build.yml --repo ${{ github.repository }} $ARGS
+
+          echo "Triggered build (ironclaw=${{ needs.check-ironclaw.outputs.new_release }}, openclaw=${{ needs.check-openclaw.outputs.new_release }})"
+          [[ "${{ needs.check-ironclaw.outputs.new_release }}" == "true" ]] && echo "  ironclaw: ${{ needs.check-ironclaw.outputs.tag }}"
+          [[ "${{ needs.check-openclaw.outputs.new_release }}" == "true" ]] && echo "  openclaw: ${{ needs.check-openclaw.outputs.tag }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
