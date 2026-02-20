@@ -74,6 +74,9 @@ export GATEWAY_AUTH_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-changeme}"
 # Disable interactive REPL (no TTY in container; would cause immediate shutdown)
 export CLI_ENABLED=false
 
+# Disable Docker sandbox (no Docker-in-Docker in this environment)
+export SANDBOX_ENABLED=false
+
 # NEAR AI: map compose-api env vars to IronClaw config
 NEARAI_API_URL="${NEARAI_API_URL:-https://cloud-api.near.ai/v1}"
 # Strip trailing /v1 — IronClaw's NEARAI_BASE_URL is the root (it adds /v1 internally)
