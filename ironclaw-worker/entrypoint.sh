@@ -92,6 +92,21 @@ fi
 # Model: default to "auto" for auto-routing (provider is nearai, model is auto)
 export NEARAI_MODEL="${NEARAI_MODEL:-auto}"
 
+# Secrets store: generate-once master key for AES-256-GCM encryption of channel credentials.
+# Persisted on the config volume so it survives container restarts (key and DB are a pair).
+MASTER_KEY_FILE="/home/agent/.ironclaw/.master_key"
+if [ -z "${SECRETS_MASTER_KEY:-}" ]; then
+    if [ -f "$MASTER_KEY_FILE" ]; then
+        SECRETS_MASTER_KEY=$(cat "$MASTER_KEY_FILE")
+    else
+        SECRETS_MASTER_KEY=$(openssl rand -hex 32)
+        echo "$SECRETS_MASTER_KEY" > "$MASTER_KEY_FILE"
+        chmod 600 "$MASTER_KEY_FILE"
+        chown root:root "$MASTER_KEY_FILE"
+    fi
+    export SECRETS_MASTER_KEY
+fi
+
 export RUST_LOG="${RUST_LOG:-ironclaw=info}"
 
 # ============================================
@@ -113,6 +128,13 @@ fi
 # Final Ownership Fix
 # ============================================
 chown -R agent:agent /home/agent/.ironclaw /home/agent/workspace
+
+# Lock master key so the agent user (and AI shell tool) cannot read it.
+# The ironclaw process inherits SECRETS_MASTER_KEY via env (scrubbed from AI shell).
+if [ -f "$MASTER_KEY_FILE" ]; then
+    chown root:root "$MASTER_KEY_FILE"
+    chmod 600 "$MASTER_KEY_FILE"
+fi
 
 # ============================================
 # Start IronClaw with auto-restart
