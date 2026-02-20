@@ -26,7 +26,7 @@ RUN apt-get update && \
       && rm -rf /var/lib/apt/lists/*
 
 # Download prebuilt IronClaw binary from GitHub release
-ARG IRONCLAW_VERSION
+ARG IRONCLAW_VERSION=0.8.0
 RUN curl -fsSL "https://github.com/nearai/ironclaw/releases/download/ironclaw-v${IRONCLAW_VERSION}/ironclaw-x86_64-unknown-linux-gnu.tar.gz" \
     | tar xz -C /usr/local/bin/ ironclaw
 
