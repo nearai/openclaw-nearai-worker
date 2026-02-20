@@ -711,11 +711,7 @@ fn generate_urls(
 }
 
 fn generate_ssh_command(config: &AppConfig, name: &str, ssh_port: u16) -> String {
-    if let Some(bastion_port) = config.bastion_ssh_port {
-        format!("ssh -p {} {}@{}", bastion_port, name, config.host_address)
-    } else {
-        format!("ssh -p {} agent@{}", ssh_port, config.host_address)
-    }
+    format!("ssh -p {} {}@{}", ssh_port, name, config.host_address)
 }
 
 // ── SSE helpers ──────────────────────────────────────────────────────
@@ -1958,7 +1954,7 @@ mod tests {
     fn test_generate_ssh_command() {
         let config = AppConfig::test_default();
         let cmd = generate_ssh_command(&config, "brave-tiger", 19002);
-        assert_eq!(cmd, "ssh -p 19002 agent@localhost");
+        assert_eq!(cmd, "ssh -p 19002 brave-tiger@localhost");
     }
 
     #[test]
@@ -1966,7 +1962,7 @@ mod tests {
         let mut config = AppConfig::test_default();
         config.bastion_ssh_port = Some(2222);
         let cmd = generate_ssh_command(&config, "brave-tiger", 19002);
-        assert_eq!(cmd, "ssh -p 2222 brave-tiger@localhost");
+        assert_eq!(cmd, "ssh -p 19002 brave-tiger@localhost");
     }
 
     // ── is_valid_instance_name ───────────────────────────────────────
