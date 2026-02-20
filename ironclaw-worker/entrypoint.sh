@@ -82,13 +82,15 @@ NEARAI_API_URL="${NEARAI_API_URL:-https://cloud-api.near.ai/v1}"
 # Strip trailing /v1 — IronClaw's NEARAI_BASE_URL is the root (it adds /v1 internally)
 export NEARAI_BASE_URL="${NEARAI_API_URL%/v1}"
 
-# Map NEARAI_API_KEY to session token (IronClaw picks up NEARAI_SESSION_TOKEN
-# on startup and saves it to ~/.ironclaw/session.json)
+# Pass the API key directly (IronClaw auto-selects ChatCompletions mode when NEARAI_API_KEY is set)
 if [ -n "${NEARAI_API_KEY:-}" ]; then
-    export NEARAI_SESSION_TOKEN="${NEARAI_API_KEY}"
+    export NEARAI_API_KEY="${NEARAI_API_KEY}"
 else
     echo "Warning: NEARAI_API_KEY not set. IronClaw may not function correctly." >&2
 fi
+
+# Model: default to "auto" for auto-routing (provider is nearai, model is auto)
+export NEARAI_MODEL="${NEARAI_MODEL:-auto}"
 
 export RUST_LOG="${RUST_LOG:-ironclaw=info}"
 
@@ -118,6 +120,8 @@ chown -R agent:agent /home/agent/.ironclaw /home/agent/workspace
 RESTART_DELAY="${IRONCLAW_RESTART_DELAY:-5}"
 MAX_FAILURES="${IRONCLAW_MAX_FAILURES:-10}"
 FAILURE_COUNT=0
+
+export HOME=/home/agent
 
 while true; do
     echo "Starting IronClaw..."
