@@ -49,9 +49,14 @@ fi
 git rev-parse HEAD > .GIT_REV
 
 TEMP_TAG="openclaw-nearai-worker-temp:$(date +%s)"
+BUILD_ARGS=(--build-arg SOURCE_DATE_EPOCH="0")
+if [ -n "${OPENCLAW_VERSION:-}" ]; then
+    BUILD_ARGS+=(--build-arg "OPENCLAW_VERSION=${OPENCLAW_VERSION}")
+fi
+
 docker buildx build --builder buildkit_20 --no-cache --platform linux/amd64 \
     -f worker/Dockerfile \
-    --build-arg SOURCE_DATE_EPOCH="0" \
+    "${BUILD_ARGS[@]}" \
     --output type=oci,dest=./oci.tar,rewrite-timestamp=true \
     --output type=docker,name="$TEMP_TAG",rewrite-timestamp=true ./worker
 
