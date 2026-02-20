@@ -4,8 +4,6 @@
 #   docker build --build-arg IRONCLAW_VERSION=0.8.0 \
 #     -t ironclaw-nearai-worker:local ironclaw-worker/
 
-ARG IRONCLAW_VERSION=0.8.0
-
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
