@@ -6,6 +6,10 @@ on:
         description: 'Image tag override (default: branch-based)'
         required: false
         type: string
+      openclaw_version:
+        description: 'OpenClaw npm version for worker image (default: Dockerfile ARG)'
+        required: false
+        type: string
   push:
     branches:
       - main
@@ -108,6 +112,8 @@ jobs:
         if: matrix.build_script
         run: |
           ./deploy/build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
+        env:
+          OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
 
       - name: Get image digest (reproducible)
         if: matrix.build_script

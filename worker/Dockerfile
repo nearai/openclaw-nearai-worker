@@ -75,8 +75,9 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.openclaw /home/agent/
 # Install pnpm, bun, and OpenClaw as agent user so they go to /home/agent/.npm-global/bin
 # This ensures they are in the agent user's PATH (npm config is set in the same RUN instruction below)
 USER agent
+ARG OPENCLAW_VERSION=2026.2.15
 RUN npm config set prefix "/home/agent/.npm-global" && \
-    npm install -g pnpm bun openclaw@2026.2.15 && \
+    npm install -g pnpm bun openclaw@${OPENCLAW_VERSION} && \
     /home/agent/.npm-global/bin/pnpm setup
 
 # Workaround: NEAR AI streaming bug truncates tool call arguments.

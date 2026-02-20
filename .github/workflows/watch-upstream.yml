@@ -1,0 +1,66 @@
+name: Watch Upstream Releases
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ironclaw:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get latest ironclaw release tag
+        id: release
+        run: |
+          TAG=$(gh release view --repo nearai/ironclaw --json tagName -q '.tagName')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest ironclaw release: $TAG"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Check if already built
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .ironclaw-release-marker
+          key: ironclaw-release-${{ steps.release.outputs.tag }}
+
+      - name: Trigger build for new release
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          echo "${{ steps.release.outputs.tag }}" > .ironclaw-release-marker
+          gh workflow run build.yml --repo ${{ github.repository }}
+          echo "Triggered build for ironclaw ${{ steps.release.outputs.tag }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  openclaw:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get latest openclaw release tag
+        id: release
+        run: |
+          TAG=$(gh release view --repo openclaw/openclaw --json tagName -q '.tagName')
+          VERSION=${TAG#v}
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Latest openclaw release: $TAG (version $VERSION)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Check if already built
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .openclaw-release-marker
+          key: openclaw-release-${{ steps.release.outputs.tag }}
+
+      - name: Trigger build for new release
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          echo "${{ steps.release.outputs.tag }}" > .openclaw-release-marker
+          gh workflow run build.yml --repo ${{ github.repository }} \
+            -f openclaw_version=${{ steps.release.outputs.version }}
+          echo "Triggered build for openclaw ${{ steps.release.outputs.tag }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
