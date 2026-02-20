@@ -5,6 +5,9 @@ on:
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
+permissions:
+  actions: write
+
 jobs:
   ironclaw:
     runs-on: ubuntu-latest
