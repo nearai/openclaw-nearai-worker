@@ -1,51 +1,9 @@
 # IronClaw worker image for compose-api deployment.
 #
-# Requires BuildKit named contexts (ironclaw source provided externally):
-#   docker buildx build \
-#     --build-context ironclaw=./ironclaw \
-#     -t ironclaw-nearai-worker:local \
-#     openclaw-nearai-worker/ironclaw-worker/
+# Downloads a prebuilt binary from GitHub releases:
+#   docker build --build-arg IRONCLAW_VERSION=0.8.0 \
+#     -t ironclaw-nearai-worker:local ironclaw-worker/
 
-# ── Stage 1: Build IronClaw with libSQL ──────────────────────────────
-FROM rust:1.92-slim-bookworm AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev cmake gcc g++ make \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Copy manifests and build script for dependency caching
-COPY --from=ironclaw Cargo.toml Cargo.lock* build.rs ./
-
-# Stub workspace members and examples for dependency caching
-# (ironclaw's Cargo.toml declares benchmarks as a workspace member)
-COPY --from=ironclaw benchmarks/Cargo.toml benchmarks/Cargo.toml
-RUN mkdir -p src examples benchmarks/src && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "fn main() {}" > examples/test_heartbeat.rs && \
-    echo "fn main() {}" > benchmarks/src/main.rs
-RUN cargo build --release --no-default-features --features libsql --bin ironclaw 2>/dev/null || true
-RUN rm -rf src examples benchmarks/src
-
-# Bust cache for fresh code
-ARG CACHEBUST=0
-RUN echo "cachebust=$CACHEBUST"
-
-# Copy actual source and WIT files (needed by wasmtime::component::bindgen!)
-COPY --from=ironclaw src ./src
-COPY --from=ironclaw wit ./wit
-
-# Stub workspace members and examples that aren't needed for the binary build
-RUN mkdir -p examples benchmarks/src && \
-    echo "fn main() {}" > examples/test_heartbeat.rs && \
-    echo "fn main() {}" > benchmarks/src/main.rs
-
-# Build the real binary
-RUN touch src/main.rs && \
-    cargo build --release --no-default-features --features libsql --bin ironclaw
-
-# ── Stage 2: Runtime ─────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
@@ -67,8 +25,10 @@ RUN apt-get update && \
       && apt-get clean \
       && rm -rf /var/lib/apt/lists/*
 
-# Copy IronClaw binary
-COPY --from=builder /app/target/release/ironclaw /usr/local/bin/ironclaw
+# Download prebuilt IronClaw binary from GitHub release
+ARG IRONCLAW_VERSION
+RUN curl -fsSL "https://github.com/nearai/ironclaw/releases/download/ironclaw-v${IRONCLAW_VERSION}/ironclaw-x86_64-unknown-linux-gnu.tar.gz" \
+    | tar xz -C /usr/local/bin/ ironclaw
 
 # Create non-root user (UID 1001, matching OpenClaw worker pattern)
 RUN useradd -m -u 1001 -s /bin/bash agent && \
