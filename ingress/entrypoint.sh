@@ -37,4 +37,4 @@ certbot certonly \
 ) &
 
 # Start nginx in foreground
-exec nginx -g "worker_processes 8; daemon off;"
+exec nginx -g "daemon off;"
