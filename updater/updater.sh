@@ -3,12 +3,7 @@ set -euo pipefail
 
 # ── Configuration (all from environment) ──────────────────────────────
 
-# Soft defaults — allow empty during chicken-and-egg transition
 COMPOSE_API_IMAGE="${UPDATER_COMPOSE_API_IMAGE:-}"
-WORKER_IMAGE="${UPDATER_WORKER_IMAGE:-}"
-IRONCLAW_IMAGE_VAR="${UPDATER_IRONCLAW_IMAGE:-}"
-INGRESS_IMAGE_VAR="${UPDATER_INGRESS_IMAGE:-}"
-BASTION_IMAGE_VAR="${UPDATER_BASTION_IMAGE:-}"
 CHANNEL="${UPDATER_CHANNEL:-latest}"
 POLL_INTERVAL="${UPDATER_POLL_INTERVAL:-300}"
 COMPOSE_FILE="${UPDATER_COMPOSE_FILE:?UPDATER_COMPOSE_FILE is required}"
@@ -17,6 +12,15 @@ BASE_ENV_FILE="${UPDATER_BASE_ENV_FILE:-}"
 COMPOSE_PROJECT="${UPDATER_COMPOSE_PROJECT:-}"
 COSIGN_IDENTITY="${UPDATER_COSIGN_IDENTITY_REGEXP:-}"
 HOST_DEPLOY_DIR="${UPDATER_HOST_DEPLOY_DIR:-}"
+
+# Image repo globals — resolved each poll cycle by resolve_image_repos()
+WORKER_IMAGE=""
+IRONCLAW_IMAGE_VAR=""
+INGRESS_IMAGE_VAR=""
+BASTION_IMAGE_VAR=""
+
+# Poll cycle counter (global so _poll_cycle can increment it)
+POLL_CYCLE=0
 
 # Auto-detect dstack mode by checking well-known path
 DSTACK_ENV_PATH="/app/deploy/.host-shared/.decrypted-env"
@@ -29,28 +33,11 @@ fi
 
 # Fill missing required vars from base env (chicken-and-egg fix)
 if [ -n "$BASE_ENV_FILE" ] && [ -f "$BASE_ENV_FILE" ]; then
-    _read_base() { grep "^${1}=" "$BASE_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-; }
+    _read_base() { grep "^${1}=" "$BASE_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2- || true; }
     [ -z "$COMPOSE_API_IMAGE" ]  && COMPOSE_API_IMAGE="$(_read_base COMPOSE_API_IMAGE_REPO)"
-    [ -z "$WORKER_IMAGE" ]       && WORKER_IMAGE="$(_read_base WORKER_IMAGE_REPO)"
-    [ -z "$IRONCLAW_IMAGE_VAR" ] && IRONCLAW_IMAGE_VAR="$(_read_base IRONCLAW_IMAGE_REPO)"
-    [ -z "$INGRESS_IMAGE_VAR" ]  && INGRESS_IMAGE_VAR="$(_read_base INGRESS_IMAGE_REPO)"
-    [ -z "$BASTION_IMAGE_VAR" ]  && BASTION_IMAGE_VAR="$(_read_base BASTION_IMAGE_REPO)"
     [ -z "$COSIGN_IDENTITY" ]    && COSIGN_IDENTITY="$(_read_base UPDATER_COSIGN_IDENTITY)"
     unset -f _read_base
 fi
-
-# Derive repos from COMPOSE_API_IMAGE prefix when not explicitly set.
-# All CI-built images share the same Docker Hub org, so we can infer
-# repos from the compose-api repo (which is always required).
-derive_repo() {
-    local name="$1"
-    local prefix="${COMPOSE_API_IMAGE%/*}"
-    echo "${prefix}/${name}"
-}
-[ -z "$WORKER_IMAGE" ]       && WORKER_IMAGE="$(derive_repo openclaw-nearai-worker)"
-[ -z "$IRONCLAW_IMAGE_VAR" ] && IRONCLAW_IMAGE_VAR="$(derive_repo ironclaw-nearai-worker)"
-[ -z "$INGRESS_IMAGE_VAR" ]  && INGRESS_IMAGE_VAR="$(derive_repo openclaw-ingress)"
-[ -z "$BASTION_IMAGE_VAR" ]  && BASTION_IMAGE_VAR="$(derive_repo openclaw-ssh-bastion)"
 
 # Validate required configuration
 [ -z "$COMPOSE_API_IMAGE" ] && { echo "FATAL: UPDATER_COMPOSE_API_IMAGE is required" >&2; exit 1; }
@@ -69,12 +56,72 @@ BUNDLED_COMPOSE="/app/compose/docker-compose.dstack.yml"
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [updater] $*"; }
 log_error() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [updater] ERROR: $*" >&2; }
 
+# ── Image repo resolution ────────────────────────────────────────────
+
+# Derive repos from COMPOSE_API_IMAGE prefix when not explicitly set.
+# All CI-built images share the same Docker Hub org, so we can infer
+# repos from the compose-api repo (which is always required).
+derive_repo() {
+    local name="$1"
+    local prefix="${COMPOSE_API_IMAGE%/*}"
+    echo "${prefix}/${name}"
+}
+
+# Resolve image repositories from env vars and base env file.
+# Called each poll cycle so hot-added config is picked up without restart.
+resolve_image_repos() {
+    _resolve() {
+        local env_var="$1" base_key="$2" derive_name="$3"
+        local val="${!env_var:-}" source="env"
+        if [ -z "$val" ] && [ -n "$BASE_ENV_FILE" ] && [ -f "$BASE_ENV_FILE" ]; then
+            val="$(grep "^${base_key}=" "$BASE_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2- || true)"
+            source="base-env"
+        fi
+        if [ -z "$val" ]; then
+            val="$(derive_repo "$derive_name")"
+            source="derived"
+        fi
+        echo "$val $source"
+    }
+
+    local prev_worker="$WORKER_IMAGE" prev_ironclaw="$IRONCLAW_IMAGE_VAR"
+    local prev_ingress="$INGRESS_IMAGE_VAR" prev_bastion="$BASTION_IMAGE_VAR"
+    local result source
+
+    result="$(_resolve UPDATER_WORKER_IMAGE WORKER_IMAGE_REPO openclaw-nearai-worker)"
+    WORKER_IMAGE="${result% *}"; source="${result##* }"
+    if [ "$WORKER_IMAGE" != "$prev_worker" ] && [ -n "$prev_worker" ]; then
+        log "Worker image repo changed: ${prev_worker} -> ${WORKER_IMAGE} (source: ${source})"
+    fi
+
+    result="$(_resolve UPDATER_IRONCLAW_IMAGE IRONCLAW_IMAGE_REPO ironclaw-nearai-worker)"
+    IRONCLAW_IMAGE_VAR="${result% *}"; source="${result##* }"
+    if [ "$IRONCLAW_IMAGE_VAR" != "$prev_ironclaw" ] && [ -n "$prev_ironclaw" ]; then
+        log "Ironclaw image repo changed: ${prev_ironclaw} -> ${IRONCLAW_IMAGE_VAR} (source: ${source})"
+    fi
+
+    result="$(_resolve UPDATER_INGRESS_IMAGE INGRESS_IMAGE_REPO openclaw-ingress)"
+    INGRESS_IMAGE_VAR="${result% *}"; source="${result##* }"
+    if [ "$INGRESS_IMAGE_VAR" != "$prev_ingress" ] && [ -n "$prev_ingress" ]; then
+        log "Ingress image repo changed: ${prev_ingress} -> ${INGRESS_IMAGE_VAR} (source: ${source})"
+    fi
+
+    result="$(_resolve UPDATER_BASTION_IMAGE BASTION_IMAGE_REPO openclaw-ssh-bastion)"
+    BASTION_IMAGE_VAR="${result% *}"; source="${result##* }"
+    if [ "$BASTION_IMAGE_VAR" != "$prev_bastion" ] && [ -n "$prev_bastion" ]; then
+        log "Bastion image repo changed: ${prev_bastion} -> ${BASTION_IMAGE_VAR} (source: ${source})"
+    fi
+}
+
 # ── State management ──────────────────────────────────────────────────
 
 init_state() {
     mkdir -p "$(dirname "$STATE_FILE")"
     if [ ! -f "$STATE_FILE" ]; then
         echo '{}' > "$STATE_FILE"
+        log "Created fresh state file at ${STATE_FILE}"
+    else
+        log "Loaded state file from ${STATE_FILE}"
     fi
 }
 
@@ -261,11 +308,11 @@ read_env_var() {
     local val=""
     # Check overrides file first
     if [ -f "$ENV_FILE" ]; then
-        val="$(grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-)"
+        val="$(grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2- || true)"
     fi
     # Fall back to base env if set and no override found
     if [ -z "$val" ] && [ -n "$BASE_ENV_FILE" ] && [ -f "$BASE_ENV_FILE" ]; then
-        val="$(grep "^${key}=" "$BASE_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-)"
+        val="$(grep "^${key}=" "$BASE_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2- || true)"
     fi
     echo "$val"
 }
@@ -305,6 +352,9 @@ bootstrap() {
     local fresh_deploy=true
     if docker ps --filter "label=com.docker.compose.service=compose-api" --format '{{.Names}}' | grep -q .; then
         fresh_deploy=false
+        log "Bootstrap: compose-api already running, will reconcile"
+    else
+        log "Bootstrap: fresh deploy, will start all services"
     fi
 
     # Start/reconcile all services (idempotent — running services stay untouched)
@@ -329,6 +379,7 @@ update_compose_api() {
     local remote_digest running_digest image_ref old_digest
 
     # 1. Fetch remote digest
+    log "Checking compose-api for updates (${COMPOSE_API_IMAGE}:${CHANNEL})..."
     remote_digest="$(fetch_remote_digest "$COMPOSE_API_IMAGE" "$CHANNEL")"
     if [ -z "$remote_digest" ]; then
         log_error "Failed to fetch remote digest for ${COMPOSE_API_IMAGE}:${CHANNEL}"
@@ -340,10 +391,12 @@ update_compose_api() {
     if [ -z "$running_digest" ]; then
         # First run: resolve from running container
         running_digest="$(docker inspect compose-api --format '{{.Image}}' 2>/dev/null || echo "")"
+        log "compose-api: no stored digest, resolved from container: ${running_digest:-<none>}"
     fi
 
     # 3. Compare
     if [ "$remote_digest" = "$running_digest" ]; then
+        log "compose-api: up to date (${remote_digest:0:16}...)"
         return 0
     fi
 
@@ -395,6 +448,7 @@ rollback_compose_api() {
     local old_image="$1" old_digest="$2"
 
     if [ -n "$old_image" ]; then
+        log "Restoring previous compose-api image: ${old_image}"
         write_env_var "COMPOSE_API_IMAGE" "$old_image"
     fi
 
@@ -408,15 +462,22 @@ rollback_compose_api() {
     fi
 
     # Skip next few checks to avoid a tight retry loop
-    write_state "backoff_until" "$(date -u -d "+30 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+30M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+    local backoff_target
+    backoff_target="$(date -u -d "+30 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+30M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+    write_state "backoff_until" "$backoff_target"
+    log "Entering 30-minute backoff until ${backoff_target}"
 }
 
 update_image() {
     local image_repo="$1" state_key="$2" env_key="$3" restart_service="$4" label="$5"
-    [ -z "$image_repo" ] && return 0
+    if [ -z "$image_repo" ]; then
+        log "${label}: skipped (not configured)"
+        return 0
+    fi
 
     local remote_digest current_digest image_ref
 
+    log "Checking ${label} for updates (${image_repo}:${CHANNEL})..."
     remote_digest="$(fetch_remote_digest "$image_repo" "$CHANNEL")"
     if [ -z "$remote_digest" ]; then
         log_error "Failed to fetch remote digest for ${image_repo}:${CHANNEL}"
@@ -425,6 +486,7 @@ update_image() {
 
     current_digest="$(read_state "$state_key")"
     if [ "$remote_digest" = "$current_digest" ]; then
+        log "${label}: up to date (${remote_digest:0:16}...)"
         return 0
     fi
 
@@ -462,17 +524,23 @@ update_image() {
 
 update_self() {
     local updater_image="${UPDATER_SELF_IMAGE:-}"
-    [ -z "$updater_image" ] && return 0
+    if [ -z "$updater_image" ]; then
+        log "Self-update: skipped (UPDATER_SELF_IMAGE not configured)"
+        return 0
+    fi
 
     local remote_digest current_digest image_ref
 
+    log "Checking self for updates (${updater_image}:${CHANNEL})..."
     remote_digest="$(fetch_remote_digest "$updater_image" "$CHANNEL")"
     if [ -z "$remote_digest" ]; then
+        log_error "Failed to fetch remote digest for self (${updater_image}:${CHANNEL})"
         return 1
     fi
 
     current_digest="$(read_state "updater_digest")"
     if [ "$remote_digest" = "$current_digest" ]; then
+        log "Self-update: up to date (${remote_digest:0:16}...)"
         return 0
     fi
 
@@ -537,6 +605,51 @@ update_self() {
     log "Self-update helper launched, this container will be replaced shortly"
 }
 
+# ── Poll cycle ────────────────────────────────────────────────────────
+# Runs inside `if` in the main loop, which disables set -e for all
+# commands within. This ensures no unexpected error can kill the updater.
+
+_poll_cycle() {
+    POLL_CYCLE=$((POLL_CYCLE + 1))
+    log "Poll cycle #${POLL_CYCLE} starting"
+
+    # Re-resolve image repos each cycle (picks up hot-added config)
+    resolve_image_repos
+
+    # Check backoff
+    local backoff_until
+    backoff_until="$(read_state "backoff_until")"
+    if [ -n "$backoff_until" ]; then
+        local now
+        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if [[ "$now" < "$backoff_until" ]]; then
+            log "In backoff period until ${backoff_until}, skipping..."
+            return 0
+        else
+            log "Backoff period expired, resuming normal operations"
+            write_state "backoff_until" ""
+        fi
+    fi
+
+    # 1. Check compose-api
+    update_compose_api || true
+
+    # 2. Check tracked images (worker, ironclaw, ingress, bastion)
+    update_image "$WORKER_IMAGE"       "worker_digest"   "OPENCLAW_IMAGE"  "compose-api" "worker"          || true
+    update_image "$IRONCLAW_IMAGE_VAR" "ironclaw_digest" "IRONCLAW_IMAGE"  "compose-api" "ironclaw worker" || true
+    update_image "$INGRESS_IMAGE_VAR"  "ingress_digest"  "INGRESS_IMAGE"   "nginx"       "ingress"         || true
+    update_image "$BASTION_IMAGE_VAR"  "bastion_digest"  "BASTION_IMAGE"   "ssh-bastion" "ssh-bastion"     || true
+
+    # 3. Check self (less frequently)
+    self_check_counter=$((self_check_counter + 1))
+    if [ "$self_check_counter" -ge "$SELF_CHECK_INTERVAL" ]; then
+        self_check_counter=0
+        update_self || true
+    fi
+
+    log "Poll cycle #${POLL_CYCLE} complete, sleeping ${POLL_INTERVAL}s"
+}
+
 # ── Main loop ────────────────────────────────────────────────────────
 
 main() {
@@ -551,6 +664,9 @@ main() {
     fi
     log "  compose project:   ${COMPOSE_PROJECT:-<auto>}"
     log "  compose-api image: ${COMPOSE_API_IMAGE}"
+
+    # Resolve image repos for initial log output
+    resolve_image_repos
     log "  worker image:      ${WORKER_IMAGE:-<not configured>}"
     log "  ironclaw image:    ${IRONCLAW_IMAGE_VAR:-<not configured>}"
     log "  ingress image:     ${INGRESS_IMAGE_VAR:-<not configured>}"
@@ -558,6 +674,8 @@ main() {
     log "  channel:           ${CHANNEL}"
     log "  poll interval:     ${POLL_INTERVAL}s"
     log "  cosign identity:   ${COSIGN_IDENTITY}"
+    log "  health url:        ${HEALTH_URL}"
+    log "  state file:        ${STATE_FILE}"
 
     init_state
 
@@ -571,44 +689,27 @@ main() {
         if [ -n "$current" ]; then
             write_state "compose_api_digest" "$current"
             log "Seeded compose-api digest from running container: ${current}"
+        else
+            log "No running compose-api container found to seed digest from"
         fi
+    else
+        log "Existing compose-api digest in state: $(read_state "compose_api_digest")"
     fi
 
     # Self-update first, before touching any other services
+    log "Checking for self-update before entering main loop..."
     update_self || true
+
+    log "Entering main poll loop (interval: ${POLL_INTERVAL}s)"
 
     local self_check_counter=0
 
     while true; do
-        # Check backoff
-        local backoff_until
-        backoff_until="$(read_state "backoff_until")"
-        if [ -n "$backoff_until" ]; then
-            local now
-            now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            if [[ "$now" < "$backoff_until" ]]; then
-                log "In backoff period until ${backoff_until}, skipping..."
-                sleep "$POLL_INTERVAL"
-                continue
-            else
-                write_state "backoff_until" ""
-            fi
-        fi
-
-        # 1. Check compose-api
-        update_compose_api || true
-
-        # 2. Check tracked images (worker, ironclaw, ingress, bastion)
-        update_image "$WORKER_IMAGE"       "worker_digest"   "OPENCLAW_IMAGE"  "compose-api" "worker"          || true
-        update_image "$IRONCLAW_IMAGE_VAR" "ironclaw_digest" "IRONCLAW_IMAGE"  "compose-api" "ironclaw worker" || true
-        update_image "$INGRESS_IMAGE_VAR"  "ingress_digest"  "INGRESS_IMAGE"   "nginx"       "ingress"         || true
-        update_image "$BASTION_IMAGE_VAR"  "bastion_digest"  "BASTION_IMAGE"   "ssh-bastion" "ssh-bastion"     || true
-
-        # 3. Check self (less frequently)
-        self_check_counter=$((self_check_counter + 1))
-        if [ "$self_check_counter" -ge "$SELF_CHECK_INTERVAL" ]; then
-            self_check_counter=0
-            update_self || true
+        # _poll_cycle runs inside `if`, which disables set -e for all
+        # commands within. This is critical: the updater must never die
+        # from an unexpected error — in a CVM that requires a full reboot.
+        if ! _poll_cycle; then
+            log_error "Poll cycle failed unexpectedly, will retry next cycle"
         fi
 
         sleep "$POLL_INTERVAL"
