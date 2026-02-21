@@ -148,6 +148,11 @@ export HOME=/home/agent
 while true; do
     echo "Starting IronClaw..."
     chown -R agent:agent /home/agent/.ironclaw /home/agent/workspace 2>/dev/null || true
+    # Re-lock master key after chown -R
+    if [ -f "$MASTER_KEY_FILE" ]; then
+        chown root:root "$MASTER_KEY_FILE"
+        chmod 600 "$MASTER_KEY_FILE"
+    fi
     runuser -p -u agent -- ironclaw run --no-onboard
     EXIT_CODE=$?
     if [ $EXIT_CODE -eq 0 ]; then
