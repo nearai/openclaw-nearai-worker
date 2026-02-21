@@ -328,9 +328,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    let bastion_ssh_port: Option<u16> = std::env::var("BASTION_SSH_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let bastion_ssh_port: Option<u16> = Some(
+        std::env::var("BASTION_SSH_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15222),
+    );
 
     let config = Arc::new(AppConfig {
         admin_token: secrecy::SecretString::from(admin_token),
@@ -924,7 +927,7 @@ async fn create_instance(
         name: name.clone(),
         token: token.clone(),
         gateway_port,
-        ssh_port: effective_ssh_port(&state.config, ssh_port),
+        ssh_port,
         url,
         dashboard_url,
         ssh_command,
@@ -1042,7 +1045,7 @@ async fn get_instance(
                 url,
                 dashboard_url,
                 gateway_port: inst.gateway_port,
-                ssh_port: effective_ssh_port(&state.config, inst.ssh_port),
+                ssh_port: inst.ssh_port,
                 ssh_command,
                 ssh_pubkey: inst.ssh_pubkey,
                 image,
@@ -1090,7 +1093,7 @@ async fn list_instances(
             url,
             dashboard_url,
             gateway_port: inst.gateway_port,
-            ssh_port: effective_ssh_port(&state.config, inst.ssh_port),
+            ssh_port: inst.ssh_port,
             ssh_command,
             ssh_pubkey: inst.ssh_pubkey,
             image,
@@ -1820,7 +1823,7 @@ impl AppConfig {
             ingress_container_name: "test-ingress".to_string(),
             env_override_file: None,
             bastion_ssh_pubkey: None,
-            bastion_ssh_port: None,
+            bastion_ssh_port: Some(15222),
         }
     }
 }
@@ -1962,7 +1965,7 @@ mod tests {
     fn test_generate_ssh_command() {
         let config = AppConfig::test_default();
         let cmd = generate_ssh_command(&config, "brave-tiger", 19002);
-        assert_eq!(cmd, "ssh -p 19002 brave-tiger@localhost");
+        assert_eq!(cmd, "ssh -p 15222 brave-tiger@localhost");
     }
 
     #[test]
@@ -1978,7 +1981,7 @@ mod tests {
         let mut config = AppConfig::test_default();
         config.openclaw_domain = Some("agent0.near.ai".into());
         let cmd = generate_ssh_command(&config, "brave-tiger", 19002);
-        assert_eq!(cmd, "ssh -p 19002 brave-tiger@agent0.near.ai");
+        assert_eq!(cmd, "ssh -p 15222 brave-tiger@agent0.near.ai");
     }
 
     // ── is_valid_instance_name ───────────────────────────────────────
