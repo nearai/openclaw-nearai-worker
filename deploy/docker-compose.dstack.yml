@@ -51,6 +51,7 @@ services:
       - ENV_OVERRIDE_FILE=/app/data/.env.overrides
       - BASTION_SSH_PUBKEY_PATH=/app/data/bastion/id_ed25519.pub
       - BASTION_SSH_PORT=${BASTION_SSH_PORT:-2222}
+      - BASTION_SSH_EXTERNAL_PORT=${BASTION_SSH_EXTERNAL_PORT:-${BASTION_SSH_PORT:-2222}}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
       interval: 5s

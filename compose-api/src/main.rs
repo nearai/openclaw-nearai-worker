@@ -329,7 +329,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let bastion_ssh_port: Option<u16> = Some(
-        std::env::var("BASTION_SSH_PORT")
+        std::env::var("BASTION_SSH_EXTERNAL_PORT")
+            .or_else(|_| std::env::var("BASTION_SSH_PORT"))
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(15222),
