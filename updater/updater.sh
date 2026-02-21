@@ -6,6 +6,9 @@ set -euo pipefail
 # Soft defaults — allow empty during chicken-and-egg transition
 COMPOSE_API_IMAGE="${UPDATER_COMPOSE_API_IMAGE:-}"
 WORKER_IMAGE="${UPDATER_WORKER_IMAGE:-}"
+IRONCLAW_IMAGE_VAR="${UPDATER_IRONCLAW_IMAGE:-}"
+INGRESS_IMAGE_VAR="${UPDATER_INGRESS_IMAGE:-}"
+BASTION_IMAGE_VAR="${UPDATER_BASTION_IMAGE:-}"
 CHANNEL="${UPDATER_CHANNEL:-latest}"
 POLL_INTERVAL="${UPDATER_POLL_INTERVAL:-300}"
 COMPOSE_FILE="${UPDATER_COMPOSE_FILE:?UPDATER_COMPOSE_FILE is required}"
@@ -27,10 +30,27 @@ fi
 # Fill missing required vars from base env (chicken-and-egg fix)
 if [ -n "$BASE_ENV_FILE" ] && [ -f "$BASE_ENV_FILE" ]; then
     _read_base() { grep "^${1}=" "$BASE_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2-; }
-    [ -z "$COMPOSE_API_IMAGE" ] && COMPOSE_API_IMAGE="$(_read_base COMPOSE_API_IMAGE_REPO)"
-    [ -z "$COSIGN_IDENTITY" ]   && COSIGN_IDENTITY="$(_read_base UPDATER_COSIGN_IDENTITY)"
+    [ -z "$COMPOSE_API_IMAGE" ]  && COMPOSE_API_IMAGE="$(_read_base COMPOSE_API_IMAGE_REPO)"
+    [ -z "$WORKER_IMAGE" ]       && WORKER_IMAGE="$(_read_base WORKER_IMAGE_REPO)"
+    [ -z "$IRONCLAW_IMAGE_VAR" ] && IRONCLAW_IMAGE_VAR="$(_read_base IRONCLAW_IMAGE_REPO)"
+    [ -z "$INGRESS_IMAGE_VAR" ]  && INGRESS_IMAGE_VAR="$(_read_base INGRESS_IMAGE_REPO)"
+    [ -z "$BASTION_IMAGE_VAR" ]  && BASTION_IMAGE_VAR="$(_read_base BASTION_IMAGE_REPO)"
+    [ -z "$COSIGN_IDENTITY" ]    && COSIGN_IDENTITY="$(_read_base UPDATER_COSIGN_IDENTITY)"
     unset -f _read_base
 fi
+
+# Derive repos from COMPOSE_API_IMAGE prefix when not explicitly set.
+# All CI-built images share the same Docker Hub org, so we can infer
+# repos from the compose-api repo (which is always required).
+derive_repo() {
+    local name="$1"
+    local prefix="${COMPOSE_API_IMAGE%/*}"
+    echo "${prefix}/${name}"
+}
+[ -z "$WORKER_IMAGE" ]       && WORKER_IMAGE="$(derive_repo openclaw-nearai-worker)"
+[ -z "$IRONCLAW_IMAGE_VAR" ] && IRONCLAW_IMAGE_VAR="$(derive_repo ironclaw-nearai-worker)"
+[ -z "$INGRESS_IMAGE_VAR" ]  && INGRESS_IMAGE_VAR="$(derive_repo openclaw-ingress)"
+[ -z "$BASTION_IMAGE_VAR" ]  && BASTION_IMAGE_VAR="$(derive_repo openclaw-ssh-bastion)"
 
 # Validate required configuration
 [ -z "$COMPOSE_API_IMAGE" ] && { echo "FATAL: UPDATER_COMPOSE_API_IMAGE is required" >&2; exit 1; }
@@ -391,26 +411,26 @@ rollback_compose_api() {
     write_state "backoff_until" "$(date -u -d "+30 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+30M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
 }
 
-update_worker_image() {
-    [ -z "$WORKER_IMAGE" ] && return 0
+update_image() {
+    local image_repo="$1" state_key="$2" env_key="$3" restart_service="$4" label="$5"
+    [ -z "$image_repo" ] && return 0
 
     local remote_digest current_digest image_ref
 
-    remote_digest="$(fetch_remote_digest "$WORKER_IMAGE" "$CHANNEL")"
+    remote_digest="$(fetch_remote_digest "$image_repo" "$CHANNEL")"
     if [ -z "$remote_digest" ]; then
-        log_error "Failed to fetch remote digest for ${WORKER_IMAGE}:${CHANNEL}"
+        log_error "Failed to fetch remote digest for ${image_repo}:${CHANNEL}"
         return 1
     fi
 
-    current_digest="$(read_state "worker_digest")"
+    current_digest="$(read_state "$state_key")"
     if [ "$remote_digest" = "$current_digest" ]; then
         return 0
     fi
 
-    log "New worker image detected: ${remote_digest} (current: ${current_digest:-unknown})"
-    image_ref="${WORKER_IMAGE}@${remote_digest}"
+    log "New ${label} image detected: ${remote_digest} (current: ${current_digest:-unknown})"
+    image_ref="${image_repo}@${remote_digest}"
 
-    # Pull and verify
     log "Pulling ${image_ref}..."
     if ! docker pull "$image_ref"; then
         log_error "Failed to pull ${image_ref}"
@@ -418,23 +438,23 @@ update_worker_image() {
     fi
 
     if ! verify_attestation "$image_ref"; then
-        log_error "Skipping worker image update — attestation failed"
+        log_error "Skipping ${label} update — attestation failed"
         return 1
     fi
 
-    # Update the env var used by compose-api for new instances
-    write_env_var "OPENCLAW_IMAGE" "$image_ref"
-    write_state "worker_digest" "$remote_digest"
-    log "Worker image updated to ${image_ref}"
+    write_env_var "$env_key" "$image_ref"
+    write_state "$state_key" "$remote_digest"
+    log "${label} image updated to ${image_ref}"
 
-    # Restart compose-api so it picks up the new default image
-    log "Restarting compose-api to pick up new worker image..."
-    compose_up -d --no-deps compose-api
+    log "Restarting ${restart_service} to pick up new ${label} image..."
+    compose_up -d --no-deps "$restart_service"
 
-    if wait_for_healthy "$HEALTH_TIMEOUT"; then
-        log "compose-api restarted with new worker image"
-    else
-        log_error "compose-api failed health check after worker image update"
+    if [ "$restart_service" = "compose-api" ]; then
+        if wait_for_healthy "$HEALTH_TIMEOUT"; then
+            log "compose-api restarted with new ${label} image"
+        else
+            log_error "compose-api failed health check after ${label} update"
+        fi
     fi
 
     return 0
@@ -532,6 +552,9 @@ main() {
     log "  compose project:   ${COMPOSE_PROJECT:-<auto>}"
     log "  compose-api image: ${COMPOSE_API_IMAGE}"
     log "  worker image:      ${WORKER_IMAGE:-<not configured>}"
+    log "  ironclaw image:    ${IRONCLAW_IMAGE_VAR:-<not configured>}"
+    log "  ingress image:     ${INGRESS_IMAGE_VAR:-<not configured>}"
+    log "  bastion image:     ${BASTION_IMAGE_VAR:-<not configured>}"
     log "  channel:           ${CHANNEL}"
     log "  poll interval:     ${POLL_INTERVAL}s"
     log "  cosign identity:   ${COSIGN_IDENTITY}"
@@ -575,8 +598,11 @@ main() {
         # 1. Check compose-api
         update_compose_api || true
 
-        # 2. Check worker image
-        update_worker_image || true
+        # 2. Check tracked images (worker, ironclaw, ingress, bastion)
+        update_image "$WORKER_IMAGE"       "worker_digest"   "OPENCLAW_IMAGE"  "compose-api" "worker"          || true
+        update_image "$IRONCLAW_IMAGE_VAR" "ironclaw_digest" "IRONCLAW_IMAGE"  "compose-api" "ironclaw worker" || true
+        update_image "$INGRESS_IMAGE_VAR"  "ingress_digest"  "INGRESS_IMAGE"   "nginx"       "ingress"         || true
+        update_image "$BASTION_IMAGE_VAR"  "bastion_digest"  "BASTION_IMAGE"   "ssh-bastion" "ssh-bastion"     || true
 
         # 3. Check self (less frequently)
         self_check_counter=$((self_check_counter + 1))
