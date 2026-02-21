@@ -144,7 +144,13 @@ configs:
           ssl_certificate /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/fullchain.pem;
           ssl_certificate_key /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/privkey.pem;
 
+          default_type application/json;
+
           location / {
+              if ($$openclaw_backend = "") {
+                  return 503 '{"error":"instance_not_available","message":"This instance is stopped or does not exist"}';
+              }
+
               proxy_pass $$openclaw_backend;
               proxy_http_version 1.1;
               proxy_set_header Upgrade $$http_upgrade;
