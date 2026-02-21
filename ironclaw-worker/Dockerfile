@@ -28,7 +28,10 @@ RUN apt-get update && \
 # Download prebuilt IronClaw binary from GitHub release
 ARG IRONCLAW_VERSION=0.8.0
 RUN curl -fsSL "https://github.com/nearai/ironclaw/releases/download/ironclaw-v${IRONCLAW_VERSION}/ironclaw-x86_64-unknown-linux-gnu.tar.gz" \
-    | tar xz --strip-components=1 -C /usr/local/bin/ --wildcards '*/ironclaw'
+      -o /tmp/ironclaw.tar.gz && \
+    tar xzf /tmp/ironclaw.tar.gz -C /tmp && \
+    mv /tmp/ironclaw-*/ironclaw /usr/local/bin/ironclaw && \
+    rm -rf /tmp/ironclaw.tar.gz /tmp/ironclaw-*
 
 # Create non-root user (UID 1001, matching OpenClaw worker pattern)
 RUN useradd -m -u 1001 -s /bin/bash agent && \
