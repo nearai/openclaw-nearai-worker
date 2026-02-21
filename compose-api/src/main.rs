@@ -710,9 +710,16 @@ fn generate_urls(
     }
 }
 
+/// Returns the user-facing SSH port: bastion port when configured, otherwise the
+/// per-instance direct port.
+fn effective_ssh_port(config: &AppConfig, instance_ssh_port: u16) -> u16 {
+    config.bastion_ssh_port.unwrap_or(instance_ssh_port)
+}
+
 fn generate_ssh_command(config: &AppConfig, name: &str, ssh_port: u16) -> String {
     let host = config.openclaw_domain.as_deref().unwrap_or(&config.host_address);
-    format!("ssh -p {} {}@{}", ssh_port, name, host)
+    let port = effective_ssh_port(config, ssh_port);
+    format!("ssh -p {} {}@{}", port, name, host)
 }
 
 // ── SSE helpers ──────────────────────────────────────────────────────
@@ -917,7 +924,7 @@ async fn create_instance(
         name: name.clone(),
         token: token.clone(),
         gateway_port,
-        ssh_port,
+        ssh_port: effective_ssh_port(&state.config, ssh_port),
         url,
         dashboard_url,
         ssh_command,
@@ -1035,7 +1042,7 @@ async fn get_instance(
                 url,
                 dashboard_url,
                 gateway_port: inst.gateway_port,
-                ssh_port: inst.ssh_port,
+                ssh_port: effective_ssh_port(&state.config, inst.ssh_port),
                 ssh_command,
                 ssh_pubkey: inst.ssh_pubkey,
                 image,
@@ -1083,7 +1090,7 @@ async fn list_instances(
             url,
             dashboard_url,
             gateway_port: inst.gateway_port,
-            ssh_port: inst.ssh_port,
+            ssh_port: effective_ssh_port(&state.config, inst.ssh_port),
             ssh_command,
             ssh_pubkey: inst.ssh_pubkey,
             image,
@@ -1963,7 +1970,7 @@ mod tests {
         let mut config = AppConfig::test_default();
         config.bastion_ssh_port = Some(2222);
         let cmd = generate_ssh_command(&config, "brave-tiger", 19002);
-        assert_eq!(cmd, "ssh -p 19002 brave-tiger@localhost");
+        assert_eq!(cmd, "ssh -p 2222 brave-tiger@localhost");
     }
 
     #[test]
