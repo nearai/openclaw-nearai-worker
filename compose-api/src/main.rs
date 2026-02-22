@@ -476,22 +476,62 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+#[derive(Serialize, Default, utoipa::ToSchema)]
+struct ImageVersions {
+    /// compose-api image reference (from COMPOSE_API_IMAGE)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compose_api: Option<String>,
+    /// openclaw worker image reference (from OPENCLAW_IMAGE)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker: Option<String>,
+    /// ironclaw worker image reference (from IRONCLAW_IMAGE)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ironclaw: Option<String>,
+    /// nginx ingress image reference (from INGRESS_IMAGE)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingress: Option<String>,
+    /// ssh-bastion image reference (from BASTION_IMAGE)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bastion: Option<String>,
+    /// updater image reference (from UPDATER_IMAGE)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updater: Option<String>,
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 struct VersionResponse {
     version: &'static str,
     git_commit: &'static str,
     build_time: &'static str,
+    /// Currently deployed image references (from updater env overrides)
+    images: ImageVersions,
 }
 
 #[utoipa::path(get, path = "/version", tag = "System",
     security(),
     responses((status = 200, description = "API version info", body = VersionResponse))
 )]
-async fn version() -> Json<VersionResponse> {
+async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
+    let images = state
+        .config
+        .env_override_file
+        .as_deref()
+        .and_then(|path| read_env_override_file(path).ok())
+        .map(|vars| ImageVersions {
+            compose_api: vars.get("COMPOSE_API_IMAGE").cloned(),
+            worker: vars.get("OPENCLAW_IMAGE").cloned(),
+            ironclaw: vars.get("IRONCLAW_IMAGE").cloned(),
+            ingress: vars.get("INGRESS_IMAGE").cloned(),
+            bastion: vars.get("BASTION_IMAGE").cloned(),
+            updater: vars.get("UPDATER_IMAGE").cloned(),
+        })
+        .unwrap_or_default();
+
     Json(VersionResponse {
         version: env!("CARGO_PKG_VERSION"),
         git_commit: env!("GIT_COMMIT"),
         build_time: env!("BUILD_TIME"),
+        images,
     })
 }
 
