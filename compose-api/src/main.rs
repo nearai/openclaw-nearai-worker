@@ -1,5 +1,5 @@
 use axum::{
-    extract::{FromRequestParts, Path, State},
+    extract::{FromRequestParts, Path, Query, State},
     http::{request::Parts, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -580,6 +580,13 @@ struct AttestationResponse {
     image_digest: Option<String>,
 }
 
+/// Query parameters for the attestation report endpoint
+#[derive(Deserialize, utoipa::IntoParams)]
+struct AttestationQuery {
+    /// 64-character hex string (32 bytes) to bind into the TDX quote as a nonce
+    nonce: Option<String>,
+}
+
 /// TDX attestation report with TLS certificate binding
 #[derive(Serialize, utoipa::ToSchema)]
 struct TdxAttestationReport {
@@ -595,6 +602,10 @@ struct TdxAttestationReport {
     tls_certificate: String,
     /// Hex SHA-256 fingerprint of the DER-encoded leaf certificate
     tls_certificate_fingerprint: String,
+    /// Hex nonce embedded in report_data bytes 32–63
+    request_nonce: String,
+    /// CVM/TCB info from dstack guest-agent
+    info: serde_json::Value,
 }
 
 /// Error response body
@@ -1354,12 +1365,37 @@ async fn instance_attestation(
 
 #[utoipa::path(get, path = "/attestation/report", tag = "Attestation",
     security(),
+    params(AttestationQuery),
     responses(
         (status = 200, description = "TDX attestation report bound to the TLS certificate", body = TdxAttestationReport),
+        (status = 400, description = "Invalid nonce format", body = ErrorResponse),
         (status = 503, description = "Attestation not available", body = ErrorResponse),
     )
 )]
-async fn tdx_attestation(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+async fn tdx_attestation(
+    State(state): State<AppState>,
+    Query(params): Query<AttestationQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Validate and resolve nonce (caller-provided or random)
+    let nonce_hex = if let Some(ref n) = params.nonce {
+        // Validate: must be exactly 64 hex characters (32 bytes)
+        if n.len() != 64 {
+            return Err(ApiError::BadRequest(
+                "nonce must be exactly 64 hex characters (32 bytes)".into(),
+            ));
+        }
+        hex::decode(n).map_err(|_| {
+            ApiError::BadRequest("nonce must be a valid hex string".into())
+        })?;
+        n.clone()
+    } else {
+        // Generate a random 32-byte nonce
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let bytes: [u8; 32] = rng.random();
+        hex::encode(bytes)
+    };
+
     let domain = state
         .config
         .openclaw_domain
@@ -1374,12 +1410,15 @@ async fn tdx_attestation(State(state): State<AppState>) -> Result<impl IntoRespo
     let fingerprint = Sha256::digest(&leaf_der);
     let fingerprint_hex = hex::encode(fingerprint);
 
-    // Build 64-byte report_data: sha256(cert) in first 32 bytes, zeros in last 32
+    // Build 64-byte report_data: sha256(cert) in first 32 bytes, nonce in last 32
     let mut report_data = [0u8; 64];
     report_data[..32].copy_from_slice(&fingerprint);
+    let nonce_bytes = hex::decode(&nonce_hex).expect("nonce already validated");
+    report_data[32..].copy_from_slice(&nonce_bytes);
 
-    // Get TDX quote from dstack guest-agent
-    let quote_response = fetch_dstack_quote(&report_data).await?;
+    // Get TDX quote and CVM info from dstack guest-agent
+    let (quote_response, info) =
+        tokio::try_join!(fetch_dstack_quote(&report_data), fetch_dstack_info())?;
 
     let quote = quote_response
         .get("quote")
@@ -1419,6 +1458,8 @@ async fn tdx_attestation(State(state): State<AppState>) -> Result<impl IntoRespo
         vm_config,
         tls_certificate: leaf_pem,
         tls_certificate_fingerprint: fingerprint_hex,
+        request_nonce: nonce_hex,
+        info,
     }))
 }
 
@@ -1806,6 +1847,40 @@ async fn fetch_dstack_quote(report_data: &[u8; 64]) -> Result<serde_json::Value,
     let response_body = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&response_body).map_err(|e| {
         ApiError::ServiceUnavailable(format!("failed to parse dstack response: {}", e))
+    })
+}
+
+/// Call dstack guest-agent Info RPC via Unix socket to get CVM/TCB metadata.
+async fn fetch_dstack_info() -> Result<serde_json::Value, ApiError> {
+    let sock_path = "/var/run/dstack.sock";
+    if !std::path::Path::new(sock_path).exists() {
+        return Err(ApiError::ServiceUnavailable(
+            "dstack.sock not found — not running in a TEE".into(),
+        ));
+    }
+
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "--unix-socket",
+            sock_path,
+            "-s",
+            "http://localhost/Info",
+        ])
+        .output()
+        .await
+        .map_err(|e| ApiError::ServiceUnavailable(format!("failed to call dstack: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::ServiceUnavailable(format!(
+            "dstack Info failed: {}",
+            stderr
+        )));
+    }
+
+    let response_body = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&response_body).map_err(|e| {
+        ApiError::ServiceUnavailable(format!("failed to parse dstack Info response: {}", e))
     })
 }
 
