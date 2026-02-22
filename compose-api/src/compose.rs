@@ -24,6 +24,12 @@ pub struct InstanceConfig<'a> {
     pub nearai_api_url: &'a str,
     pub service_type: &'a str,
     pub bastion_ssh_pubkey: Option<&'a str>,
+    /// Memory limit (e.g. "1g", "2g"). Omit to use compose template default.
+    pub mem_limit: Option<&'a str>,
+    /// CPU limit (e.g. "2", "4"). Omit to use compose template default.
+    pub cpus: Option<&'a str>,
+    /// Container storage limit (e.g. "10G", "20G"). Omit to use compose template default.
+    pub storage_size: Option<&'a str>,
 }
 
 /// Manages one Docker Compose project per worker via the `docker compose` CLI.
@@ -132,6 +138,15 @@ impl ComposeManager {
             vars.insert("BASTION_SSH_PUBKEY".into(), bastion_key.into());
         }
         vars.insert("SERVICE_TYPE".into(), cfg.service_type.to_string());
+        if let Some(v) = cfg.mem_limit {
+            vars.insert("MEM_LIMIT".into(), v.into());
+        }
+        if let Some(v) = cfg.cpus {
+            vars.insert("CPUS".into(), v.into());
+        }
+        if let Some(v) = cfg.storage_size {
+            vars.insert("STORAGE_SIZE".into(), v.into());
+        }
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
         // Pull from registry for remote images (contain '/') or digest-pinned references;
@@ -472,6 +487,9 @@ impl ComposeManager {
             image,
             image_digest,
             service_type,
+            mem_limit: None,
+            cpus: None,
+            storage_size: None,
         })
     }
 

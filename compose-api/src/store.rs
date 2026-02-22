@@ -32,6 +32,15 @@ pub struct Instance {
     /// "openclaw" (default) or "ironclaw"
     #[serde(default)]
     pub service_type: Option<String>,
+    /// Memory limit override (e.g. "1g", "2g")
+    #[serde(default)]
+    pub mem_limit: Option<String>,
+    /// CPU limit override (e.g. "2", "4")
+    #[serde(default)]
+    pub cpus: Option<String>,
+    /// Container storage limit override (e.g. "10G", "20G")
+    #[serde(default)]
+    pub storage_size: Option<String>,
 }
 
 #[derive(Debug)]
@@ -149,6 +158,9 @@ mod tests {
             image: None,
             image_digest: None,
             service_type: None,
+            mem_limit: None,
+            cpus: None,
+            storage_size: None,
         }
     }
 
