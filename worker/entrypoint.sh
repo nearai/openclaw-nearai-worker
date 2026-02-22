@@ -56,7 +56,10 @@ setup_ssh() {
       -o PasswordAuthentication=no \
       -o PermitRootLogin=no \
       -o PidFile=/home/agent/ssh/sshd.pid \
-      -o StrictModes=yes 2>&1) && SSHD_RC=0 || SSHD_RC=$?
+      -o StrictModes=yes \
+      -o UsePAM=yes \
+      -o AcceptEnv="LANG LC_*" \
+      -o PrintMotd=no 2>&1) && SSHD_RC=0 || SSHD_RC=$?
     if [ "$SSHD_RC" -eq 0 ]; then
       echo "SSH daemon started on port 2222"
     else
