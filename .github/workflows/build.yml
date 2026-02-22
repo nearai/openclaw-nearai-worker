@@ -83,7 +83,7 @@ jobs:
             TAG=${GITHUB_REF_NAME#v}
             echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} tag"
           elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
-            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'main' ]]; then echo 'latest'; else echo 'dev'; fi)
+            TAG='dev'
             echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} branch"
           else
             echo "Unsupported ref type: ${GITHUB_REF_TYPE}" >&2
