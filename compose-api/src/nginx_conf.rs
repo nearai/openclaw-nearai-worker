@@ -54,6 +54,9 @@ mod tests {
             image_digest: None,
             nearai_api_url: None,
             service_type: None,
+            mem_limit: None,
+            cpus: None,
+            storage_size: None,
         }
     }
 

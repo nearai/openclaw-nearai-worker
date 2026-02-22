@@ -133,6 +133,9 @@ impl AppState {
         image: &str,
         nearai_api_url: &str,
         service_type: &str,
+        mem_limit: Option<String>,
+        cpus: Option<String>,
+        storage_size: Option<String>,
     ) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
@@ -155,6 +158,9 @@ impl AppState {
                 nearai_api_url: &nearai_api_url,
                 service_type: &service_type,
                 bastion_ssh_pubkey: bastion_ssh_pubkey.as_deref(),
+                mem_limit: mem_limit.as_deref(),
+                cpus: cpus.as_deref(),
+                storage_size: storage_size.as_deref(),
             })
         })
         .await
@@ -515,6 +521,15 @@ struct CreateInstanceRequest {
     /// Service type: "openclaw" (default) or "ironclaw"
     #[serde(default)]
     service_type: Option<String>,
+    /// Memory limit (e.g. "1g", "2g", "512m"). Default: "1g"
+    #[serde(default)]
+    mem_limit: Option<String>,
+    /// CPU limit (e.g. "2", "4", "0.5"). Default: "2"
+    #[serde(default)]
+    cpus: Option<String>,
+    /// Container storage limit (e.g. "10G", "20G"). Default: "10G"
+    #[serde(default)]
+    storage_size: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -949,6 +964,9 @@ async fn create_instance(
         image: Some(image.clone()),
         image_digest: None,
         service_type: Some(service_type.clone()),
+        mem_limit: req.mem_limit.clone(),
+        cpus: req.cpus.clone(),
+        storage_size: req.storage_size.clone(),
     };
 
     // Save to store before streaming so it's persisted immediately
@@ -959,6 +977,9 @@ async fn create_instance(
 
     let nearai_api_key = req.nearai_api_key.clone();
     let ssh_pubkey = req.ssh_pubkey.clone();
+    let mem_limit = req.mem_limit.clone();
+    let cpus = req.cpus.clone();
+    let storage_size = req.storage_size.clone();
 
     let stream = async_stream::stream! {
         yield Ok(sse_created(&info));
@@ -975,6 +996,9 @@ async fn create_instance(
             &image,
             &nearai_api_url,
             &service_type,
+            mem_limit,
+            cpus,
+            storage_size,
         ).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
@@ -1192,6 +1216,9 @@ async fn restart_instance(
                     .as_deref()
                     .unwrap_or(DEFAULT_NEARAI_API_URL),
                 inst.service_type.as_deref().unwrap_or("openclaw"),
+                inst.mem_limit.clone(),
+                inst.cpus.clone(),
+                inst.storage_size.clone(),
             ).await {
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
