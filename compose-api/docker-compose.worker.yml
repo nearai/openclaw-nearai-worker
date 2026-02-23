@@ -20,7 +20,7 @@ services:
       SSH_PUBKEY: ${SSH_PUBKEY:-}
       BASTION_SSH_PUBKEY: ${BASTION_SSH_PUBKEY:-}
     command: ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789"]
-    mem_limit: ${MEM_LIMIT:-1g}
+    mem_limit: ${MEM_LIMIT:-4g}
     cpus: ${CPUS:-1}
     volumes:
       - config:/home/agent/.openclaw
