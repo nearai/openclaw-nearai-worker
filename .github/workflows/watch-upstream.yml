@@ -20,7 +20,8 @@ jobs:
         id: release
         run: |
           TAG=$(gh release view --repo nearai/ironclaw --json tagName -q '.tagName')
-          VERSION=${TAG#ironclaw-v}
+          # Strip any non-digit prefix: "ironclaw-v0.8.0" -> "0.8.0", "v0.9.0" -> "0.9.0"
+          VERSION=$(echo "$TAG" | sed 's/^[^0-9]*//')
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Latest ironclaw release: $TAG (version $VERSION)"
