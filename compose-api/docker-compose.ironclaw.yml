@@ -16,7 +16,7 @@ services:
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
       SSH_PUBKEY: ${SSH_PUBKEY:-}
       BASTION_SSH_PUBKEY: ${BASTION_SSH_PUBKEY:-}
-    mem_limit: ${MEM_LIMIT:-1g}
+    mem_limit: ${MEM_LIMIT:-4g}
     cpus: ${CPUS:-1}
     volumes:
       - config:/home/agent/.ironclaw
