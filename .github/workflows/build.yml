@@ -102,13 +102,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
+      # Resolve latest openclaw version from GitHub releases when not explicitly provided
+      - name: Resolve openclaw version
+        if: matrix.name == 'openclaw-nearai-worker' && !inputs.openclaw_version
+        id: openclaw
+        run: |
+          TAG=$(gh release view --repo openclaw/openclaw --json tagName -q '.tagName')
+          VERSION=${TAG#v}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved latest openclaw version: $VERSION (tag: $TAG)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       # Reproducible build path (worker only — uses build-image.sh)
       - name: Build and push reproducible image
         if: matrix.build_script
         run: |
           ./deploy/build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
         env:
-          OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
+          OPENCLAW_VERSION: ${{ inputs.openclaw_version || steps.openclaw.outputs.version }}
 
       - name: Get image digest (reproducible)
         if: matrix.build_script
@@ -119,6 +131,18 @@ jobs:
             exit 1
           fi
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+
+      # Resolve latest ironclaw version from GitHub releases when not explicitly provided
+      - name: Resolve ironclaw version
+        if: matrix.name == 'ironclaw-nearai-worker' && !inputs.ironclaw_version
+        id: ironclaw
+        run: |
+          TAG=$(gh release view --repo nearai/ironclaw --json tagName -q '.tagName')
+          VERSION=$(echo "$TAG" | sed 's/^[^0-9]*//')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved latest ironclaw version: $VERSION (tag: $TAG)"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       # Standard Docker build path (compose-api, updater)
       - name: Build and push image
@@ -132,7 +156,7 @@ jobs:
           tags: ${{ env.IMAGE_REFERENCE }}
           build-args: |
             GIT_COMMIT=${{ github.sha }}
-            ${{ inputs.ironclaw_version && format('IRONCLAW_VERSION={0}', inputs.ironclaw_version) || '' }}
+            ${{ (inputs.ironclaw_version || steps.ironclaw.outputs.version) && format('IRONCLAW_VERSION={0}', inputs.ironclaw_version || steps.ironclaw.outputs.version) || '' }}
 
       - name: Get image digest (standard)
         if: ${{ !matrix.build_script }}
