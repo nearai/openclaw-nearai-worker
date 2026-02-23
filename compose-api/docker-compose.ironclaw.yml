@@ -17,7 +17,7 @@ services:
       SSH_PUBKEY: ${SSH_PUBKEY:-}
       BASTION_SSH_PUBKEY: ${BASTION_SSH_PUBKEY:-}
     mem_limit: ${MEM_LIMIT:-1g}
-    cpus: ${CPUS:-2}
+    cpus: ${CPUS:-1}
     volumes:
       - config:/home/agent/.ironclaw
       - workspace:/home/agent/workspace
