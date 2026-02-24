@@ -831,23 +831,31 @@ fn sse_created(info: &InstanceInfo) -> Event {
 
 // ── Health polling loop (shared by create/start/restart SSE streams) ─
 
-async fn poll_health_to_ready(state: &AppState, name: &str, tx: &tokio::sync::mpsc::Sender<Event>) {
+const MAX_HEALTH_RETRIES: u32 = 2;
+
+async fn poll_health_to_ready(
+    state: &AppState,
+    name: &str,
+    service_type: Option<&str>,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
     let mut last_stage = String::new();
+    let mut retries: u32 = 0;
 
-    loop {
+    let success = loop {
         if tokio::time::Instant::now() >= deadline {
             let _ = tx
                 .send(sse_error("timeout waiting for container to become ready"))
                 .await;
-            return;
+            break false;
         }
 
         let health = match state.compose_container_health(name).await {
             Ok(h) => h,
             Err(e) => {
                 let _ = tx.send(sse_error(&e.to_string())).await;
-                return;
+                break false;
             }
         };
         let (stage, msg, done) = match (health.state.as_str(), health.health.as_str()) {
@@ -874,9 +882,39 @@ async fn poll_health_to_ready(state: &AppState, name: &str, tx: &tokio::sync::mp
 
         if stage != last_stage {
             last_stage = stage.to_string();
+
             if done {
+                if retries < MAX_HEALTH_RETRIES {
+                    retries += 1;
+                    let _ = tx
+                        .send(sse_stage(
+                            "retrying",
+                            &format!("{} — restarting (attempt {}/{})", msg, retries, MAX_HEALTH_RETRIES),
+                        ))
+                        .await;
+                    tracing::warn!(
+                        "Instance '{}' failed ({}), restarting (attempt {}/{})",
+                        name, msg, retries, MAX_HEALTH_RETRIES
+                    );
+                    // Use `start` for exited/dead containers, `restart` for
+                    // unhealthy ones that are still running.
+                    let result = if health.state == "exited" || health.state == "dead" {
+                        state.compose_start(name, service_type).await
+                    } else {
+                        state.compose_restart(name, service_type).await
+                    };
+                    if let Err(e) = result {
+                        let _ = tx
+                            .send(sse_error(&format!("Failed to restart container: {}", e)))
+                            .await;
+                        break false;
+                    }
+                    last_stage.clear();
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
                 let _ = tx.send(sse_error(msg)).await;
-                return;
+                break false;
             }
 
             let _ = tx.send(sse_stage(stage, msg)).await;
@@ -885,11 +923,24 @@ async fn poll_health_to_ready(state: &AppState, name: &str, tx: &tokio::sync::mp
                 let _ = tx
                     .send(sse_stage("ready", &format!("Instance '{}' is ready", name)))
                     .await;
-                return;
+                break true;
             }
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    };
+
+    // On health check failure, deactivate the instance and remove from routing
+    // so nginx stops sending traffic to a non-functional container.
+    if !success {
+        {
+            let mut store = state.store.write().await;
+            if let Err(e) = store.set_active(name, false) {
+                tracing::warn!("Failed to deactivate instance on health failure: {}", e);
+            }
+        }
+        update_nginx_now(state).await;
+        tracing::warn!("Deactivated instance '{}' after health check failure", name);
     }
 }
 
@@ -1051,6 +1102,11 @@ async fn create_instance(
             cpus,
             storage_size,
         ).await {
+            // Remove from store — container never started, instance is not functional
+            {
+                let mut store = state.store.write().await;
+                store.remove(&name);
+            }
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
         }
@@ -1070,12 +1126,13 @@ async fn create_instance(
 
         tracing::info!("Created instance: {} (gateway:{}, ssh:{})", name, gateway_port, ssh_port);
 
-        // Poll health until ready
+        // Poll health until ready (with auto-retry on failure)
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
         let poll_state = state.clone();
         let poll_name = name.clone();
+        let poll_service_type = service_type.clone();
         tokio::spawn(async move {
-            poll_health_to_ready(&poll_state, &poll_name, &tx).await;
+            poll_health_to_ready(&poll_state, &poll_name, Some(&poll_service_type), &tx).await;
         });
 
         while let Some(event) = rx.recv().await {
@@ -1271,6 +1328,12 @@ async fn restart_instance(
                 inst.cpus.clone(),
                 inst.storage_size.clone(),
             ).await {
+                // Mark inactive — old container was replaced, new one failed to start
+                {
+                    let mut store = state.store.write().await;
+                    let _ = store.set_active(&name, false);
+                }
+                update_nginx_now(&state).await;
                 yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
                 return;
             }
@@ -1297,8 +1360,9 @@ async fn restart_instance(
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
         let poll_state = state.clone();
         let poll_name = name.clone();
+        let poll_service_type = inst.service_type.clone();
         tokio::spawn(async move {
-            poll_health_to_ready(&poll_state, &poll_name, &tx).await;
+            poll_health_to_ready(&poll_state, &poll_name, poll_service_type.as_deref(), &tx).await;
         });
 
         while let Some(event) = rx.recv().await {
@@ -1396,8 +1460,9 @@ async fn start_instance(
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
         let poll_state = state.clone();
         let poll_name = name.clone();
+        let poll_service_type = inst.service_type.clone();
         tokio::spawn(async move {
-            poll_health_to_ready(&poll_state, &poll_name, &tx).await;
+            poll_health_to_ready(&poll_state, &poll_name, poll_service_type.as_deref(), &tx).await;
         });
 
         while let Some(event) = rx.recv().await {
