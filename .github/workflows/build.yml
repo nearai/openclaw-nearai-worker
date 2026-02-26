@@ -14,6 +14,10 @@ on:
         description: 'IronClaw version for worker image (default: Dockerfile ARG)'
         required: false
         type: string
+      ironclaw_commit:
+        description: 'Build ironclaw from source at this commit (nearai/ironclaw). Only builds ironclaw-worker.'
+        required: false
+        type: string
   push:
     branches:
       - main
@@ -60,10 +64,22 @@ jobs:
             dockerfile: ssh-bastion/Dockerfile
             build_script: false
     steps:
+      - name: Validate inputs
+        if: ${{ inputs.ironclaw_commit && inputs.ironclaw_version }}
+        run: |
+          echo "::error::Cannot specify both ironclaw_commit and ironclaw_version"
+          exit 1
+
+      - name: Skip non-ironclaw images when building from commit
+        if: ${{ inputs.ironclaw_commit && matrix.name != 'ironclaw-nearai-worker' }}
+        run: echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
+
       - name: Checkout repository
+        if: ${{ env.SKIP_BUILD != 'true' }}
         uses: actions/checkout@v4
 
       - name: Log in to Docker registry
+        if: ${{ env.SKIP_BUILD != 'true' }}
         uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
         with:
           registry: ${{ env.REGISTRY }}
@@ -71,9 +87,11 @@ jobs:
           password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
 
       - name: Set image repository
+        if: ${{ env.SKIP_BUILD != 'true' }}
         run: echo "IMAGE_REPOSITORY=${{ vars.DOCKER_REGISTRY_USER }}/${{ matrix.name }}" >> "$GITHUB_ENV"
 
       - name: Extract image tag from GitHub ref (branch or tag)
+        if: ${{ env.SKIP_BUILD != 'true' }}
         run: |
           # Use manual input tag if provided via workflow_dispatch
           if [[ -n "${{ inputs.tag }}" ]]; then
@@ -97,21 +115,48 @@ jobs:
           echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${IMAGE_REPOSITORY}:${TAG}" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
-        if: matrix.build_script
+        if: ${{ matrix.build_script && env.SKIP_BUILD != 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
+      # Build ironclaw from source when ironclaw_commit is provided
+      - name: Clone ironclaw source
+        if: ${{ inputs.ironclaw_commit && matrix.name == 'ironclaw-nearai-worker' && env.SKIP_BUILD != 'true' }}
+        run: |
+          git clone https://github.com/nearai/ironclaw.git ironclaw-src
+          cd ironclaw-src
+          git checkout "${{ inputs.ironclaw_commit }}"
+          echo "Checked out ironclaw at $(git rev-parse HEAD)"
+
+      - name: Install Rust toolchain
+        if: ${{ inputs.ironclaw_commit && matrix.name == 'ironclaw-nearai-worker' && env.SKIP_BUILD != 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        if: ${{ inputs.ironclaw_commit && matrix.name == 'ironclaw-nearai-worker' && env.SKIP_BUILD != 'true' }}
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ironclaw-src -> target
+
+      - name: Build ironclaw from source
+        if: ${{ inputs.ironclaw_commit && matrix.name == 'ironclaw-nearai-worker' && env.SKIP_BUILD != 'true' }}
+        run: |
+          cd ironclaw-src
+          cargo build --release
+          cp target/release/ironclaw "${{ github.workspace }}/ironclaw-worker/ironclaw"
+          echo "Built ironclaw binary successfully"
+
       # Reproducible build path (worker only — uses build-image.sh)
       - name: Build and push reproducible image
-        if: matrix.build_script
+        if: ${{ matrix.build_script && env.SKIP_BUILD != 'true' }}
         run: |
           ./deploy/build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
         env:
           OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
 
       - name: Get image digest (reproducible)
-        if: matrix.build_script
+        if: ${{ matrix.build_script && env.SKIP_BUILD != 'true' }}
         run: |
           DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
           if [ -z "${DIGEST}" ]; then
@@ -122,7 +167,7 @@ jobs:
 
       # Standard Docker build path (compose-api, updater, ironclaw-worker, ingress, bastion)
       - name: Build and push image
-        if: ${{ !matrix.build_script }}
+        if: ${{ !matrix.build_script && env.SKIP_BUILD != 'true' }}
         uses: docker/build-push-action@v6
         id: docker_build
         with:
@@ -135,10 +180,11 @@ jobs:
             ${{ inputs.ironclaw_version && format('IRONCLAW_VERSION={0}', inputs.ironclaw_version) || '' }}
 
       - name: Get image digest (standard)
-        if: ${{ !matrix.build_script }}
+        if: ${{ !matrix.build_script && env.SKIP_BUILD != 'true' }}
         run: echo "IMAGE_DIGEST=${{ steps.docker_build.outputs.digest }}" >> "$GITHUB_ENV"
 
       - name: Generate artifact attestation (GitHub)
+        if: ${{ env.SKIP_BUILD != 'true' }}
         uses: actions/attest-build-provenance@v3
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
@@ -146,13 +192,16 @@ jobs:
           push-to-registry: true
 
       - name: Install cosign
+        if: ${{ env.SKIP_BUILD != 'true' }}
         uses: sigstore/cosign-installer@v3
 
       - name: Sign image with cosign (keyless)
+        if: ${{ env.SKIP_BUILD != 'true' }}
         run: |
           cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
 
       - name: Generate build summary
+        if: ${{ env.SKIP_BUILD != 'true' }}
         run: |
           {
             echo "## ${{ env.IMAGE_REPOSITORY }} docker image"
