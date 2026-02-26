@@ -1,12 +1,14 @@
 # IronClaw worker image for compose-api deployment.
 #
+# Requires BuildKit (uses RUN --mount). Enable with DOCKER_BUILDKIT=1 or use buildx.
+#
 # Downloads a prebuilt binary from GitHub releases:
-#   docker build --build-arg IRONCLAW_VERSION=<version> \
-#     -t ironclaw-nearai-worker:local ironclaw-worker/
+#   DOCKER_BUILDKIT=1 docker build --build-arg IRONCLAW_VERSION=<version> \
+#     -t ironclaw-nearai-worker:<tag> ironclaw-worker/
 #
 # Or use a locally built binary (CI places it in the build context):
 #   cp /path/to/ironclaw ironclaw-worker/ironclaw
-#   docker build -t ironclaw-nearai-worker:dev ironclaw-worker/
+#   DOCKER_BUILDKIT=1 docker build -t ironclaw-nearai-worker:<tag> ironclaw-worker/
 
 FROM debian:bookworm-slim
 

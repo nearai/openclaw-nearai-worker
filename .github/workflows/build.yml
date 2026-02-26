@@ -137,7 +137,7 @@ jobs:
         if: ${{ inputs.ironclaw_commit }}
         run: |
           cd ironclaw-src
-          cargo build --release
+          cargo build --release --locked
           cp target/release/ironclaw "${{ github.workspace }}/ironclaw-worker/ironclaw"
           echo "Built ironclaw binary successfully"
 
