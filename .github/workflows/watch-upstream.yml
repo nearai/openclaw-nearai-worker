@@ -6,7 +6,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
+  contents: write
+  pull-requests: write
 
 jobs:
   check-ironclaw:
@@ -28,7 +29,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Check if already built
+      - name: Check if already seen
         id: cache
         uses: actions/cache@v4
         with:
@@ -57,7 +58,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Check if already built
+      - name: Check if already seen
         id: cache
         uses: actions/cache@v4
         with:
@@ -68,25 +69,81 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: echo "${{ steps.release.outputs.tag }}" > .openclaw-release-marker
 
-  trigger-build:
+  version-bump-pr:
     needs: [check-ironclaw, check-openclaw]
     if: needs.check-ironclaw.outputs.new_release == 'true' || needs.check-openclaw.outputs.new_release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger single build
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bump ironclaw version in Dockerfile
+        if: needs.check-ironclaw.outputs.new_release == 'true'
         run: |
-          ARGS=""
+          VERSION="${{ needs.check-ironclaw.outputs.version }}"
+          sed -i "s/^ARG IRONCLAW_VERSION=.*/ARG IRONCLAW_VERSION=${VERSION}/" ironclaw-worker/Dockerfile
+          echo "Updated ironclaw-worker/Dockerfile: IRONCLAW_VERSION=${VERSION}"
+
+      - name: Bump openclaw version in Dockerfile
+        if: needs.check-openclaw.outputs.new_release == 'true'
+        run: |
+          VERSION="${{ needs.check-openclaw.outputs.version }}"
+          sed -i "s/^ARG OPENCLAW_VERSION=.*/ARG OPENCLAW_VERSION=${VERSION}/" worker/Dockerfile
+          echo "Updated worker/Dockerfile: OPENCLAW_VERSION=${VERSION}"
+
+      - name: Validate changes were applied
+        run: |
           if [[ "${{ needs.check-ironclaw.outputs.new_release }}" == "true" ]]; then
-            ARGS="$ARGS -f ironclaw_version=${{ needs.check-ironclaw.outputs.version }}"
+            if git diff --quiet ironclaw-worker/Dockerfile; then
+              echo "ERROR: sed made no change to ironclaw-worker/Dockerfile" >&2
+              exit 1
+            fi
           fi
           if [[ "${{ needs.check-openclaw.outputs.new_release }}" == "true" ]]; then
-            ARGS="$ARGS -f openclaw_version=${{ needs.check-openclaw.outputs.version }}"
+            if git diff --quiet worker/Dockerfile; then
+              echo "ERROR: sed made no change to worker/Dockerfile" >&2
+              exit 1
+            fi
           fi
 
-          gh workflow run build.yml --repo ${{ github.repository }} $ARGS
+      - name: Create pull request
+        run: |
+          NL=$'\n'
+          COMPONENTS=""
+          BODY="Automated version bump detected by watch-upstream.${NL}${NL}## Changes${NL}"
 
-          echo "Triggered build (ironclaw=${{ needs.check-ironclaw.outputs.new_release }}, openclaw=${{ needs.check-openclaw.outputs.new_release }})"
-          [[ "${{ needs.check-ironclaw.outputs.new_release }}" == "true" ]] && echo "  ironclaw: ${{ needs.check-ironclaw.outputs.tag }}"
-          [[ "${{ needs.check-openclaw.outputs.new_release }}" == "true" ]] && echo "  openclaw: ${{ needs.check-openclaw.outputs.tag }}"
+          if [[ "${{ needs.check-ironclaw.outputs.new_release }}" == "true" ]]; then
+            COMPONENTS="ironclaw-${{ needs.check-ironclaw.outputs.version }}"
+            BODY="${BODY}- **IronClaw**: \`${{ needs.check-ironclaw.outputs.version }}\` ([release](https://github.com/nearai/ironclaw/releases/tag/${{ needs.check-ironclaw.outputs.tag }}))${NL}"
+          fi
+
+          if [[ "${{ needs.check-openclaw.outputs.new_release }}" == "true" ]]; then
+            [[ -n "$COMPONENTS" ]] && COMPONENTS="${COMPONENTS}-"
+            COMPONENTS="${COMPONENTS}openclaw-${{ needs.check-openclaw.outputs.version }}"
+            BODY="${BODY}- **OpenClaw**: \`${{ needs.check-openclaw.outputs.version }}\` ([release](https://github.com/openclaw/openclaw/releases/tag/${{ needs.check-openclaw.outputs.tag }}))${NL}"
+          fi
+
+          BRANCH="deps/bump-${COMPONENTS}"
+          TITLE="Bump ${COMPONENTS}"
+
+          # Skip if a PR already exists for this branch (handles cache expiry re-detection)
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number' || true)
+          if [[ -n "$EXISTING" ]]; then
+            echo "PR #${EXISTING} already exists for branch ${BRANCH}, skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add ironclaw-worker/Dockerfile worker/Dockerfile
+          git commit -m "$TITLE"
+          git push --force-with-lease origin "$BRANCH"
+
+          printf '%s' "$BODY" | gh pr create \
+            --title "$TITLE" \
+            --body-file - \
+            --head "$BRANCH" \
+            --base main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
