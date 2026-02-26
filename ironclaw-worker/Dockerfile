@@ -1,7 +1,7 @@
 # IronClaw worker image for compose-api deployment.
 #
 # Downloads a prebuilt binary from GitHub releases:
-#   docker build --build-arg IRONCLAW_VERSION=0.11.1 \
+#   docker build --build-arg IRONCLAW_VERSION=<version> \
 #     -t ironclaw-nearai-worker:local ironclaw-worker/
 #
 # Or use a locally built binary (CI places it in the build context):
@@ -34,7 +34,7 @@ RUN apt-get update && \
 # Otherwise, download the pinned release from GitHub.
 # Uses BuildKit bind mount to probe the build context without a COPY that
 # would fail when the file is absent.
-ARG IRONCLAW_VERSION=0.11.1
+ARG IRONCLAW_VERSION=0.12.0
 RUN --mount=type=bind,source=.,target=/ctx \
     if [ -f /ctx/ironclaw ]; then \
       echo "Using locally built ironclaw binary"; \
