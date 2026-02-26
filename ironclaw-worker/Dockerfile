@@ -1,7 +1,7 @@
 # IronClaw worker image for compose-api deployment.
 #
 # Downloads a prebuilt binary from GitHub releases:
-#   docker build --build-arg IRONCLAW_VERSION=0.11.1 \
+#   docker build --build-arg IRONCLAW_VERSION=<version> \
 #     -t ironclaw-nearai-worker:local ironclaw-worker/
 
 FROM debian:bookworm-slim
