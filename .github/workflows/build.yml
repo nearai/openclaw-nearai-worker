@@ -109,7 +109,7 @@ jobs:
           echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${IMAGE_REPOSITORY}:${TAG}" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
-        if: ${{ matrix.build_script }}
+        if: matrix.build_script
         run: |
           sudo apt-get update
           sudo apt-get install -y skopeo jq
@@ -143,14 +143,14 @@ jobs:
 
       # Reproducible build path (worker only — uses build-image.sh)
       - name: Build and push reproducible image
-        if: ${{ matrix.build_script }}
+        if: matrix.build_script
         run: |
           ./deploy/build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
         env:
           OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
 
       - name: Get image digest (reproducible)
-        if: ${{ matrix.build_script }}
+        if: matrix.build_script
         run: |
           DIGEST=$(skopeo inspect oci-archive:./oci.tar | jq -r '.Digest')
           if [ -z "${DIGEST}" ]; then
