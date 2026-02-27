@@ -124,7 +124,7 @@ impl ComposeManager {
 
     // ── compose lifecycle ─────────────────────────────────────────────
 
-    /// `docker compose -p openclaw-{name} up -d --pull always`
+    /// `docker compose -p openclaw-{name} up -d --pull missing`
     pub fn up(&self, cfg: &InstanceConfig) -> Result<(), ApiError> {
         let mut vars = HashMap::new();
         vars.insert("NEARAI_API_KEY".into(), cfg.nearai_api_key.into());
@@ -149,10 +149,13 @@ impl ComposeManager {
         }
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
-        // Pull from registry for remote images (contain '/') or digest-pinned references;
-        // local-only images (no '/') use --pull never
+        // Pull from registry only when the image is not already cached locally.
+        // For digest-pinned images (@sha256:), "missing" is semantically identical to
+        // "always" (same digest = same bytes) but avoids redundant re-downloads that
+        // fail on some storage backends (overlay2-on-ZFS in dstack).
+        // Local-only images (no '/') use --pull never.
         let pull_policy = if cfg.image.contains('/') || cfg.image.contains("@sha256:") {
-            "always"
+            "missing"
         } else {
             "never"
         };
