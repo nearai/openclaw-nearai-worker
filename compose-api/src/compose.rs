@@ -124,7 +124,6 @@ impl ComposeManager {
 
     // ── compose lifecycle ─────────────────────────────────────────────
 
-    /// `docker compose -p openclaw-{name} up -d --pull missing`
     pub fn up(&self, cfg: &InstanceConfig) -> Result<(), ApiError> {
         let mut vars = HashMap::new();
         vars.insert("NEARAI_API_KEY".into(), cfg.nearai_api_key.into());
@@ -149,20 +148,22 @@ impl ComposeManager {
         }
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
-        // Pull from registry only when the image is not already cached locally.
-        // For digest-pinned images (@sha256:), "missing" is semantically identical to
-        // "always" (same digest = same bytes) but avoids redundant re-downloads that
-        // fail on some storage backends (overlay2-on-ZFS in dstack).
-        // Local-only images (no '/') use --pull never.
-        let pull_policy = if cfg.image.contains('/') || cfg.image.contains("@sha256:") {
-            "missing"
-        } else {
-            "never"
-        };
+        // docker pull handles caching correctly; compose v5 --pull does not.
+        let is_remote = cfg.image.contains('/') || cfg.image.contains("@sha256:");
+        if is_remote {
+            let output = Command::new("docker")
+                .args(["pull", cfg.image])
+                .output()
+                .map_err(|e| ApiError::Internal(format!("docker pull: {}", e)))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(ApiError::Internal(format!("docker pull failed: {}", stderr)));
+            }
+        }
         self.compose_cmd(
             cfg.name,
             &env_path,
-            &["up", "-d", "--pull", pull_policy],
+            &["up", "-d", "--pull", "never"],
             Some(&vars),
             Some(cfg.service_type),
         )
