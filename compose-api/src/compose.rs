@@ -178,7 +178,14 @@ impl ComposeManager {
             &["up", "-d", "--pull", "never"],
             Some(&vars),
             Some(cfg.service_type),
-        )
+        )?;
+
+        // Clean up dangling images left behind by upgrades.
+        let _ = Command::new("docker")
+            .args(["image", "prune", "-f"])
+            .output();
+
+        Ok(())
     }
 
     /// `docker compose -p openclaw-{name} down -v` (removes volumes too)
