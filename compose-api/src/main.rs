@@ -194,7 +194,11 @@ impl AppState {
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+    async fn compose_restart(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+    ) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
         let service_type = service_type.map(|s| s.to_string());
@@ -203,7 +207,11 @@ impl AppState {
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_status(&self, name: &str, service_type: Option<&str>) -> Result<String, ApiError> {
+    async fn compose_status(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+    ) -> Result<String, ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
         let service_type = service_type.map(|s| s.to_string());
@@ -377,7 +385,10 @@ async fn main() -> anyhow::Result<()> {
     let ironclaw_path = std::path::PathBuf::from(&ironclaw_compose_file);
     if ironclaw_path.exists() {
         compose_files.insert("ironclaw".to_string(), ironclaw_path);
-        tracing::info!("IronClaw compose template loaded: {}", ironclaw_compose_file);
+        tracing::info!(
+            "IronClaw compose template loaded: {}",
+            ironclaw_compose_file
+        );
     } else {
         tracing::info!(
             "IronClaw compose template not found at {}, ironclaw service type disabled",
@@ -796,7 +807,10 @@ fn effective_ssh_port(config: &AppConfig, instance_ssh_port: u16) -> u16 {
 }
 
 fn generate_ssh_command(config: &AppConfig, name: &str, ssh_port: u16) -> String {
-    let host = config.openclaw_domain.as_deref().unwrap_or(&config.host_address);
+    let host = config
+        .openclaw_domain
+        .as_deref()
+        .unwrap_or(&config.host_address);
     let port = effective_ssh_port(config, ssh_port);
     format!("ssh -p {} {}@{}", port, name, host)
 }
@@ -898,12 +912,18 @@ async fn poll_health_to_ready(
                     let _ = tx
                         .send(sse_stage(
                             "retrying",
-                            &format!("{} — restarting (attempt {}/{})", msg, retries, MAX_HEALTH_RETRIES),
+                            &format!(
+                                "{} — restarting (attempt {}/{})",
+                                msg, retries, MAX_HEALTH_RETRIES
+                            ),
                         ))
                         .await;
                     tracing::warn!(
                         "Instance '{}' failed ({}), restarting (attempt {}/{})",
-                        name, msg, retries, MAX_HEALTH_RETRIES
+                        name,
+                        msg,
+                        retries,
+                        MAX_HEALTH_RETRIES
                     );
                     // Use `start` for exited/dead containers, `restart` for
                     // unhealthy ones that are still running.
@@ -1173,7 +1193,9 @@ async fn get_instance(
 
     match instance {
         Some(inst) => {
-            let status = state.compose_status(&inst.name, inst.service_type.as_deref()).await?;
+            let status = state
+                .compose_status(&inst.name, inst.service_type.as_deref())
+                .await?;
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = generate_ssh_command(&state.config, &inst.name, inst.ssh_port);
@@ -1279,7 +1301,9 @@ async fn delete_instance(
     };
     let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
-    state.compose_down(&name, inst.service_type.as_deref()).await?;
+    state
+        .compose_down(&name, inst.service_type.as_deref())
+        .await?;
 
     {
         let mut store = state.store.write().await;
@@ -1327,43 +1351,64 @@ async fn restart_instance(
 
     let stream = async_stream::stream! {
         if let Some(ref image) = new_image {
-            // Full recreate with new image
+            // Full recreate with new image — run compose_up + set_image in a spawned task
+            // so store is updated even if the client disconnects; stream yields immediately for UX
             yield Ok(sse_stage("container_starting", &format!("Recreating container with image {}...", image)));
 
-            if let Err(e) = state.compose_up(
-                &name,
-                &inst.nearai_api_key,
-                &inst.token,
-                inst.gateway_port,
-                inst.ssh_port,
-                &inst.ssh_pubkey,
-                image,
-                inst.nearai_api_url
-                    .as_deref()
-                    .unwrap_or(DEFAULT_NEARAI_API_URL),
-                inst.service_type.as_deref().unwrap_or("openclaw"),
-                inst.mem_limit.clone(),
-                inst.cpus.clone(),
-                inst.storage_size.clone(),
-            ).await {
-                // Mark inactive — old container was replaced, new one failed to start
-                {
-                    let mut store = state.store.write().await;
-                    let _ = store.set_active(&name, false);
-                }
-                update_nginx_now(&state).await;
-                yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
-                return;
-            }
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<Option<String>, String>>();
+            let state_clone = state.clone();
+            let name_clone = name.clone();
+            let image_clone = image.clone();
+            let inst_clone = inst.clone();
 
-            // Resolve new digest
-            let image_digest = state.compose_resolve_image_digest(&name).await;
-            if let Some(ref digest) = image_digest {
-                yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
-            }
-            {
-                let mut store = state.store.write().await;
-                let _ = store.set_image(&name, Some(image.clone()), image_digest);
+            tokio::spawn(async move {
+                let result = if let Err(e) = state_clone.compose_up(
+                    &name_clone,
+                    &inst_clone.nearai_api_key,
+                    &inst_clone.token,
+                    inst_clone.gateway_port,
+                    inst_clone.ssh_port,
+                    &inst_clone.ssh_pubkey,
+                    &image_clone,
+                    inst_clone.nearai_api_url
+                        .as_deref()
+                        .unwrap_or(DEFAULT_NEARAI_API_URL),
+                    inst_clone.service_type.as_deref().unwrap_or("openclaw"),
+                    inst_clone.mem_limit.clone(),
+                    inst_clone.cpus.clone(),
+                    inst_clone.storage_size.clone(),
+                ).await {
+                    {
+                        let mut store = state_clone.store.write().await;
+                        let _ = store.set_active(&name_clone, false);
+                    }
+                    update_nginx_now(&state_clone).await;
+                    Err(e.to_string())
+                } else {
+                    let image_digest = state_clone.compose_resolve_image_digest(&name_clone).await;
+                    {
+                        let mut store = state_clone.store.write().await;
+                        let _ = store.set_image(&name_clone, Some(image_clone), image_digest.clone());
+                    }
+                    Ok(image_digest)
+                };
+                let _ = tx.send(result);
+            });
+
+            match rx.await {
+                Ok(Ok(image_digest)) => {
+                    if let Some(ref digest) = image_digest {
+                        yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
+                    }
+                }
+                Ok(Err(e)) => {
+                    yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
+                    return;
+                }
+                Err(_) => {
+                    yield Ok(sse_error("Upgrade task was dropped"));
+                    return;
+                }
             }
         } else {
             // Simple restart
@@ -1534,9 +1579,8 @@ async fn tdx_attestation(
                 "nonce must be exactly 64 hex characters (32 bytes)".into(),
             ));
         }
-        hex::decode(n).map_err(|_| {
-            ApiError::BadRequest("nonce must be a valid hex string".into())
-        })?;
+        hex::decode(n)
+            .map_err(|_| ApiError::BadRequest("nonce must be a valid hex string".into()))?;
         n.clone()
     } else {
         // Generate a random 32-byte nonce
@@ -1595,10 +1639,7 @@ async fn tdx_attestation(
     // dstack returns report_data as a hex string — validate and use directly
     let report_data_hex = returned_report_data.to_string();
     hex::decode(&report_data_hex).map_err(|e| {
-        ApiError::ServiceUnavailable(format!(
-            "dstack returned invalid hex report_data: {}",
-            e
-        ))
+        ApiError::ServiceUnavailable(format!("dstack returned invalid hex report_data: {}", e))
     })?;
 
     Ok(Json(TdxAttestationReport {
@@ -1762,17 +1803,13 @@ async fn download_backup_endpoint(
 
 fn validate_env_key(key: &str) -> Result<(), ApiError> {
     if key.is_empty() || key.len() > 128 {
-        return Err(ApiError::BadRequest(
-            "Key must be 1-128 characters".into(),
-        ));
+        return Err(ApiError::BadRequest("Key must be 1-128 characters".into()));
     }
     if !key
         .chars()
         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     {
-        return Err(ApiError::BadRequest(
-            "Key must match [A-Z0-9_]+".into(),
-        ));
+        return Err(ApiError::BadRequest("Key must match [A-Z0-9_]+".into()));
     }
     Ok(())
 }
@@ -2010,12 +2047,7 @@ async fn fetch_dstack_info() -> Result<serde_json::Value, ApiError> {
     }
 
     let output = tokio::process::Command::new("curl")
-        .args([
-            "--unix-socket",
-            sock_path,
-            "-s",
-            "http://localhost/Info",
-        ])
+        .args(["--unix-socket", sock_path, "-s", "http://localhost/Info"])
         .output()
         .await
         .map_err(|e| ApiError::ServiceUnavailable(format!("failed to call dstack: {}", e)))?;
