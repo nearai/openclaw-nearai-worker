@@ -1344,37 +1344,36 @@ async fn restart_instance(
             let inst_clone = inst.clone();
 
             tokio::spawn(async move {
-                let result = async {
-                    if let Err(e) = state_clone.compose_up(
-                        &name_clone,
-                        &inst_clone.nearai_api_key,
-                        &inst_clone.token,
-                        inst_clone.gateway_port,
-                        inst_clone.ssh_port,
-                        &inst_clone.ssh_pubkey,
-                        &image_clone,
-                        inst_clone.nearai_api_url
-                            .as_deref()
-                            .unwrap_or(DEFAULT_NEARAI_API_URL),
-                        inst_clone.service_type.as_deref().unwrap_or("openclaw"),
-                        inst_clone.mem_limit.clone(),
-                        inst_clone.cpus.clone(),
-                        inst_clone.storage_size.clone(),
-                    ).await {
-                        {
-                            let mut store = state_clone.store.write().await;
-                            let _ = store.set_active(&name_clone, false);
-                        }
-                        update_nginx_now(&state_clone).await;
-                        return Err(e.to_string());
+                let result = if let Err(e) = state_clone.compose_up(
+                    &name_clone,
+                    &inst_clone.nearai_api_key,
+                    &inst_clone.token,
+                    inst_clone.gateway_port,
+                    inst_clone.ssh_port,
+                    &inst_clone.ssh_pubkey,
+                    &image_clone,
+                    inst_clone.nearai_api_url
+                        .as_deref()
+                        .unwrap_or(DEFAULT_NEARAI_API_URL),
+                    inst_clone.service_type.as_deref().unwrap_or("openclaw"),
+                    inst_clone.mem_limit.clone(),
+                    inst_clone.cpus.clone(),
+                    inst_clone.storage_size.clone(),
+                ).await {
+                    {
+                        let mut store = state_clone.store.write().await;
+                        let _ = store.set_active(&name_clone, false);
                     }
+                    update_nginx_now(&state_clone).await;
+                    Err(e.to_string())
+                } else {
                     let image_digest = state_clone.compose_resolve_image_digest(&name_clone).await;
                     {
                         let mut store = state_clone.store.write().await;
                         let _ = store.set_image(&name_clone, Some(image_clone), image_digest.clone());
                     }
                     Ok(image_digest)
-                }.await;
+                };
                 let _ = tx.send(result);
             });
 
