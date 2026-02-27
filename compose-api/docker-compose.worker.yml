@@ -8,6 +8,7 @@ services:
     init: true
     labels:
       openclaw.managed: "true"
+      openclaw.service_type: "${SERVICE_TYPE:-openclaw}"
     environment:
       HOME: /home/agent
       TERM: xterm-256color
@@ -19,6 +20,7 @@ services:
       OPENCLAW_AUTO_APPROVE_DEVICES: ${OPENCLAW_AUTO_APPROVE_DEVICES:-1}
       SSH_PUBKEY: ${SSH_PUBKEY:-}
       BASTION_SSH_PUBKEY: ${BASTION_SSH_PUBKEY:-}
+      SERVICE_TYPE: ${SERVICE_TYPE:-openclaw}
     command: ["openclaw", "gateway", "run", "--bind", "lan", "--port", "18789"]
     mem_limit: ${MEM_LIMIT:-4g}
     cpus: ${CPUS:-1}
