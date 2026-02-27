@@ -64,9 +64,12 @@ fi
 # IronClaw Configuration (env var mapping)
 # ============================================
 
-# Database: libSQL embedded (no external DB dependency)
-export DATABASE_BACKEND=libsql
-export LIBSQL_PATH=/home/agent/.ironclaw/ironclaw.db
+# Database: default to libSQL embedded, but allow override via DATABASE_BACKEND.
+# Set DATABASE_BACKEND=postgres and DATABASE_URL=postgres://... to use PostgreSQL.
+export DATABASE_BACKEND="${DATABASE_BACKEND:-libsql}"
+if [ "$DATABASE_BACKEND" = "libsql" ]; then
+    export LIBSQL_PATH="${LIBSQL_PATH:-/home/agent/.ironclaw/ironclaw.db}"
+fi
 
 # Gateway: bind to all interfaces on port 18789 (matches compose port mapping)
 export GATEWAY_ENABLED=true
