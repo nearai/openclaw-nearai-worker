@@ -212,6 +212,15 @@ impl AppState {
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
+    async fn compose_all_statuses(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, ApiError> {
+        let compose = self.compose.clone();
+        tokio::task::spawn_blocking(move || compose.all_statuses())
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
     async fn compose_container_health(
         &self,
         name: &str,
@@ -1207,34 +1216,41 @@ async fn list_instances(
         store.list()
     };
 
-    let mut responses = Vec::new();
-    for inst in instances {
-        let status = state
-            .compose_status(&inst.name, inst.service_type.as_deref())
-            .await
-            .unwrap_or_else(|_| "unknown".to_string());
-        let (url, dashboard_url) =
-            generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
-        let ssh_command = generate_ssh_command(&state.config, &inst.name, inst.ssh_port);
-        let image = inst
-            .image
-            .clone()
-            .unwrap_or_else(|| state.config.openclaw_image.clone());
-        responses.push(InstanceResponse {
-            name: inst.name.clone(),
-            token: inst.token,
-            url,
-            dashboard_url,
-            gateway_port: inst.gateway_port,
-            ssh_port: inst.ssh_port,
-            ssh_command,
-            ssh_pubkey: inst.ssh_pubkey,
-            image,
-            image_digest: inst.image_digest.clone(),
-            status,
-            created_at: inst.created_at.to_rfc3339(),
-        });
-    }
+    let status_map = state
+        .compose_all_statuses()
+        .await
+        .unwrap_or_default();
+
+    let responses: Vec<_> = instances
+        .into_iter()
+        .map(|inst| {
+            let status = status_map
+                .get(&inst.name)
+                .cloned()
+                .unwrap_or_else(|| "not found".to_string());
+            let (url, dashboard_url) =
+                generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
+            let ssh_command = generate_ssh_command(&state.config, &inst.name, inst.ssh_port);
+            let image = inst
+                .image
+                .clone()
+                .unwrap_or_else(|| state.config.openclaw_image.clone());
+            InstanceResponse {
+                name: inst.name.clone(),
+                token: inst.token,
+                url,
+                dashboard_url,
+                gateway_port: inst.gateway_port,
+                ssh_port: inst.ssh_port,
+                ssh_command,
+                ssh_pubkey: inst.ssh_pubkey,
+                image,
+                image_digest: inst.image_digest.clone(),
+                status,
+                created_at: inst.created_at.to_rfc3339(),
+            }
+        })
+        .collect();
 
     Ok(Json(InstancesListResponse {
         instances: responses,

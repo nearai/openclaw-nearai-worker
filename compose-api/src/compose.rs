@@ -226,6 +226,47 @@ impl ComposeManager {
         Ok("unknown".into())
     }
 
+    /// Fetch the status of all managed gateway containers in a single `docker ps` call.
+    /// Returns a map from instance name to container state (e.g. "running", "exited").
+    pub fn all_statuses(&self) -> Result<HashMap<String, String>, ApiError> {
+        let output = Command::new("docker")
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                "label=openclaw.managed=true",
+                "--format",
+                "{{.Names}}\t{{.State}}",
+            ])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("failed to run docker ps: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!("docker ps failed: {stderr}")));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut map = HashMap::new();
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((container_name, state)) = line.split_once('\t') else {
+                continue;
+            };
+            // Match pattern: openclaw-{name}-gateway-1
+            if let Some(name) = container_name
+                .strip_prefix("openclaw-")
+                .and_then(|s| s.strip_suffix("-gateway-1"))
+            {
+                map.insert(name.to_string(), state.to_string());
+            }
+        }
+        Ok(map)
+    }
+
     // ── health polling ────────────────────────────────────────────────
 
     /// Query the Docker container health state for an instance's gateway container.
