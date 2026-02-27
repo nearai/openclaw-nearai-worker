@@ -1222,13 +1222,7 @@ async fn list_instances(
         }));
     }
 
-    let status_map = match state.compose_all_statuses().await {
-        Ok(map) => map,
-        Err(e) => {
-            tracing::warn!("Failed to fetch container statuses: {e}");
-            std::collections::HashMap::new()
-        }
-    };
+    let status_map = state.compose_all_statuses().await?;
 
     let responses: Vec<_> = instances
         .into_iter()

@@ -228,7 +228,36 @@ impl ComposeManager {
 
     /// Fetch the status of all managed gateway containers in a single `docker ps` call.
     /// Returns a map from instance name to container state (e.g. "running", "exited").
+    /// Retries up to 3 times on transient failures before returning an error.
     pub fn all_statuses(&self) -> Result<HashMap<String, String>, ApiError> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.docker_ps_statuses() {
+                Ok(map) => return Ok(map),
+                Err(e) => {
+                    last_err = e.to_string();
+                    tracing::warn!(
+                        "docker ps failed (attempt {}/{}): {}",
+                        attempt,
+                        MAX_ATTEMPTS,
+                        last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
+        }
+
+        Err(ApiError::Internal(format!(
+            "docker ps failed after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )))
+    }
+
+    fn docker_ps_statuses(&self) -> Result<HashMap<String, String>, ApiError> {
         let output = Command::new("docker")
             .args([
                 "ps",
