@@ -259,6 +259,10 @@ impl ComposeManager {
                 let name = container_name
                     .strip_prefix("openclaw-")
                     .and_then(|s| s.strip_suffix("-gateway-1"))?;
+                if !crate::is_valid_instance_name(name) {
+                    tracing::warn!("skipping container with invalid instance name: {}", name);
+                    return None;
+                }
                 Some((name.to_string(), state.to_string()))
             })
             .collect();
