@@ -226,6 +226,78 @@ impl ComposeManager {
         Ok("unknown".into())
     }
 
+    /// Fetch the status of all managed gateway containers in a single `docker ps` call.
+    /// Returns a map from instance name to container state (e.g. "running", "exited").
+    /// Retries up to 3 times on transient failures before returning an error.
+    pub fn all_statuses(&self) -> Result<HashMap<String, String>, ApiError> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.docker_ps_statuses() {
+                Ok(map) => return Ok(map),
+                Err(e) => {
+                    last_err = e.to_string();
+                    tracing::warn!(
+                        "docker ps failed (attempt {}/{}): {}",
+                        attempt,
+                        MAX_ATTEMPTS,
+                        last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
+        }
+
+        Err(ApiError::Internal(format!(
+            "docker ps failed after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )))
+    }
+
+    fn docker_ps_statuses(&self) -> Result<HashMap<String, String>, ApiError> {
+        let output = Command::new("docker")
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                "label=openclaw.managed=true",
+                "--format",
+                "{{.Names}}\t{{.State}}",
+            ])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("failed to run docker ps: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!("docker ps failed: {stderr}")));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let map = stdout
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                let (container_name, state) = line.split_once('\t')?;
+                // Match pattern: openclaw-{name}-gateway-1
+                let name = container_name
+                    .strip_prefix("openclaw-")
+                    .and_then(|s| s.strip_suffix("-gateway-1"))?;
+                if !crate::is_valid_instance_name(name) {
+                    tracing::warn!("skipping container with invalid instance name: {}", name);
+                    return None;
+                }
+                Some((name.to_string(), state.to_string()))
+            })
+            .collect();
+        Ok(map)
+    }
+
     // ── health polling ────────────────────────────────────────────────
 
     /// Query the Docker container health state for an instance's gateway container.
