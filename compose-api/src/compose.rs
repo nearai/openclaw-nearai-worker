@@ -148,16 +148,28 @@ impl ComposeManager {
         }
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
-        // docker pull handles caching correctly; compose v5 --pull does not.
+        // Pull remote images via `docker pull` (compose v5 --pull is broken on ZFS).
+        // Skip if already cached to avoid unnecessary registry round-trips / rate limits.
         let is_remote = cfg.image.contains('/') || cfg.image.contains("@sha256:");
         if is_remote {
-            let output = Command::new("docker")
-                .args(["pull", cfg.image])
-                .output()
-                .map_err(|e| ApiError::Internal(format!("docker pull: {}", e)))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(ApiError::Internal(format!("docker pull failed: {}", stderr)));
+            let check = Command::new("docker")
+                .args(["image", "inspect", cfg.image])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap_or_else(|_| std::process::ExitStatus::default());
+            if !check.success() {
+                let output = Command::new("docker")
+                    .args(["pull", cfg.image])
+                    .output()
+                    .map_err(|e| ApiError::Internal(format!("docker pull: {}", e)))?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(ApiError::Internal(format!(
+                        "docker pull failed: {}",
+                        stderr
+                    )));
+                }
             }
         }
         self.compose_cmd(
