@@ -1216,10 +1216,7 @@ async fn list_instances(
         store.list()
     };
 
-    let status_map = state
-        .compose_all_statuses()
-        .await
-        .unwrap_or_default();
+    let status_map = state.compose_all_statuses().await?;
 
     let responses: Vec<_> = instances
         .into_iter()
@@ -1233,10 +1230,9 @@ async fn list_instances(
             let ssh_command = generate_ssh_command(&state.config, &inst.name, inst.ssh_port);
             let image = inst
                 .image
-                .clone()
                 .unwrap_or_else(|| state.config.openclaw_image.clone());
             InstanceResponse {
-                name: inst.name.clone(),
+                name: inst.name,
                 token: inst.token,
                 url,
                 dashboard_url,
@@ -1245,7 +1241,7 @@ async fn list_instances(
                 ssh_command,
                 ssh_pubkey: inst.ssh_pubkey,
                 image,
-                image_digest: inst.image_digest.clone(),
+                image_digest: inst.image_digest,
                 status,
                 created_at: inst.created_at.to_rfc3339(),
             }

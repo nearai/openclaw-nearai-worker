@@ -247,23 +247,21 @@ impl ComposeManager {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut map = HashMap::new();
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some((container_name, state)) = line.split_once('\t') else {
-                continue;
-            };
-            // Match pattern: openclaw-{name}-gateway-1
-            if let Some(name) = container_name
-                .strip_prefix("openclaw-")
-                .and_then(|s| s.strip_suffix("-gateway-1"))
-            {
-                map.insert(name.to_string(), state.to_string());
-            }
-        }
+        let map = stdout
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                let (container_name, state) = line.split_once('\t')?;
+                // Match pattern: openclaw-{name}-gateway-1
+                let name = container_name
+                    .strip_prefix("openclaw-")
+                    .and_then(|s| s.strip_suffix("-gateway-1"))?;
+                Some((name.to_string(), state.to_string()))
+            })
+            .collect();
         Ok(map)
     }
 
