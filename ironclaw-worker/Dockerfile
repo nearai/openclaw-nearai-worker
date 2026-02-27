@@ -1,8 +1,14 @@
 # IronClaw worker image for compose-api deployment.
 #
+# Requires BuildKit (uses RUN --mount). Enable with DOCKER_BUILDKIT=1 or use buildx.
+#
 # Downloads a prebuilt binary from GitHub releases:
-#   docker build --build-arg IRONCLAW_VERSION=<version> \
-#     -t ironclaw-nearai-worker:local ironclaw-worker/
+#   DOCKER_BUILDKIT=1 docker build --build-arg IRONCLAW_VERSION=<version> \
+#     -t ironclaw-nearai-worker:<tag> ironclaw-worker/
+#
+# Or use a locally built binary (CI places it in the build context):
+#   cp /path/to/ironclaw ironclaw-worker/ironclaw
+#   DOCKER_BUILDKIT=1 docker build -t ironclaw-nearai-worker:<tag> ironclaw-worker/
 
 FROM debian:bookworm-slim
 
@@ -25,13 +31,25 @@ RUN apt-get update && \
       && apt-get clean \
       && rm -rf /var/lib/apt/lists/*
 
-# Download prebuilt IronClaw binary from GitHub release
+# Install IronClaw binary.
+# If a local binary exists in build context (CI source build), use it.
+# Otherwise, download the pinned release from GitHub.
+# Uses BuildKit bind mount to probe the build context without a COPY that
+# would fail when the file is absent.
 ARG IRONCLAW_VERSION=0.12.0
-RUN curl -fsSL "https://github.com/nearai/ironclaw/releases/download/v${IRONCLAW_VERSION}/ironclaw-x86_64-unknown-linux-gnu.tar.gz" \
-      -o /tmp/ironclaw.tar.gz && \
-    tar xzf /tmp/ironclaw.tar.gz -C /tmp && \
-    mv /tmp/ironclaw-*/ironclaw /usr/local/bin/ironclaw && \
-    rm -rf /tmp/ironclaw.tar.gz /tmp/ironclaw-*
+RUN --mount=type=bind,source=.,target=/ctx \
+    if [ -f /ctx/ironclaw ]; then \
+      echo "Using locally built ironclaw binary"; \
+      cp /ctx/ironclaw /usr/local/bin/ironclaw; \
+    else \
+      echo "Downloading ironclaw v${IRONCLAW_VERSION} from GitHub releases"; \
+      curl -fsSL "https://github.com/nearai/ironclaw/releases/download/v${IRONCLAW_VERSION}/ironclaw-x86_64-unknown-linux-gnu.tar.gz" \
+        -o /tmp/ironclaw.tar.gz && \
+      tar xzf /tmp/ironclaw.tar.gz -C /tmp && \
+      mv /tmp/ironclaw-*/ironclaw /usr/local/bin/ironclaw && \
+      rm -rf /tmp/ironclaw.tar.gz /tmp/ironclaw-*; \
+    fi && \
+    chmod +x /usr/local/bin/ironclaw
 
 # Create non-root user (UID 1001, matching OpenClaw worker pattern)
 RUN useradd -m -u 1001 -s /bin/bash agent && \

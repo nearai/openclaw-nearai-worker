@@ -14,6 +14,10 @@ on:
         description: 'IronClaw version for worker image (default: Dockerfile ARG)'
         required: false
         type: string
+      ironclaw_commit:
+        description: 'Build ironclaw from source at this commit (nearai/ironclaw). Only builds ironclaw-worker.'
+        required: false
+        type: string
   push:
     branches:
       - main
@@ -25,6 +29,8 @@ env:
 
 jobs:
   build:
+    # When ironclaw_commit is set (workflow_dispatch only), build only ironclaw-nearai-worker
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.ironclaw_commit || matrix.name == 'ironclaw-nearai-worker' }}
     name: Build ${{ matrix.name }}
     permissions:
       contents: read
@@ -60,6 +66,12 @@ jobs:
             dockerfile: ssh-bastion/Dockerfile
             build_script: false
     steps:
+      - name: Validate inputs
+        if: ${{ inputs.ironclaw_commit && inputs.ironclaw_version }}
+        run: |
+          echo "::error::Cannot specify both ironclaw_commit and ironclaw_version"
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -101,6 +113,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y skopeo jq
+
+      # Build ironclaw from source when ironclaw_commit is provided (workflow_dispatch only)
+      - name: Clone ironclaw source
+        if: ${{ inputs.ironclaw_commit }}
+        run: |
+          git clone https://github.com/nearai/ironclaw.git ironclaw-src
+          cd ironclaw-src
+          git checkout "${{ inputs.ironclaw_commit }}"
+          echo "Checked out ironclaw at $(git rev-parse HEAD)"
+
+      - name: Install Rust toolchain
+        if: ${{ inputs.ironclaw_commit }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        if: ${{ inputs.ironclaw_commit }}
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ironclaw-src -> target
+
+      - name: Build ironclaw from source
+        if: ${{ inputs.ironclaw_commit }}
+        run: |
+          cd ironclaw-src
+          cargo build --release --locked
+          cp target/release/ironclaw "${{ github.workspace }}/ironclaw-worker/ironclaw"
+          echo "Built ironclaw binary successfully"
 
       # Reproducible build path (worker only — uses build-image.sh)
       - name: Build and push reproducible image
