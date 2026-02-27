@@ -368,11 +368,19 @@ impl ComposeManager {
 
     // ── instance data export ────────────────────────────────────────────
 
-    /// Export both the config volume (`.openclaw/`) and workspace volume (`openclaw/`)
-    /// from an instance's gateway container as a single tar archive.
+    /// Export both the config volume and workspace volume from an instance's
+    /// gateway container as a single tar archive.
     /// Uses `docker exec tar` to capture both directories relative to `/home/agent/`.
-    pub fn export_instance_data(&self, name: &str) -> Result<Vec<u8>, ApiError> {
+    pub fn export_instance_data(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+    ) -> Result<Vec<u8>, ApiError> {
         let container = format!("openclaw-{}-gateway-1", name);
+        let (config_dir, workspace_dir) = match service_type {
+            Some("ironclaw") => (".ironclaw", "workspace"),
+            _ => (".openclaw", "openclaw"),
+        };
         let output = Command::new("docker")
             .args([
                 "exec",
@@ -382,8 +390,8 @@ impl ComposeManager {
                 "-",
                 "-C",
                 "/home/agent",
-                ".openclaw",
-                "openclaw",
+                config_dir,
+                workspace_dir,
             ])
             .output()
             .map_err(|e| ApiError::Internal(format!("Failed to run docker exec tar: {}", e)))?;
@@ -507,10 +515,27 @@ impl ComposeManager {
             .cloned()
             .filter(|s| !s.is_empty());
         let image_env = env_map.get("OPENCLAW_IMAGE").cloned();
-        let service_type = env_map
-            .get("SERVICE_TYPE")
-            .cloned()
-            .filter(|s| !s.is_empty());
+        // Resolve service_type: label (most reliable) → container env → persisted .env file
+        let service_type = v
+            .pointer("/Config/Labels/openclaw.service_type")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                env_map
+                    .get("SERVICE_TYPE")
+                    .cloned()
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| self.read_service_type_from_env_file(name));
+
+        if service_type.is_none() {
+            tracing::warn!(
+                "Instance '{}' has no SERVICE_TYPE in labels, container env, or env file. \
+                 Upgrade operations will fail until this is resolved.",
+                name
+            );
+        }
 
         // Parse port bindings from .HostConfig.PortBindings
         let port_bindings = v.pointer("/HostConfig/PortBindings");
@@ -602,10 +627,30 @@ impl ComposeManager {
         if let Some(ref image) = inst.image {
             vars.insert("OPENCLAW_IMAGE".into(), image.clone());
         }
-        if let Some(ref st) = inst.service_type {
-            vars.insert("SERVICE_TYPE".into(), st.clone());
-        }
+        vars.insert(
+            "SERVICE_TYPE".into(),
+            inst.service_type
+                .clone()
+                .unwrap_or_else(|| "openclaw".to_string()),
+        );
         self.write_env_file(&inst.name, &vars)
+    }
+
+    /// Read SERVICE_TYPE from the persisted .env file for an instance.
+    /// Fallback for containers created before SERVICE_TYPE was added to the
+    /// compose template environment block.
+    fn read_service_type_from_env_file(&self, name: &str) -> Option<String> {
+        let path = self.env_path(name);
+        let content = std::fs::read_to_string(&path).ok()?;
+        for line in content.lines() {
+            if let Some(value) = line.strip_prefix("SERVICE_TYPE=") {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
     }
 
     // ── internal ──────────────────────────────────────────────────────

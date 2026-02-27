@@ -249,12 +249,19 @@ impl AppState {
             .flatten()
     }
 
-    async fn compose_export_instance_data(&self, name: &str) -> Result<Vec<u8>, ApiError> {
+    async fn compose_export_instance_data(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+    ) -> Result<Vec<u8>, ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.export_instance_data(&name))
-            .await
-            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            compose.export_instance_data(&name, service_type.as_deref())
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 }
 
@@ -1362,6 +1369,17 @@ async fn restart_instance(
             let inst_clone = inst.clone();
 
             tokio::spawn(async move {
+                let stype = match inst_clone.service_type.as_deref() {
+                    Some(st) => st,
+                    None => {
+                        let _ = tx.send(Err(format!(
+                            "Instance '{}' has no service_type set; refusing to upgrade \
+                             (would use wrong compose file and lose data)",
+                            name_clone
+                        )));
+                        return;
+                    }
+                };
                 let result = if let Err(e) = state_clone.compose_up(
                     &name_clone,
                     &inst_clone.nearai_api_key,
@@ -1373,7 +1391,7 @@ async fn restart_instance(
                     inst_clone.nearai_api_url
                         .as_deref()
                         .unwrap_or(DEFAULT_NEARAI_API_URL),
-                    inst_clone.service_type.as_deref().unwrap_or("openclaw"),
+                    stype,
                     inst_clone.mem_limit.clone(),
                     inst_clone.cpus.clone(),
                     inst_clone.storage_size.clone(),
@@ -1686,7 +1704,7 @@ async fn create_backup_endpoint(
     let stream = async_stream::stream! {
         yield Ok(sse_stage("encrypting", "Exporting and encrypting workspace..."));
 
-        let tar_bytes = match state.compose_export_instance_data(&name).await {
+        let tar_bytes = match state.compose_export_instance_data(&name, inst.service_type.as_deref()).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 yield Ok(sse_error(&format!("Backup failed: {}", e)));
@@ -2121,7 +2139,7 @@ async fn background_sync_loop(state: AppState) {
                         continue;
                     }
                     tracing::info!("Scheduled backup for instance: {}", inst.name);
-                    let tar_bytes = match state.compose_export_instance_data(&inst.name).await {
+                    let tar_bytes = match state.compose_export_instance_data(&inst.name, inst.service_type.as_deref()).await {
                         Ok(bytes) => bytes,
                         Err(e) => {
                             tracing::warn!(
