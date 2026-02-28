@@ -263,6 +263,19 @@ impl AppState {
         .await
         .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
+
+    async fn compose_import_instance_data(
+        &self,
+        name: &str,
+        tar_bytes: &[u8],
+    ) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        let tar_bytes = tar_bytes.to_vec();
+        tokio::task::spawn_blocking(move || compose.import_instance_data(&name, &tar_bytes))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
 }
 
 /// Extractor that validates the admin token from the Authorization header
@@ -1358,75 +1371,77 @@ async fn restart_instance(
 
     let stream = async_stream::stream! {
         if let Some(ref image) = new_image {
-            // Full recreate with new image — run compose_up + set_image in a spawned task
-            // so store is updated even if the client disconnects; stream yields immediately for UX
-            yield Ok(sse_stage("container_starting", &format!("Recreating container with image {}...", image)));
-
-            let (tx, rx) = tokio::sync::oneshot::channel::<Result<Option<String>, String>>();
-            let state_clone = state.clone();
-            let name_clone = name.clone();
-            let image_clone = image.clone();
-            let inst_clone = inst.clone();
-
-            tokio::spawn(async move {
-                let stype = match inst_clone.service_type.as_deref() {
-                    Some(st) => st,
-                    None => {
-                        let _ = tx.send(Err(format!(
-                            "Instance '{}' has no service_type set; refusing to upgrade \
-                             (would use wrong compose file and lose data)",
-                            name_clone
-                        )));
-                        return;
-                    }
-                };
-                let result = if let Err(e) = state_clone.compose_up(
-                    &name_clone,
-                    &inst_clone.nearai_api_key,
-                    &inst_clone.token,
-                    inst_clone.gateway_port,
-                    inst_clone.ssh_port,
-                    &inst_clone.ssh_pubkey,
-                    &image_clone,
-                    inst_clone.nearai_api_url
-                        .as_deref()
-                        .unwrap_or(DEFAULT_NEARAI_API_URL),
-                    stype,
-                    inst_clone.mem_limit.clone(),
-                    inst_clone.cpus.clone(),
-                    inst_clone.storage_size.clone(),
-                ).await {
-                    {
-                        let mut store = state_clone.store.write().await;
-                        let _ = store.set_active(&name_clone, false);
-                    }
-                    update_nginx_now(&state_clone).await;
-                    Err(e.to_string())
-                } else {
-                    let image_digest = state_clone.compose_resolve_image_digest(&name_clone).await;
-                    {
-                        let mut store = state_clone.store.write().await;
-                        let _ = store.set_image(&name_clone, Some(image_clone), image_digest.clone());
-                    }
-                    Ok(image_digest)
-                };
-                let _ = tx.send(result);
-            });
-
-            match rx.await {
-                Ok(Ok(image_digest)) => {
-                    if let Some(ref digest) = image_digest {
-                        yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
-                    }
-                }
-                Ok(Err(e)) => {
-                    yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
+            // Full upgrade: export workspace → down -v → up with new image → restore workspace
+            let stype = match inst.service_type.as_deref() {
+                Some(st) => st,
+                None => {
+                    yield Ok(sse_error(&format!(
+                        "Instance '{}' has no service_type set; refusing to upgrade \
+                         (would use wrong compose file and lose data)",
+                        name
+                    )));
                     return;
                 }
-                Err(_) => {
-                    yield Ok(sse_error("Upgrade task was dropped"));
+            };
+
+            yield Ok(sse_stage("exporting", "Exporting workspace and config..."));
+
+            let tar_bytes = match state.compose_export_instance_data(&name, Some(stype)).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    yield Ok(sse_error(&format!("Failed to export workspace: {}", e)));
                     return;
                 }
+            };
+
+            yield Ok(sse_stage("stopping", "Stopping and removing old container..."));
+
+            if let Err(e) = state.compose_down(&name, Some(stype)).await {
+                yield Ok(sse_error(&format!("Failed to stop old container: {}", e)));
+                return;
+            }
+
+            yield Ok(sse_stage("container_starting", &format!("Starting new container with image {}...", image)));
+
+            if let Err(e) = state.compose_up(
+                &name,
+                &inst.nearai_api_key,
+                &inst.token,
+                inst.gateway_port,
+                inst.ssh_port,
+                &inst.ssh_pubkey,
+                image,
+                inst.nearai_api_url.as_deref().unwrap_or(DEFAULT_NEARAI_API_URL),
+                stype,
+                inst.mem_limit.clone(),
+                inst.cpus.clone(),
+                inst.storage_size.clone(),
+            ).await {
+                {
+                    let mut store = state.store.write().await;
+                    let _ = store.set_active(&name, false);
+                }
+                update_nginx_now(&state).await;
+                yield Ok(sse_error(&format!("Failed to start new container: {}", e)));
+                return;
+            }
+
+            // Update image metadata immediately after new container starts, so it's correct
+            // even if workspace restore fails later
+            let image_digest = state.compose_resolve_image_digest(&name).await;
+            {
+                let mut store = state.store.write().await;
+                let _ = store.set_image(&name, Some(image.clone()), image_digest.clone());
+            }
+            if let Some(ref digest) = image_digest {
+                yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
+            }
+
+            yield Ok(sse_stage("restoring", "Restoring workspace and config..."));
+
+            if let Err(e) = state.compose_import_instance_data(&name, &tar_bytes).await {
+                yield Ok(sse_error(&format!("Failed to restore workspace: {}", e)));
+                return;
             }
         } else {
             // Simple restart
@@ -2139,7 +2154,10 @@ async fn background_sync_loop(state: AppState) {
                         continue;
                     }
                     tracing::info!("Scheduled backup for instance: {}", inst.name);
-                    let tar_bytes = match state.compose_export_instance_data(&inst.name, inst.service_type.as_deref()).await {
+                    let tar_bytes = match state
+                        .compose_export_instance_data(&inst.name, inst.service_type.as_deref())
+                        .await
+                    {
                         Ok(bytes) => bytes,
                         Err(e) => {
                             tracing::warn!(

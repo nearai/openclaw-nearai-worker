@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::ApiError;
 use crate::store::Instance;
@@ -428,6 +429,58 @@ impl ComposeManager {
         }
 
         Ok(output.stdout)
+    }
+
+    /// Import workspace and config data into an instance's gateway container.
+    /// Extracts the given tar archive (same format as export_instance_data) into /home/agent.
+    pub fn import_instance_data(&self, name: &str, tar_bytes: &[u8]) -> Result<(), ApiError> {
+        let container = format!("openclaw-{}-gateway-1", name);
+
+        let mut child = Command::new("docker")
+            .args([
+                "exec",
+                "-i",
+                "-u",
+                "agent",
+                &container,
+                "tar",
+                "xf",
+                "-",
+                "-C",
+                "/home/agent",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| ApiError::Internal(format!("Failed to run docker exec: {}", e)))?;
+
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| ApiError::Internal("Failed to get stdin".into()))?;
+            stdin
+                .write_all(tar_bytes)
+                .map_err(|e| ApiError::Internal(format!("Failed to write tar to stdin: {}", e)))?;
+            stdin
+                .flush()
+                .map_err(|e| ApiError::Internal(format!("Failed to flush stdin: {}", e)))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| ApiError::Internal(format!("Failed to wait for docker exec: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!(
+                "docker exec tar extract failed: {}",
+                stderr
+            )));
+        }
+
+        Ok(())
     }
 
     // ── discovery ─────────────────────────────────────────────────────
