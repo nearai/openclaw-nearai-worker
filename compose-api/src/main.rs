@@ -267,11 +267,10 @@ impl AppState {
     async fn compose_import_instance_data(
         &self,
         name: &str,
-        tar_bytes: &[u8],
+        tar_bytes: Vec<u8>,
     ) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
-        let tar_bytes = tar_bytes.to_vec();
         tokio::task::spawn_blocking(move || compose.import_instance_data(&name, &tar_bytes))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
@@ -1369,98 +1368,107 @@ async fn restart_instance(
     };
     let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
-    let stream = async_stream::stream! {
-        if let Some(ref image) = new_image {
-            // Full upgrade: export workspace → down -v → up with new image → restore workspace
-            let stype = match inst.service_type.as_deref() {
-                Some(st) => st,
-                None => {
-                    yield Ok(sse_error(&format!(
-                        "Instance '{}' has no service_type set; refusing to upgrade \
-                         (would use wrong compose file and lose data)",
-                        name
-                    )));
+    // Run the entire upgrade/restart flow in a background task so it completes
+    // even if the SSE client disconnects mid-flight (e.g. after compose_down).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+
+    {
+        let state = state.clone();
+        let name = name.clone();
+        let inst = inst.clone();
+        let new_image = new_image.clone();
+
+        tokio::spawn(async move {
+            if let Some(ref image) = new_image {
+                // Full upgrade: export workspace → down -v → up with new image → restore workspace
+                let stype = match inst.service_type.as_deref() {
+                    Some(st) => st,
+                    None => {
+                        let _ = tx.send(sse_error(&format!(
+                            "Instance '{}' has no service_type set; refusing to upgrade \
+                             (would use wrong compose file and lose data)",
+                            name
+                        ))).await;
+                        return;
+                    }
+                };
+
+                let _ = tx.send(sse_stage("exporting", "Exporting workspace and config...")).await;
+
+                let tar_bytes = match state.compose_export_instance_data(&name, Some(stype)).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let _ = tx.send(sse_error(&format!("Failed to export workspace: {}", e))).await;
+                        return;
+                    }
+                };
+
+                let _ = tx.send(sse_stage("stopping", "Stopping and removing old container...")).await;
+
+                if let Err(e) = state.compose_down(&name, Some(stype)).await {
+                    let _ = tx.send(sse_error(&format!("Failed to stop old container: {}", e))).await;
                     return;
                 }
-            };
 
-            yield Ok(sse_stage("exporting", "Exporting workspace and config..."));
+                let _ = tx.send(sse_stage("container_starting", &format!("Starting new container with image {}...", image))).await;
 
-            let tar_bytes = match state.compose_export_instance_data(&name, Some(stype)).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    yield Ok(sse_error(&format!("Failed to export workspace: {}", e)));
+                if let Err(e) = state.compose_up(
+                    &name,
+                    &inst.nearai_api_key,
+                    &inst.token,
+                    inst.gateway_port,
+                    inst.ssh_port,
+                    &inst.ssh_pubkey,
+                    image,
+                    inst.nearai_api_url.as_deref().unwrap_or(DEFAULT_NEARAI_API_URL),
+                    stype,
+                    inst.mem_limit.clone(),
+                    inst.cpus.clone(),
+                    inst.storage_size.clone(),
+                ).await {
+                    {
+                        let mut store = state.store.write().await;
+                        let _ = store.set_active(&name, false);
+                    }
+                    update_nginx_now(&state).await;
+                    let _ = tx.send(sse_error(&format!("Failed to start new container: {}", e))).await;
                     return;
                 }
-            };
 
-            yield Ok(sse_stage("stopping", "Stopping and removing old container..."));
-
-            if let Err(e) = state.compose_down(&name, Some(stype)).await {
-                yield Ok(sse_error(&format!("Failed to stop old container: {}", e)));
-                return;
-            }
-
-            yield Ok(sse_stage("container_starting", &format!("Starting new container with image {}...", image)));
-
-            if let Err(e) = state.compose_up(
-                &name,
-                &inst.nearai_api_key,
-                &inst.token,
-                inst.gateway_port,
-                inst.ssh_port,
-                &inst.ssh_pubkey,
-                image,
-                inst.nearai_api_url.as_deref().unwrap_or(DEFAULT_NEARAI_API_URL),
-                stype,
-                inst.mem_limit.clone(),
-                inst.cpus.clone(),
-                inst.storage_size.clone(),
-            ).await {
+                // Update image metadata immediately after new container starts, so it's correct
+                // even if workspace restore fails later
+                let image_digest = state.compose_resolve_image_digest(&name).await;
                 {
                     let mut store = state.store.write().await;
-                    let _ = store.set_active(&name, false);
+                    let _ = store.set_image(&name, Some(image.clone()), image_digest.clone());
                 }
-                update_nginx_now(&state).await;
-                yield Ok(sse_error(&format!("Failed to start new container: {}", e)));
-                return;
+                if let Some(ref digest) = image_digest {
+                    let _ = tx.send(sse_stage("image_resolved", &format!("Image digest: {}", digest))).await;
+                }
+
+                let _ = tx.send(sse_stage("restoring", "Restoring workspace and config...")).await;
+
+                if let Err(e) = state.compose_import_instance_data(&name, tar_bytes).await {
+                    let _ = tx.send(sse_error(&format!(
+                        "Failed to restore workspace, the instance may be missing user data: {}", e
+                    ))).await;
+                }
+            } else {
+                // Simple restart
+                let _ = tx.send(sse_stage("container_starting", "Restarting container...")).await;
+
+                if let Err(e) = state.compose_restart(&name, inst.service_type.as_deref()).await {
+                    let _ = tx.send(sse_error(&format!("Failed to restart container: {}", e))).await;
+                    return;
+                }
             }
 
-            // Update image metadata immediately after new container starts, so it's correct
-            // even if workspace restore fails later
-            let image_digest = state.compose_resolve_image_digest(&name).await;
-            {
-                let mut store = state.store.write().await;
-                let _ = store.set_image(&name, Some(image.clone()), image_digest.clone());
-            }
-            if let Some(ref digest) = image_digest {
-                yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
-            }
-
-            yield Ok(sse_stage("restoring", "Restoring workspace and config..."));
-
-            if let Err(e) = state.compose_import_instance_data(&name, &tar_bytes).await {
-                yield Ok(sse_error(&format!("Failed to restore workspace: {}", e)));
-                return;
-            }
-        } else {
-            // Simple restart
-            yield Ok(sse_stage("container_starting", "Restarting container..."));
-
-            if let Err(e) = state.compose_restart(&name, inst.service_type.as_deref()).await {
-                yield Ok(sse_error(&format!("Failed to restart container: {}", e)));
-                return;
-            }
-        }
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
-        let poll_state = state.clone();
-        let poll_name = name.clone();
-        let poll_service_type = inst.service_type.clone();
-        tokio::spawn(async move {
-            poll_health_to_ready(&poll_state, &poll_name, poll_service_type.as_deref(), &tx).await;
+            // Health polling always runs, even after a partial restore failure
+            poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx).await;
         });
+    }
 
+    let stream = async_stream::stream! {
         while let Some(event) = rx.recv().await {
             yield Ok(event);
         }
