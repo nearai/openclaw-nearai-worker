@@ -10,11 +10,11 @@ use axum::{
 };
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -98,12 +98,17 @@ impl utoipa::Modify for SecurityAddon {
 
 const ADMIN_TOKEN_HEX_LEN: usize = 32;
 
+/// Max workspace export size (512 MB). Protects against OOM during upgrades.
+const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
+
 #[derive(Clone)]
 struct AppState {
     compose: Arc<ComposeManager>,
     store: Arc<RwLock<InstanceStore>>,
     config: Arc<AppConfig>,
     backup: Option<Arc<BackupManager>>,
+    /// Per-instance lock to prevent concurrent upgrades.
+    upgrading: Arc<Mutex<HashSet<String>>>,
 }
 
 struct AppConfig {
@@ -460,6 +465,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         config,
         backup,
+        upgrading: Arc::new(Mutex::new(HashSet::new())),
     };
 
     update_nginx_now(&state).await;
@@ -1368,6 +1374,17 @@ async fn restart_instance(
     };
     let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
+    // Reject concurrent upgrades on the same instance.
+    if new_image.is_some() {
+        let mut upgrading = state.upgrading.lock().await;
+        if !upgrading.insert(name.clone()) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' is already being upgraded",
+                name
+            )));
+        }
+    }
+
     // Run the entire upgrade/restart flow in a background task so it completes
     // even if the SSE client disconnects mid-flight (e.g. after compose_down).
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
@@ -1389,6 +1406,7 @@ async fn restart_instance(
                              (would use wrong compose file and lose data)",
                             name
                         ))).await;
+                        state.upgrading.lock().await.remove(&name);
                         return;
                     }
                 };
@@ -1396,9 +1414,22 @@ async fn restart_instance(
                 let _ = tx.send(sse_stage("exporting", "Exporting workspace and config...")).await;
 
                 let tar_bytes = match state.compose_export_instance_data(&name, Some(stype)).await {
-                    Ok(bytes) => bytes,
+                    Ok(bytes) => {
+                        if bytes.len() > MAX_EXPORT_BYTES {
+                            let _ = tx.send(sse_error(&format!(
+                                "Workspace export too large ({} MB, limit {} MB). \
+                                 Clean up large files before upgrading.",
+                                bytes.len() / (1024 * 1024),
+                                MAX_EXPORT_BYTES / (1024 * 1024),
+                            ))).await;
+                            state.upgrading.lock().await.remove(&name);
+                            return;
+                        }
+                        bytes
+                    }
                     Err(e) => {
                         let _ = tx.send(sse_error(&format!("Failed to export workspace: {}", e))).await;
+                        state.upgrading.lock().await.remove(&name);
                         return;
                     }
                 };
@@ -1407,11 +1438,13 @@ async fn restart_instance(
 
                 if let Err(e) = state.compose_down(&name, Some(stype)).await {
                     let _ = tx.send(sse_error(&format!("Failed to stop old container: {}", e))).await;
+                    state.upgrading.lock().await.remove(&name);
                     return;
                 }
 
                 let _ = tx.send(sse_stage("container_starting", &format!("Starting new container with image {}...", image))).await;
 
+                let old_image = inst.image.as_deref().unwrap_or(image);
                 if let Err(e) = state.compose_up(
                     &name,
                     &inst.nearai_api_key,
@@ -1426,12 +1459,44 @@ async fn restart_instance(
                     inst.cpus.clone(),
                     inst.storage_size.clone(),
                 ).await {
-                    {
+                    // Attempt rollback with the original image
+                    let _ = tx.send(sse_stage("rolling_back", &format!(
+                        "Failed to start with new image ({}), rolling back to {}...", e, old_image
+                    ))).await;
+                    if let Err(rb_err) = state.compose_up(
+                        &name,
+                        &inst.nearai_api_key,
+                        &inst.token,
+                        inst.gateway_port,
+                        inst.ssh_port,
+                        &inst.ssh_pubkey,
+                        old_image,
+                        inst.nearai_api_url.as_deref().unwrap_or(DEFAULT_NEARAI_API_URL),
+                        stype,
+                        inst.mem_limit.clone(),
+                        inst.cpus.clone(),
+                        inst.storage_size.clone(),
+                    ).await {
                         let mut store = state.store.write().await;
                         let _ = store.set_active(&name, false);
+                        drop(store);
+                        update_nginx_now(&state).await;
+                        let _ = tx.send(sse_error(&format!(
+                            "Rollback also failed ({}). Instance needs manual recreation.", rb_err
+                        ))).await;
+                        state.upgrading.lock().await.remove(&name);
+                        return;
                     }
-                    update_nginx_now(&state).await;
-                    let _ = tx.send(sse_error(&format!("Failed to start new container: {}", e))).await;
+                    // Rollback succeeded — restore workspace into the old container
+                    if !tar_bytes.is_empty() {
+                        let _ = state.compose_import_instance_data(&name, tar_bytes).await;
+                    }
+                    let _ = tx.send(sse_error(&format!(
+                        "Upgrade failed, rolled back to previous image: {}", e
+                    ))).await;
+                    state.upgrading.lock().await.remove(&name);
+                    // Still run health polling for the rolled-back container
+                    poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx).await;
                     return;
                 }
 
@@ -1446,13 +1511,17 @@ async fn restart_instance(
                     let _ = tx.send(sse_stage("image_resolved", &format!("Image digest: {}", digest))).await;
                 }
 
-                let _ = tx.send(sse_stage("restoring", "Restoring workspace and config...")).await;
+                if !tar_bytes.is_empty() {
+                    let _ = tx.send(sse_stage("restoring", "Restoring workspace and config...")).await;
 
-                if let Err(e) = state.compose_import_instance_data(&name, tar_bytes).await {
-                    let _ = tx.send(sse_error(&format!(
-                        "Failed to restore workspace, the instance may be missing user data: {}", e
-                    ))).await;
+                    if let Err(e) = state.compose_import_instance_data(&name, tar_bytes).await {
+                        let _ = tx.send(sse_error(&format!(
+                            "Failed to restore workspace, the instance may be missing user data: {}", e
+                        ))).await;
+                    }
                 }
+
+                state.upgrading.lock().await.remove(&name);
             } else {
                 // Simple restart
                 let _ = tx.send(sse_stage("container_starting", "Restarting container...")).await;

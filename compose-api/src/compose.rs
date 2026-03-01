@@ -405,11 +405,13 @@ impl ComposeManager {
             Some("ironclaw") => (".ironclaw", "workspace"),
             _ => (".openclaw", "openclaw"),
         };
+        // --ignore-failed-read: fresh instances may not have workspace/config dirs yet.
         let output = Command::new("docker")
             .args([
                 "exec",
                 &container,
                 "tar",
+                "--ignore-failed-read",
                 "cf",
                 "-",
                 "-C",
@@ -422,10 +424,15 @@ impl ComposeManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ApiError::Internal(format!(
-                "docker exec tar failed: {}",
-                stderr
-            )));
+            // tar --ignore-failed-read still exits 1 on missing files but produces
+            // valid (possibly empty) output. Only fail on exit code 2+ (real errors).
+            if output.status.code().unwrap_or(2) >= 2 {
+                return Err(ApiError::Internal(format!(
+                    "docker exec tar failed: {}",
+                    stderr
+                )));
+            }
+            tracing::warn!("tar export had warnings (non-fatal): {}", stderr.trim());
         }
 
         Ok(output.stdout)
