@@ -1326,6 +1326,17 @@ async fn delete_instance(
     };
     let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
+    // Reject delete while an upgrade is in progress.
+    {
+        let upgrading = state.upgrading.lock().await;
+        if upgrading.contains(&name) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' is currently being upgraded",
+                name
+            )));
+        }
+    }
+
     state
         .compose_down(&name, inst.service_type.as_deref())
         .await?;

@@ -424,9 +424,13 @@ impl ComposeManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // tar --ignore-failed-read still exits 1 on missing files but produces
-            // valid (possibly empty) output. Only fail on exit code 2+ (real errors).
-            if output.status.code().unwrap_or(2) >= 2 {
+            // Distinguish docker exec failures (container not found, etc.) from tar
+            // warnings (missing files with --ignore-failed-read, exit code 1).
+            let is_docker_error = stderr.contains("No such container")
+                || stderr.contains("is not running")
+                || stderr.contains("Error response from daemon");
+            let is_real_tar_error = output.status.code().unwrap_or(2) >= 2;
+            if is_docker_error || is_real_tar_error {
                 return Err(ApiError::Internal(format!(
                     "docker exec tar failed: {}",
                     stderr
