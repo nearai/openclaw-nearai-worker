@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::ApiError;
 use crate::store::Instance;
@@ -404,11 +405,13 @@ impl ComposeManager {
             Some("ironclaw") => (".ironclaw", "workspace"),
             _ => (".openclaw", "openclaw"),
         };
+        // --ignore-failed-read: fresh instances may not have workspace/config dirs yet.
         let output = Command::new("docker")
             .args([
                 "exec",
                 &container,
                 "tar",
+                "--ignore-failed-read",
                 "cf",
                 "-",
                 "-C",
@@ -421,13 +424,74 @@ impl ComposeManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // Distinguish docker exec failures (container not found, etc.) from tar
+            // warnings (missing files with --ignore-failed-read, exit code 1).
+            let is_docker_error = stderr.contains("No such container")
+                || stderr.contains("is not running")
+                || stderr.contains("Error response from daemon");
+            let is_real_tar_error = output.status.code().unwrap_or(2) >= 2;
+            if is_docker_error || is_real_tar_error {
+                return Err(ApiError::Internal(format!(
+                    "docker exec tar failed: {}",
+                    stderr
+                )));
+            }
+            tracing::warn!("tar export had warnings (non-fatal): {}", stderr.trim());
+        }
+
+        Ok(output.stdout)
+    }
+
+    /// Import workspace and config data into an instance's gateway container.
+    /// Extracts the given tar archive (same format as export_instance_data) into /home/agent.
+    pub fn import_instance_data(&self, name: &str, tar_bytes: &[u8]) -> Result<(), ApiError> {
+        let container = format!("openclaw-{}-gateway-1", name);
+
+        let mut child = Command::new("docker")
+            .args([
+                "exec",
+                "-i",
+                "-u",
+                "agent",
+                &container,
+                "tar",
+                "xf",
+                "-",
+                "-C",
+                "/home/agent",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| ApiError::Internal(format!("Failed to run docker exec: {}", e)))?;
+
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| ApiError::Internal("Failed to get stdin".into()))?;
+            stdin
+                .write_all(tar_bytes)
+                .map_err(|e| ApiError::Internal(format!("Failed to write tar to stdin: {}", e)))?;
+            stdin
+                .flush()
+                .map_err(|e| ApiError::Internal(format!("Failed to flush stdin: {}", e)))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| ApiError::Internal(format!("Failed to wait for docker exec: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(ApiError::Internal(format!(
-                "docker exec tar failed: {}",
+                "docker exec tar extract failed: {}",
                 stderr
             )));
         }
 
-        Ok(output.stdout)
+        Ok(())
     }
 
     // ── discovery ─────────────────────────────────────────────────────

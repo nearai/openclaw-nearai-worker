@@ -10,11 +10,11 @@ use axum::{
 };
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -98,12 +98,17 @@ impl utoipa::Modify for SecurityAddon {
 
 const ADMIN_TOKEN_HEX_LEN: usize = 32;
 
+/// Max workspace export size (512 MB). Protects against OOM during upgrades.
+const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
+
 #[derive(Clone)]
 struct AppState {
     compose: Arc<ComposeManager>,
     store: Arc<RwLock<InstanceStore>>,
     config: Arc<AppConfig>,
     backup: Option<Arc<BackupManager>>,
+    /// Per-instance lock to prevent concurrent upgrades.
+    upgrading: Arc<Mutex<HashSet<String>>>,
 }
 
 struct AppConfig {
@@ -262,6 +267,18 @@ impl AppState {
         })
         .await
         .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_import_instance_data(
+        &self,
+        name: &str,
+        tar_bytes: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || compose.import_instance_data(&name, &tar_bytes))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 }
 
@@ -448,6 +465,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         config,
         backup,
+        upgrading: Arc::new(Mutex::new(HashSet::new())),
     };
 
     update_nginx_now(&state).await;
@@ -1308,6 +1326,17 @@ async fn delete_instance(
     };
     let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
+    // Reject delete while an upgrade is in progress.
+    {
+        let upgrading = state.upgrading.lock().await;
+        if upgrading.contains(&name) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' is currently being upgraded",
+                name
+            )));
+        }
+    }
+
     state
         .compose_down(&name, inst.service_type.as_deref())
         .await?;
@@ -1356,96 +1385,170 @@ async fn restart_instance(
     };
     let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
-    let stream = async_stream::stream! {
-        if let Some(ref image) = new_image {
-            // Full recreate with new image — run compose_up + set_image in a spawned task
-            // so store is updated even if the client disconnects; stream yields immediately for UX
-            yield Ok(sse_stage("container_starting", &format!("Recreating container with image {}...", image)));
+    // Reject concurrent upgrades on the same instance.
+    if new_image.is_some() {
+        let mut upgrading = state.upgrading.lock().await;
+        if !upgrading.insert(name.clone()) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' is already being upgraded",
+                name
+            )));
+        }
+    }
 
-            let (tx, rx) = tokio::sync::oneshot::channel::<Result<Option<String>, String>>();
-            let state_clone = state.clone();
-            let name_clone = name.clone();
-            let image_clone = image.clone();
-            let inst_clone = inst.clone();
+    // Run the entire upgrade/restart flow in a background task so it completes
+    // even if the SSE client disconnects mid-flight (e.g. after compose_down).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
 
-            tokio::spawn(async move {
-                let stype = match inst_clone.service_type.as_deref() {
+    {
+        let state = state.clone();
+        let name = name.clone();
+        let inst = inst.clone();
+        let new_image = new_image.clone();
+
+        tokio::spawn(async move {
+            if let Some(ref image) = new_image {
+                // Full upgrade: export workspace → down -v → up with new image → restore workspace
+                let stype = match inst.service_type.as_deref() {
                     Some(st) => st,
                     None => {
-                        let _ = tx.send(Err(format!(
+                        let _ = tx.send(sse_error(&format!(
                             "Instance '{}' has no service_type set; refusing to upgrade \
                              (would use wrong compose file and lose data)",
-                            name_clone
-                        )));
+                            name
+                        ))).await;
+                        state.upgrading.lock().await.remove(&name);
                         return;
                     }
                 };
-                let result = if let Err(e) = state_clone.compose_up(
-                    &name_clone,
-                    &inst_clone.nearai_api_key,
-                    &inst_clone.token,
-                    inst_clone.gateway_port,
-                    inst_clone.ssh_port,
-                    &inst_clone.ssh_pubkey,
-                    &image_clone,
-                    inst_clone.nearai_api_url
-                        .as_deref()
-                        .unwrap_or(DEFAULT_NEARAI_API_URL),
-                    stype,
-                    inst_clone.mem_limit.clone(),
-                    inst_clone.cpus.clone(),
-                    inst_clone.storage_size.clone(),
-                ).await {
-                    {
-                        let mut store = state_clone.store.write().await;
-                        let _ = store.set_active(&name_clone, false);
+
+                let _ = tx.send(sse_stage("exporting", "Exporting workspace and config...")).await;
+
+                let tar_bytes = match state.compose_export_instance_data(&name, Some(stype)).await {
+                    Ok(bytes) => {
+                        if bytes.len() > MAX_EXPORT_BYTES {
+                            let _ = tx.send(sse_error(&format!(
+                                "Workspace export too large ({} MB, limit {} MB). \
+                                 Clean up large files before upgrading.",
+                                bytes.len() / (1024 * 1024),
+                                MAX_EXPORT_BYTES / (1024 * 1024),
+                            ))).await;
+                            state.upgrading.lock().await.remove(&name);
+                            return;
+                        }
+                        bytes
                     }
-                    update_nginx_now(&state_clone).await;
-                    Err(e.to_string())
-                } else {
-                    let image_digest = state_clone.compose_resolve_image_digest(&name_clone).await;
-                    {
-                        let mut store = state_clone.store.write().await;
-                        let _ = store.set_image(&name_clone, Some(image_clone), image_digest.clone());
+                    Err(e) => {
+                        let _ = tx.send(sse_error(&format!("Failed to export workspace: {}", e))).await;
+                        state.upgrading.lock().await.remove(&name);
+                        return;
                     }
-                    Ok(image_digest)
                 };
-                let _ = tx.send(result);
-            });
 
-            match rx.await {
-                Ok(Ok(image_digest)) => {
-                    if let Some(ref digest) = image_digest {
-                        yield Ok(sse_stage("image_resolved", &format!("Image digest: {}", digest)));
+                let _ = tx.send(sse_stage("stopping", "Stopping and removing old container...")).await;
+
+                if let Err(e) = state.compose_down(&name, Some(stype)).await {
+                    let _ = tx.send(sse_error(&format!("Failed to stop old container: {}", e))).await;
+                    state.upgrading.lock().await.remove(&name);
+                    return;
+                }
+
+                let _ = tx.send(sse_stage("container_starting", &format!("Starting new container with image {}...", image))).await;
+
+                let old_image = inst.image.as_deref().unwrap_or(image);
+                if let Err(e) = state.compose_up(
+                    &name,
+                    &inst.nearai_api_key,
+                    &inst.token,
+                    inst.gateway_port,
+                    inst.ssh_port,
+                    &inst.ssh_pubkey,
+                    image,
+                    inst.nearai_api_url.as_deref().unwrap_or(DEFAULT_NEARAI_API_URL),
+                    stype,
+                    inst.mem_limit.clone(),
+                    inst.cpus.clone(),
+                    inst.storage_size.clone(),
+                ).await {
+                    // Attempt rollback with the original image
+                    let _ = tx.send(sse_stage("rolling_back", &format!(
+                        "Failed to start with new image ({}), rolling back to {}...", e, old_image
+                    ))).await;
+                    if let Err(rb_err) = state.compose_up(
+                        &name,
+                        &inst.nearai_api_key,
+                        &inst.token,
+                        inst.gateway_port,
+                        inst.ssh_port,
+                        &inst.ssh_pubkey,
+                        old_image,
+                        inst.nearai_api_url.as_deref().unwrap_or(DEFAULT_NEARAI_API_URL),
+                        stype,
+                        inst.mem_limit.clone(),
+                        inst.cpus.clone(),
+                        inst.storage_size.clone(),
+                    ).await {
+                        let mut store = state.store.write().await;
+                        let _ = store.set_active(&name, false);
+                        drop(store);
+                        update_nginx_now(&state).await;
+                        let _ = tx.send(sse_error(&format!(
+                            "Rollback also failed ({}). Instance needs manual recreation.", rb_err
+                        ))).await;
+                        state.upgrading.lock().await.remove(&name);
+                        return;
+                    }
+                    // Rollback succeeded — restore workspace into the old container
+                    if !tar_bytes.is_empty() {
+                        let _ = state.compose_import_instance_data(&name, tar_bytes).await;
+                    }
+                    let _ = tx.send(sse_error(&format!(
+                        "Upgrade failed, rolled back to previous image: {}", e
+                    ))).await;
+                    state.upgrading.lock().await.remove(&name);
+                    // Still run health polling for the rolled-back container
+                    poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx).await;
+                    return;
+                }
+
+                // Update image metadata immediately after new container starts, so it's correct
+                // even if workspace restore fails later
+                let image_digest = state.compose_resolve_image_digest(&name).await;
+                {
+                    let mut store = state.store.write().await;
+                    let _ = store.set_image(&name, Some(image.clone()), image_digest.clone());
+                }
+                if let Some(ref digest) = image_digest {
+                    let _ = tx.send(sse_stage("image_resolved", &format!("Image digest: {}", digest))).await;
+                }
+
+                if !tar_bytes.is_empty() {
+                    let _ = tx.send(sse_stage("restoring", "Restoring workspace and config...")).await;
+
+                    if let Err(e) = state.compose_import_instance_data(&name, tar_bytes).await {
+                        let _ = tx.send(sse_error(&format!(
+                            "Failed to restore workspace, the instance may be missing user data: {}", e
+                        ))).await;
                     }
                 }
-                Ok(Err(e)) => {
-                    yield Ok(sse_error(&format!("Failed to recreate container: {}", e)));
-                    return;
-                }
-                Err(_) => {
-                    yield Ok(sse_error("Upgrade task was dropped"));
+
+                state.upgrading.lock().await.remove(&name);
+            } else {
+                // Simple restart
+                let _ = tx.send(sse_stage("container_starting", "Restarting container...")).await;
+
+                if let Err(e) = state.compose_restart(&name, inst.service_type.as_deref()).await {
+                    let _ = tx.send(sse_error(&format!("Failed to restart container: {}", e))).await;
                     return;
                 }
             }
-        } else {
-            // Simple restart
-            yield Ok(sse_stage("container_starting", "Restarting container..."));
 
-            if let Err(e) = state.compose_restart(&name, inst.service_type.as_deref()).await {
-                yield Ok(sse_error(&format!("Failed to restart container: {}", e)));
-                return;
-            }
-        }
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
-        let poll_state = state.clone();
-        let poll_name = name.clone();
-        let poll_service_type = inst.service_type.clone();
-        tokio::spawn(async move {
-            poll_health_to_ready(&poll_state, &poll_name, poll_service_type.as_deref(), &tx).await;
+            // Health polling always runs, even after a partial restore failure
+            poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx).await;
         });
+    }
 
+    let stream = async_stream::stream! {
         while let Some(event) = rx.recv().await {
             yield Ok(event);
         }
@@ -2139,7 +2242,10 @@ async fn background_sync_loop(state: AppState) {
                         continue;
                     }
                     tracing::info!("Scheduled backup for instance: {}", inst.name);
-                    let tar_bytes = match state.compose_export_instance_data(&inst.name, inst.service_type.as_deref()).await {
+                    let tar_bytes = match state
+                        .compose_export_instance_data(&inst.name, inst.service_type.as_deref())
+                        .await
+                    {
                         Ok(bytes) => bytes,
                         Err(e) => {
                             tracing::warn!(
