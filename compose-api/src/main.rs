@@ -58,6 +58,7 @@ use store::{Instance, InstanceStore};
         get_config,
         set_config,
         delete_config_key,
+        restart_management_service,
     ),
     components(schemas(
         VersionResponse,
@@ -73,6 +74,7 @@ use store::{Instance, InstanceStore};
         BackupDownloadResponse,
         SseEvent,
         ErrorResponse,
+        RestartServiceResponse,
     )),
     security(("bearer_auth" = [])),
     modifiers(&SecurityAddon),
@@ -491,7 +493,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/attestation/report", get(tdx_attestation))
         .route("/config", get(get_config))
         .route("/config", put(set_config))
-        .route("/config/{key}", delete(delete_config_key));
+        .route("/config/{key}", delete(delete_config_key))
+        .route(
+            "/admin/restart-service/{service}",
+            post(restart_management_service),
+        );
 
     if state.backup.is_some() {
         app = app
@@ -2067,6 +2073,105 @@ async fn delete_config_key(
     write_env_override_file(path, &vars)?;
     tracing::info!("Config key '{}' removed from override file", key);
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Admin: management service restart ────────────────────────────────
+
+/// Docker Compose service names that may be restarted via the admin API.
+const RESTARTABLE_SERVICES: &[&str] = &[
+    "openclaw-updater",
+    "nginx",
+    "ssh-bastion",
+    "datadog-agent",
+];
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct RestartServiceResponse {
+    /// Service that was restarted
+    service: String,
+    /// Container ID that was restarted
+    container_id: String,
+    /// Result status
+    status: String,
+}
+
+#[utoipa::path(post, path = "/admin/restart-service/{service}", tag = "Admin",
+    params(("service" = String, Path, description = "Management service name to restart (openclaw-updater, nginx, ssh-bastion, datadog-agent)")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Service restarted successfully", body = RestartServiceResponse),
+        (status = 400, description = "Service name not in allowlist", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Container not found for service", body = ErrorResponse),
+        (status = 500, description = "Docker restart failed", body = ErrorResponse),
+    )
+)]
+async fn restart_management_service(
+    _auth: AdminAuth,
+    Path(service): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !RESTARTABLE_SERVICES.contains(&service.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "Service '{}' not in allowlist. Allowed: {}",
+            service,
+            RESTARTABLE_SERVICES.join(", ")
+        )));
+    }
+
+    let service_clone = service.clone();
+    let (container_id, restart_result) = tokio::task::spawn_blocking(move || {
+        // Find the container by Docker Compose service label
+        let find = std::process::Command::new("docker")
+            .args([
+                "ps",
+                "-q",
+                "--filter",
+                &format!("label=com.docker.compose.service={}", service_clone),
+            ])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("Failed to run docker ps: {}", e)))?;
+
+        let container_id = String::from_utf8_lossy(&find.stdout).trim().to_string();
+        if container_id.is_empty() {
+            return Err(ApiError::NotFound(format!(
+                "No running container found for service '{}'",
+                service_clone
+            )));
+        }
+
+        // Take only the first container ID if multiple lines
+        let container_id = container_id.lines().next().unwrap_or("").to_string();
+
+        let restart = std::process::Command::new("docker")
+            .args(["restart", &container_id])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("Failed to run docker restart: {}", e)))?;
+
+        if !restart.status.success() {
+            let stderr = String::from_utf8_lossy(&restart.stderr);
+            return Err(ApiError::Internal(format!(
+                "docker restart failed: {}",
+                stderr
+            )));
+        }
+
+        Ok(container_id)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("task join: {e}")))
+    .and_then(|r| r.map(|id| (id.clone(), "restarted".to_string())))?;
+
+    tracing::info!(
+        "Management service '{}' restarted (container={})",
+        service,
+        container_id
+    );
+
+    Ok(Json(RestartServiceResponse {
+        service,
+        container_id,
+        status: restart_result,
+    }))
 }
 
 // ── Utilities ────────────────────────────────────────────────────────
