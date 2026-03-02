@@ -56,6 +56,26 @@ BUNDLED_COMPOSE="/app/compose/docker-compose.dstack.yml"
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [updater] $*"; }
 log_error() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [updater] ERROR: $*" >&2; }
 
+# ── Docker Hub authentication ─────────────────────────────────────────
+
+docker_login() {
+    local username password
+    username="$(read_env_var 'DOCKER_REGISTRY_USER')"
+    password="$(read_env_var 'DOCKER_REGISTRY_TOKEN')"
+
+    if [ -z "$username" ] || [ -z "$password" ]; then
+        log "Docker Hub credentials not configured, pulling anonymously (rate limits apply)"
+        return 0
+    fi
+
+    log "Logging in to Docker Hub as ${username}..."
+    if echo "$password" | docker login -u "$username" --password-stdin; then
+        log "Docker Hub login successful"
+    else
+        log_error "Docker Hub login failed — will pull anonymously"
+    fi
+}
+
 # ── Image repo resolution ────────────────────────────────────────────
 
 # Derive repos from COMPOSE_API_IMAGE prefix when not explicitly set.
@@ -678,6 +698,7 @@ main() {
     log "  state file:        ${STATE_FILE}"
 
     init_state
+    docker_login
 
     # Bootstrap: deploy all services if compose-api isn't running yet
     bootstrap || true
