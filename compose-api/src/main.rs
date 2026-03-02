@@ -1546,7 +1546,9 @@ async fn restart_instance(
                 // discovered as inactive on startup or previously stopped).
                 {
                     let mut store = state.store.write().await;
-                    let _ = store.set_active(&name, true);
+                    if let Err(e) = store.set_active(&name, true) {
+                        tracing::warn!("Failed to mark instance active after restart: {}", e);
+                    }
                 }
                 update_nginx_now(&state).await;
             }
@@ -2247,7 +2249,9 @@ async fn background_sync_loop(state: AppState) {
                         inst.active,
                         is_running,
                     );
-                    let _ = store.set_active(&inst.name, is_running);
+                    if let Err(e) = store.set_active(&inst.name, is_running) {
+                        tracing::warn!("background_sync: Failed to set active state for instance {}: {}", inst.name, e);
+                    }
                 }
             }
         }
