@@ -1547,6 +1547,16 @@ async fn restart_instance(
                     let _ = tx.send(sse_error(&format!("Failed to restart container: {}", e))).await;
                     return;
                 }
+
+                // Mark active and update nginx routing (instance may have been
+                // discovered as inactive on startup or previously stopped).
+                {
+                    let mut store = state.store.write().await;
+                    if let Err(e) = store.set_active(&name, true) {
+                        tracing::warn!("Failed to mark instance active after restart: {}", e);
+                    }
+                }
+                update_nginx_now(&state).await;
             }
 
             // Health polling always runs, even after a partial restore failure
@@ -2333,6 +2343,30 @@ async fn background_sync_loop(state: AppState) {
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        // Reconcile in-memory `active` flags with actual Docker container state.
+        // This catches containers that recovered (e.g. after CVM reboot) or died
+        // without the API being notified — ensuring nginx routes stay in sync.
+        if let Ok(docker_statuses) = state.compose_all_statuses().await {
+            let mut store = state.store.write().await;
+            for inst in store.list() {
+                let is_running = docker_statuses
+                    .get(&inst.name)
+                    .map(|s| s == "running")
+                    .unwrap_or(false);
+                if inst.active != is_running {
+                    tracing::info!(
+                        "background_sync: reconciling instance {} active {} -> {}",
+                        inst.name,
+                        inst.active,
+                        is_running,
+                    );
+                    if let Err(e) = store.set_active(&inst.name, is_running) {
+                        tracing::warn!("background_sync: Failed to set active state for instance {}: {}", inst.name, e);
+                    }
+                }
+            }
+        }
 
         let instances = {
             let store = state.store.read().await;

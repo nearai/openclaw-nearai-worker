@@ -84,6 +84,7 @@ services:
       - management-data:/app/data
       - compose-files:/app/compose-live
       - ${DEPLOY_DIR:-.}:/app/deploy
+      - /root/.docker:/root/.docker:ro
     environment:
       - UPDATER_COMPOSE_API_IMAGE=${COMPOSE_API_IMAGE_REPO:-}
       - UPDATER_WORKER_IMAGE=${WORKER_IMAGE_REPO:-}
@@ -102,6 +103,8 @@ services:
       - UPDATER_HEALTH_URL=http://127.0.0.1:8080/health
       - UPDATER_HEALTH_TIMEOUT=60
       - UPDATER_STATE_FILE=/app/data/updater-state.json
+      - DOCKER_REGISTRY_USER=${DOCKER_REGISTRY_USER:-}
+      - DOCKER_REGISTRY_TOKEN=${DOCKER_REGISTRY_TOKEN:-}
     restart: unless-stopped
     depends_on:
       - compose-api
