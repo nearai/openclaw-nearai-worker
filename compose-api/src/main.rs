@@ -2036,8 +2036,15 @@ async fn restart_management_service(
             )));
         }
 
-        // Take only the first container ID if multiple lines
-        let container_id = container_id.lines().next().unwrap_or("").to_string();
+        // Fail explicitly if multiple containers match — partial restarts are dangerous
+        let mut lines = container_id.lines();
+        let container_id = lines.next().unwrap().to_string(); // .is_empty() check above makes this safe
+        if lines.next().is_some() {
+            return Err(ApiError::BadRequest(format!(
+                "Multiple containers found for service '{}'. Restarting multi-replica services is not supported.",
+                service_clone
+            )));
+        }
 
         let restart = std::process::Command::new("docker")
             .args(["restart", &container_id])
