@@ -405,13 +405,11 @@ impl ComposeManager {
             Some("ironclaw") => (".ironclaw", "workspace"),
             _ => (".openclaw", "openclaw"),
         };
-        // --ignore-failed-read: fresh instances may not have workspace/config dirs yet.
         let output = Command::new("docker")
             .args([
                 "exec",
                 &container,
                 "tar",
-                "--ignore-failed-read",
                 "cf",
                 "-",
                 "-C",
@@ -424,19 +422,24 @@ impl ComposeManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Distinguish docker exec failures (container not found, etc.) from tar
-            // warnings (missing files with --ignore-failed-read, exit code 1).
+            // Fresh instances may not have workspace/config dirs yet — treat as empty export.
+            // Both GNU tar and BusyBox tar emit "Cannot stat" / "No such file or directory"
+            // when a source path doesn't exist.
+            let is_missing_dir = stderr.contains("Cannot stat")
+                || stderr.contains("No such file or directory");
             let is_docker_error = stderr.contains("No such container")
                 || stderr.contains("is not running")
                 || stderr.contains("Error response from daemon");
-            let is_real_tar_error = output.status.code().unwrap_or(2) >= 2;
-            if is_docker_error || is_real_tar_error {
+            if is_docker_error || (!is_missing_dir) {
                 return Err(ApiError::Internal(format!(
                     "docker exec tar failed: {}",
                     stderr
                 )));
             }
-            tracing::warn!("tar export had warnings (non-fatal): {}", stderr.trim());
+            tracing::warn!(
+                "tar export: workspace/config dirs not found (fresh instance), treating as empty: {}",
+                stderr.trim()
+            );
         }
 
         Ok(output.stdout)
