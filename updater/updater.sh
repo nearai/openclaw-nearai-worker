@@ -58,8 +58,10 @@ log_error() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [updater] ERROR: $*" >&2; }
 
 # ── Docker Hub authentication ─────────────────────────────────────────
 
+# Use temp dir for Docker config to avoid persisting credentials on disk.
+# Docker Hub token endpoint and docker pull both need auth to avoid rate limits.
 docker_login() {
-    local username password
+    local username password docker_config
     username="$(read_env_var 'DOCKER_REGISTRY_USER')"
     password="$(read_env_var 'DOCKER_REGISTRY_TOKEN')"
 
@@ -68,8 +70,10 @@ docker_login() {
         return 0
     fi
 
+    docker_config="$(mktemp -d)"
+    export DOCKER_CONFIG="$docker_config"
     log "Logging in to Docker Hub as ${username}..."
-    if echo "$password" | docker login -u "$username" --password-stdin; then
+    if printf '%s' "$password" | docker login -u "$username" --password-stdin; then
         log "Docker Hub login successful"
     else
         log_error "Docker Hub login failed — will pull anonymously"
@@ -192,11 +196,20 @@ parse_image() {
     echo "$registry" "$repo"
 }
 
-# Get a Docker Hub auth token for pulling manifests
+# Get a Docker Hub auth token for pulling manifests.
+# Uses Basic auth when DOCKER_REGISTRY_USER/TOKEN are set (avoids anonymous rate limits).
 get_auth_token() {
     local repo="$1"
-    curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" \
-        | jq -r '.token'
+    local username password curl_args
+    username="$(read_env_var 'DOCKER_REGISTRY_USER')"
+    password="$(read_env_var 'DOCKER_REGISTRY_TOKEN')"
+
+    curl_args=(-fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull")
+    if [ -n "$username" ] && [ -n "$password" ]; then
+        curl_args=(-u "${username}:${password}" "${curl_args[@]}")
+    fi
+
+    curl "${curl_args[@]}" | jq -r '.token'
 }
 
 # Fetch the remote digest for a given image:tag
