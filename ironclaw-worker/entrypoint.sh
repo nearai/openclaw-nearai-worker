@@ -112,20 +112,9 @@ fi
 
 export RUST_LOG="${RUST_LOG:-ironclaw=info}"
 
-# ============================================
-# Workspace Bootstrap
-# ============================================
-if [ -d /app/workspace ]; then
-    for f in /app/workspace/*.md; do
-        [ -f "$f" ] || continue
-        fname=$(basename "$f")
-        if [ ! -f "/home/agent/workspace/$fname" ]; then
-            cp "$f" "/home/agent/workspace/$fname"
-            chown agent:agent "/home/agent/workspace/$fname"
-            echo "Bootstrap file $fname installed to workspace"
-        fi
-    done
-fi
+# Workspace: import custom templates from Docker image into DB on first boot.
+# seed_if_empty() fills any remaining gaps with generic defaults.
+export WORKSPACE_IMPORT_DIR=/app/init/workspace
 
 # ============================================
 # Final Ownership Fix
