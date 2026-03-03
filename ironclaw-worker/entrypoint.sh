@@ -74,6 +74,22 @@ export GATEWAY_HOST=0.0.0.0
 export GATEWAY_PORT=18789
 export GATEWAY_AUTH_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-changeme}"
 
+# OAuth callback: when OPENCLAW_DOMAIN and instance name are available,
+# configure IronClaw to use the shared auth proxy for OAuth redirects.
+# The auth proxy (auth.DOMAIN) reads the state parameter to route callbacks
+# back to the correct instance (INSTANCE.DOMAIN/oauth/callback).
+if [ -n "${OPENCLAW_DOMAIN:-}" ] && [ -n "${OPENCLAW_INSTANCE_NAME:-}" ]; then
+    export IRONCLAW_OAUTH_CALLBACK_URL="https://auth.${OPENCLAW_DOMAIN}/oauth/callback"
+    export IRONCLAW_INSTANCE_NAME="${OPENCLAW_INSTANCE_NAME}"
+fi
+
+# OAuth exchange proxy: when set, IronClaw uses this URL to exchange auth codes
+# for tokens instead of calling Google directly. The platform holds the client
+# secret so it never enters containers.
+if [ -n "${IRONCLAW_OAUTH_EXCHANGE_URL:-}" ]; then
+    export IRONCLAW_OAUTH_EXCHANGE_URL="${IRONCLAW_OAUTH_EXCHANGE_URL}"
+fi
+
 # Disable interactive REPL (no TTY in container; would cause immediate shutdown)
 export CLI_ENABLED=false
 

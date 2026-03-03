@@ -41,6 +41,9 @@ aws-config = "1"
 sha2 = "0.10"
 pem = "3"
 
+# HTTP client (OAuth token exchange proxy)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Security
 subtle = "2"
 secrecy = "0.10"

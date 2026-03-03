@@ -112,6 +112,11 @@ impl InstanceStore {
         self.instances.values().cloned().collect()
     }
 
+    /// Returns an iterator over all instance references (avoids cloning).
+    pub fn all(&self) -> impl Iterator<Item = &Instance> {
+        self.instances.values()
+    }
+
     /// Returns (gateway_port, ssh_port) - two consecutive ports
     pub fn next_available_ports(&self) -> Result<(u16, u16), crate::error::ApiError> {
         let used_ports: std::collections::HashSet<u16> = self
