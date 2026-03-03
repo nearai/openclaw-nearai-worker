@@ -9,6 +9,27 @@ use crate::store::Instance;
 /// Default NEAR AI Cloud API URL used when not specified per-instance.
 pub const DEFAULT_NEARAI_API_URL: &str = "https://cloud-api.near.ai/v1";
 
+/// Insert OAuth-related env vars into the given map.
+/// Shared by `up()` and `ensure_env_file()` to avoid duplication.
+fn insert_oauth_env_vars(
+    vars: &mut HashMap<String, String>,
+    instance_name: &str,
+    openclaw_domain: Option<&str>,
+    google_oauth_client_id: Option<&str>,
+    oauth_exchange_url: Option<&str>,
+) {
+    if let Some(domain) = openclaw_domain {
+        vars.insert("OPENCLAW_DOMAIN".into(), domain.into());
+        vars.insert("OPENCLAW_INSTANCE_NAME".into(), instance_name.into());
+    }
+    if let Some(client_id) = google_oauth_client_id {
+        vars.insert("GOOGLE_OAUTH_CLIENT_ID".into(), client_id.into());
+    }
+    if let Some(url) = oauth_exchange_url {
+        vars.insert("IRONCLAW_OAUTH_EXCHANGE_URL".into(), url.into());
+    }
+}
+
 pub struct ContainerHealth {
     pub state: String,
     pub health: String,
@@ -154,17 +175,13 @@ impl ComposeManager {
         if let Some(v) = cfg.storage_size {
             vars.insert("STORAGE_SIZE".into(), v.into());
         }
-        // Pass domain and instance name for OAuth auth proxy routing
-        if let Some(domain) = cfg.openclaw_domain {
-            vars.insert("OPENCLAW_DOMAIN".into(), domain.into());
-            vars.insert("OPENCLAW_INSTANCE_NAME".into(), cfg.name.into());
-        }
-        if let Some(client_id) = cfg.google_oauth_client_id {
-            vars.insert("GOOGLE_OAUTH_CLIENT_ID".into(), client_id.into());
-        }
-        if let Some(url) = cfg.oauth_exchange_url {
-            vars.insert("IRONCLAW_OAUTH_EXCHANGE_URL".into(), url.into());
-        }
+        insert_oauth_env_vars(
+            &mut vars,
+            cfg.name,
+            cfg.openclaw_domain,
+            cfg.google_oauth_client_id,
+            cfg.oauth_exchange_url,
+        );
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
         // Pull remote images via `docker pull` (compose v5 --pull is broken on ZFS).
@@ -747,17 +764,13 @@ impl ComposeManager {
                 .clone()
                 .unwrap_or_else(|| "openclaw".to_string()),
         );
-        // Pass domain and instance name for OAuth auth proxy routing
-        if let Some(domain) = openclaw_domain {
-            vars.insert("OPENCLAW_DOMAIN".into(), domain.to_string());
-            vars.insert("OPENCLAW_INSTANCE_NAME".into(), inst.name.clone());
-        }
-        if let Some(client_id) = google_oauth_client_id {
-            vars.insert("GOOGLE_OAUTH_CLIENT_ID".into(), client_id.to_string());
-        }
-        if let Some(url) = oauth_exchange_url {
-            vars.insert("IRONCLAW_OAUTH_EXCHANGE_URL".into(), url.to_string());
-        }
+        insert_oauth_env_vars(
+            &mut vars,
+            &inst.name,
+            openclaw_domain,
+            google_oauth_client_id,
+            oauth_exchange_url,
+        );
         self.write_env_file(&inst.name, &vars)
     }
 

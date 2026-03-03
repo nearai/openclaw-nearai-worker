@@ -59,6 +59,8 @@ use store::{Instance, InstanceStore};
         set_config,
         delete_config_key,
         restart_management_service,
+        oauth_exchange,
+        oauth_refresh,
     ),
     components(schemas(
         VersionResponse,
@@ -75,6 +77,8 @@ use store::{Instance, InstanceStore};
         SseEvent,
         ErrorResponse,
         RestartServiceResponse,
+        OAuthExchangeRequest,
+        OAuthRefreshRequest,
     )),
     security(("bearer_auth" = [])),
     modifiers(&SecurityAddon),
@@ -111,8 +115,9 @@ struct AppState {
     backup: Option<Arc<BackupManager>>,
     /// Per-instance lock to prevent concurrent upgrades.
     upgrading: Arc<Mutex<HashSet<String>>>,
-    /// Internal OAuth exchange proxy URL (e.g. "http://127.0.0.1:8080/oauth").
-    /// Set when GOOGLE_OAUTH_CLIENT_ID is configured.
+    /// URL exposed to ironclaw containers for them to proxy OAuth token exchanges through this service
+    /// (e.g. "http://host.docker.internal:8080/oauth"). Set when both GOOGLE_OAUTH_CLIENT_ID and
+    /// GOOGLE_OAUTH_CLIENT_SECRET are configured.
     oauth_exchange_url: Option<String>,
     /// Shared HTTP client for outgoing requests (OAuth token exchange).
     http_client: reqwest::Client,
@@ -343,10 +348,23 @@ impl FromRequestParts<AppState> for AdminAuth {
     }
 }
 
+/// Constant-time token comparison that does not leak length via timing.
+fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let max_len = ab.len().max(bb.len());
+    let mut diff: u8 = 0;
+    for i in 0..max_len {
+        let x = ab.get(i).copied().unwrap_or(0);
+        let y = bb.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0 && ab.len() == bb.len()
+}
+
 /// Extractor that validates an instance gateway token from the Authorization header.
 /// Returns the instance name if the token matches any known instance.
 struct InstanceAuth {
-    #[allow(dead_code)]
     instance_name: String,
 }
 
@@ -373,15 +391,11 @@ impl FromRequestParts<AppState> for InstanceAuth {
             })?
             .trim();
 
-        use subtle::ConstantTimeEq;
-
         // Scan all instances without early exit to avoid timing side-channels.
         let store = state.store.read().await;
         let mut matched_name: Option<String> = None;
         for inst in store.all() {
-            let same_len = token.len() == inst.token.len();
-            let ct_match = same_len && bool::from(token.as_bytes().ct_eq(inst.token.as_bytes()));
-            if ct_match && matched_name.is_none() {
+            if constant_time_token_eq(token, &inst.token) && matched_name.is_none() {
                 matched_name = Some(inst.name.clone());
             }
         }
@@ -398,7 +412,7 @@ impl FromRequestParts<AppState> for InstanceAuth {
 /// Google's token endpoint URL.
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct OAuthExchangeRequest {
     provider: String,
     code: String,
@@ -407,7 +421,7 @@ struct OAuthExchangeRequest {
     code_verifier: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct OAuthRefreshRequest {
     provider: String,
     refresh_token: String,
@@ -415,8 +429,21 @@ struct OAuthRefreshRequest {
 
 /// Exchange an authorization code for tokens via the provider's token endpoint.
 /// The client secret stays on the platform — containers never see it.
+#[utoipa::path(
+    post,
+    path = "/oauth/exchange",
+    tag = "OAuth",
+    security(("bearer_auth" = [])),
+    request_body(content = OAuthExchangeRequest),
+    responses(
+        (status = 200, description = "Token exchange successful"),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 502, description = "Provider error"),
+    )
+)]
 async fn oauth_exchange(
-    _auth: InstanceAuth,
+    auth: InstanceAuth,
     State(state): State<AppState>,
     Json(req): Json<OAuthExchangeRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -425,6 +452,23 @@ async fn oauth_exchange(
             "Unsupported OAuth provider: {}. Only 'google' is supported.",
             req.provider
         )));
+    }
+
+    // Validate redirect_uri belongs to the platform's auth domain.
+    // Prevents a compromised container from exchanging codes destined for other instances.
+    if let Some(domain) = &state.config.openclaw_domain {
+        let expected_prefix = format!("https://auth.{}/", domain);
+        if !req.redirect_uri.starts_with(&expected_prefix) {
+            tracing::warn!(
+                instance = %auth.instance_name,
+                redirect_uri = %req.redirect_uri,
+                "OAuth exchange rejected: redirect_uri does not match platform domain"
+            );
+            return Err(ApiError::BadRequest(format!(
+                "redirect_uri must start with https://auth.{}/",
+                domain
+            )));
+        }
     }
 
     let client_id = state
@@ -494,6 +538,19 @@ async fn oauth_exchange(
 
 /// Refresh an access token using a refresh token.
 /// The client secret stays on the platform — containers never see it.
+#[utoipa::path(
+    post,
+    path = "/oauth/refresh",
+    tag = "OAuth",
+    security(("bearer_auth" = [])),
+    request_body(content = OAuthRefreshRequest),
+    responses(
+        (status = 200, description = "Token refresh successful"),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 502, description = "Provider error"),
+    )
+)]
 async fn oauth_refresh(
     _auth: InstanceAuth,
     State(state): State<AppState>,
@@ -677,12 +734,16 @@ async fn main() -> anyhow::Result<()> {
     // Uses host.docker.internal because ironclaw containers run on a Docker bridge network
     // and can't reach the host's 127.0.0.1. The compose template adds extra_hosts for this.
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let listen_port = listen_addr.split(':').next_back().unwrap_or("8080");
-    let oauth_exchange_url: Option<String> = if config.google_oauth_client_id.is_some() {
-        Some(format!("http://host.docker.internal:{}/oauth", listen_port))
-    } else {
-        None
+    let listen_port = match listen_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.port().to_string(),
+        Err(_) => listen_addr.split(':').next_back().unwrap_or("8080").to_string(),
     };
+    let oauth_exchange_url: Option<String> =
+        if config.google_oauth_client_id.is_some() && config.google_oauth_client_secret.is_some() {
+            Some(format!("http://host.docker.internal:{}/oauth", listen_port))
+        } else {
+            None
+        };
 
     let mut instance_store = InstanceStore::new();
     match compose.discover_instances() {
@@ -760,9 +821,15 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/restart-service/{service}",
             post(restart_management_service),
-        )
-        .route("/oauth/exchange", post(oauth_exchange))
-        .route("/oauth/refresh", post(oauth_refresh));
+        );
+
+    if state.config.google_oauth_client_id.is_some()
+        && state.config.google_oauth_client_secret.is_some()
+    {
+        app = app
+            .route("/oauth/exchange", post(oauth_exchange))
+            .route("/oauth/refresh", post(oauth_refresh));
+    }
 
     if state.backup.is_some() {
         app = app
@@ -2811,5 +2878,33 @@ mod tests {
         assert!(is_valid_instance_name("a-b-c"));
         assert!(!is_valid_instance_name("-leading"));
         assert!(!is_valid_instance_name("trailing-"));
+    }
+
+    // ── constant_time_token_eq ──────────────────────────────────────
+
+    #[test]
+    fn test_ct_eq_matching() {
+        assert!(constant_time_token_eq("abc123", "abc123"));
+    }
+
+    #[test]
+    fn test_ct_eq_different_content() {
+        assert!(!constant_time_token_eq("abc123", "xyz789"));
+    }
+
+    #[test]
+    fn test_ct_eq_different_length() {
+        assert!(!constant_time_token_eq("short", "muchlongertoken"));
+    }
+
+    #[test]
+    fn test_ct_eq_empty_strings() {
+        assert!(constant_time_token_eq("", ""));
+    }
+
+    #[test]
+    fn test_ct_eq_one_empty() {
+        assert!(!constant_time_token_eq("", "notempty"));
+        assert!(!constant_time_token_eq("notempty", ""));
     }
 }
