@@ -251,6 +251,12 @@ fetch_remote_digest() {
     echo "$digest"
 }
 
+# Check if a digest-referenced image exists in the local Docker image store
+image_exists_locally() {
+    local image_repo="$1" digest="$2"
+    docker image inspect "${image_repo}@${digest}" > /dev/null 2>&1
+}
+
 # ── Cosign verification ──────────────────────────────────────────────
 
 verify_attestation() {
@@ -431,8 +437,11 @@ update_compose_api() {
 
     # 3. Compare
     if [ "$remote_digest" = "$running_digest" ]; then
-        log "compose-api: up to date (${remote_digest:0:16}...)"
-        return 0
+        if image_exists_locally "$COMPOSE_API_IMAGE" "$remote_digest"; then
+            log "compose-api: up to date (${remote_digest:0:16}...)"
+            return 0
+        fi
+        log "compose-api: digest matches but image missing locally, will pull"
     fi
 
     log "New compose-api image detected: ${remote_digest} (current: ${running_digest:-unknown})"
@@ -521,8 +530,11 @@ update_image() {
 
     current_digest="$(read_state "$state_key")"
     if [ "$remote_digest" = "$current_digest" ]; then
-        log "${label}: up to date (${remote_digest:0:16}...)"
-        return 0
+        if image_exists_locally "$image_repo" "$remote_digest"; then
+            log "${label}: up to date (${remote_digest:0:16}...)"
+            return 0
+        fi
+        log "${label}: digest matches but image missing locally, will pull"
     fi
 
     log "New ${label} image detected: ${remote_digest} (current: ${current_digest:-unknown})"
@@ -575,8 +587,11 @@ update_self() {
 
     current_digest="$(read_state "updater_digest")"
     if [ "$remote_digest" = "$current_digest" ]; then
-        log "Self-update: up to date (${remote_digest:0:16}...)"
-        return 0
+        if image_exists_locally "$updater_image" "$remote_digest"; then
+            log "Self-update: up to date (${remote_digest:0:16}...)"
+            return 0
+        fi
+        log "Self-update: digest matches but image missing locally, will pull"
     fi
 
     log "New updater image detected: ${remote_digest}"
