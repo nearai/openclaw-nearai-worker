@@ -86,6 +86,10 @@ services:
       - management-data:/app/data
       - compose-files:/app/compose-live
       - ${DEPLOY_DIR:-.}:/app/deploy
+    configs:
+      - source: docker_registry_config
+        target: /root/.docker/config.json
+        mode: 0600
     environment:
       - UPDATER_COMPOSE_API_IMAGE=${COMPOSE_API_IMAGE_REPO:-}
       - UPDATER_WORKER_IMAGE=${WORKER_IMAGE_REPO:-}
@@ -133,6 +137,10 @@ services:
     restart: unless-stopped
 
 configs:
+  docker_registry_config:
+    content: |
+      {"auths":{"https://index.docker.io/v1/":{"auth":"${DOCKER_REGISTRY_AUTH:-}"}}}
+
   openclaw_nginx:
     content: |
       map $$host $$openclaw_backend {
