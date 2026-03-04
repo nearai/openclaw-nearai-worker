@@ -28,9 +28,9 @@ env:
   REGISTRY: docker.io
 
 jobs:
+  # Normal build: all 6 images (skipped when building ironclaw from source)
   build:
-    # When ironclaw_commit is set (workflow_dispatch only), build only ironclaw-nearai-worker
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.ironclaw_commit || matrix.name == 'ironclaw-nearai-worker' }}
+    if: ${{ !inputs.ironclaw_commit }}
     name: Build ${{ matrix.name }}
     permissions:
       contents: read
@@ -66,12 +66,6 @@ jobs:
             dockerfile: ssh-bastion/Dockerfile
             build_script: false
     steps:
-      - name: Validate inputs
-        if: ${{ inputs.ironclaw_commit && inputs.ironclaw_version }}
-        run: |
-          echo "::error::Cannot specify both ironclaw_commit and ironclaw_version"
-          exit 1
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -86,10 +80,12 @@ jobs:
         run: echo "IMAGE_REPOSITORY=${{ vars.DOCKER_REGISTRY_USER }}/${{ matrix.name }}" >> "$GITHUB_ENV"
 
       - name: Extract image tag from GitHub ref (branch or tag)
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
         run: |
           # Use manual input tag if provided via workflow_dispatch
-          if [[ -n "${{ inputs.tag }}" ]]; then
-            TAG="${{ inputs.tag }}"
+          if [[ -n "$TAG_INPUT" ]]; then
+            TAG="$TAG_INPUT"
             echo "Using '${TAG}' image tag from workflow_dispatch input"
           elif [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
             TAG=${GITHUB_REF_NAME#v}
@@ -113,33 +109,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y skopeo jq
-
-      # Build ironclaw from source when ironclaw_commit is provided (workflow_dispatch only)
-      - name: Clone ironclaw source
-        if: ${{ inputs.ironclaw_commit }}
-        run: |
-          git clone https://github.com/nearai/ironclaw.git ironclaw-src
-          cd ironclaw-src
-          git checkout "${{ inputs.ironclaw_commit }}"
-          echo "Checked out ironclaw at $(git rev-parse HEAD)"
-
-      - name: Install Rust toolchain
-        if: ${{ inputs.ironclaw_commit }}
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        if: ${{ inputs.ironclaw_commit }}
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: ironclaw-src -> target
-
-      - name: Build ironclaw from source
-        if: ${{ inputs.ironclaw_commit }}
-        run: |
-          cd ironclaw-src
-          cargo build --release --locked
-          cp target/release/ironclaw "${{ github.workspace }}/ironclaw-worker/ironclaw"
-          echo "Built ironclaw binary successfully"
 
       # Reproducible build path (worker only — uses build-image.sh)
       - name: Build and push reproducible image
@@ -199,4 +168,108 @@ jobs:
             echo "- tag: \`${{ env.IMAGE_REFERENCE }}\`"
             echo "- digest: \`${{ env.IMAGE_DIGEST }}\`"
             echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Source build: compile ironclaw from a specific commit and build only ironclaw-nearai-worker
+  build-ironclaw-from-source:
+    if: ${{ inputs.ironclaw_commit }}
+    name: Build ironclaw-nearai-worker (from source)
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        if: ${{ inputs.ironclaw_version }}
+        run: |
+          echo "::error::Cannot specify both ironclaw_commit and ironclaw_version"
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Set image metadata
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          echo "IMAGE_REPOSITORY=${{ vars.DOCKER_REGISTRY_USER }}/ironclaw-nearai-worker" >> "$GITHUB_ENV"
+
+          if [[ -n "$TAG_INPUT" ]]; then
+            TAG="$TAG_INPUT"
+          else
+            TAG='dev'
+          fi
+          echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ vars.DOCKER_REGISTRY_USER }}/ironclaw-nearai-worker:${TAG}" >> "$GITHUB_ENV"
+
+      - name: Clone ironclaw source
+        env:
+          IRONCLAW_COMMIT: ${{ inputs.ironclaw_commit }}
+        run: |
+          if ! [[ "$IRONCLAW_COMMIT" =~ ^[0-9A-Za-z._/-]+$ ]]; then
+            echo "::error::Invalid ironclaw_commit value"
+            exit 1
+          fi
+          git init ironclaw-src
+          cd ironclaw-src
+          git remote add origin https://github.com/nearai/ironclaw.git
+          git fetch --depth 1 origin "$IRONCLAW_COMMIT"
+          git checkout FETCH_HEAD
+          echo "Checked out ironclaw at $(git rev-parse HEAD)"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ironclaw-src -> target
+
+      - name: Build ironclaw from source
+        run: |
+          cd ironclaw-src
+          cargo build --release --locked
+          cp target/release/ironclaw "${{ github.workspace }}/ironclaw-worker/ironclaw"
+          echo "Built ironclaw binary successfully"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        id: docker_build
+        with:
+          context: ironclaw-worker
+          file: ironclaw-worker/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE_REFERENCE }}
+
+      - name: Generate artifact attestation (GitHub)
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.docker_build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ steps.docker_build.outputs.digest }}"
+
+      - name: Generate build summary
+        run: |
+          {
+            echo "## ironclaw-nearai-worker docker image (from source)"
+            echo ""
+            echo "- tag: \`${{ env.IMAGE_REFERENCE }}\`"
+            echo "- digest: \`${{ steps.docker_build.outputs.digest }}\`"
+            echo "- ironclaw commit: \`${{ inputs.ironclaw_commit }}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${{ steps.docker_build.outputs.digest }}"
           } >> "$GITHUB_STEP_SUMMARY"
