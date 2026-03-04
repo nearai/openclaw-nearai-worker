@@ -349,6 +349,11 @@ impl FromRequestParts<AppState> for AdminAuth {
 }
 
 /// Constant-time token comparison that does not leak length via timing.
+///
+/// Hand-rolled XOR rather than `subtle::ConstantTimeEq` because `ct_eq` requires
+/// equal-length slices, forcing a branch on length that leaks timing information.
+/// This version iterates `max(len_a, len_b)` and pads with zeros, so the work done
+/// is independent of which input is shorter.
 fn constant_time_token_eq(a: &str, b: &str) -> bool {
     let ab = a.as_bytes();
     let bb = b.as_bytes();
@@ -392,10 +397,12 @@ impl FromRequestParts<AppState> for InstanceAuth {
             .trim();
 
         // Scan all instances without early exit to avoid timing side-channels.
+        // Always call constant_time_token_eq to keep per-iteration time constant.
         let store = state.store.read().await;
         let mut matched_name: Option<String> = None;
         for inst in store.all() {
-            if constant_time_token_eq(token, &inst.token) && matched_name.is_none() {
+            let is_match = constant_time_token_eq(token, &inst.token);
+            if is_match && matched_name.is_none() {
                 matched_name = Some(inst.name.clone());
             }
         }
@@ -456,18 +463,26 @@ async fn oauth_exchange(
 
     // Validate redirect_uri belongs to the platform's auth domain.
     // Prevents a compromised container from exchanging codes destined for other instances.
-    if let Some(domain) = &state.config.openclaw_domain {
-        let expected_prefix = format!("https://auth.{}/", domain);
-        if !req.redirect_uri.starts_with(&expected_prefix) {
-            tracing::warn!(
-                instance = %auth.instance_name,
-                redirect_uri = %req.redirect_uri,
-                "OAuth exchange rejected: redirect_uri does not match platform domain"
-            );
-            return Err(ApiError::BadRequest(format!(
-                "redirect_uri must start with https://auth.{}/",
-                domain
-            )));
+    // Fail closed: if OPENCLAW_DOMAIN is not configured, reject the request.
+    match &state.config.openclaw_domain {
+        Some(domain) => {
+            let expected_prefix = format!("https://auth.{}/", domain);
+            if !req.redirect_uri.starts_with(&expected_prefix) {
+                tracing::warn!(
+                    instance = %auth.instance_name,
+                    redirect_uri = %req.redirect_uri,
+                    "OAuth exchange rejected: redirect_uri does not match platform domain"
+                );
+                return Err(ApiError::BadRequest(format!(
+                    "redirect_uri must start with https://auth.{}/",
+                    domain
+                )));
+            }
+        }
+        None => {
+            return Err(ApiError::Internal(
+                "OPENCLAW_DOMAIN not configured; OAuth exchange is unavailable".into(),
+            ));
         }
     }
 
@@ -791,7 +806,10 @@ async fn main() -> anyhow::Result<()> {
         backup,
         upgrading: Arc::new(Mutex::new(HashSet::new())),
         oauth_exchange_url: oauth_exchange_url.clone(),
-        http_client: reqwest::Client::new(),
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client"),
     };
 
     update_nginx_now(&state).await;

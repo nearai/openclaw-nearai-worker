@@ -211,8 +211,11 @@ configs:
           default_type application/json;
 
           location = /oauth/callback {
+              if ($$arg_state = "") {
+                  return 400 '{"error":"missing_state","message":"OAuth callback missing state parameter"}';
+              }
               if ($$oauth_instance = "") {
-                  return 400 '{"error":"invalid_state","message":"OAuth callback missing or malformed state parameter"}';
+                  return 400 '{"error":"invalid_state","message":"Could not extract instance name from state parameter"}';
               }
               # Redirect to the instance subdomain, preserving ALL original query params
               # (code, state, error, scope, etc. — IronClaw needs state for CSRF check).
