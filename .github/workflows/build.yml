@@ -226,6 +226,7 @@ jobs:
       - name: Build ironclaw from source (Bookworm container for GLIBC compatibility)
         run: |
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
             -v "${{ github.workspace }}/ironclaw-src:/src" \
             -v "${{ github.workspace }}/ironclaw-worker:/out" \
             -w /src \

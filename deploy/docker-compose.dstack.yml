@@ -148,8 +148,8 @@ configs:
       # Extract instance name from OAuth state parameter (format: "instance:nonce").
       # Used by auth.${OPENCLAW_DOMAIN} to route callbacks to the correct instance subdomain.
       map $$arg_state $$oauth_instance {
-          ~^([^:]+):   $$1;
-          default      "";
+          ~*^([a-z0-9-]{1,63}):   $$1;
+          default                  "";
       }
 
       server {
