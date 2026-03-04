@@ -16,8 +16,8 @@ fn parse_port_env(var_name: &str, default: u16) -> u16 {
         Ok(raw) => match raw.parse::<u16>() {
             Ok(port) => port,
             Err(e) => {
-                eprintln!(
-                    "Warning: failed to parse {}='{}' as u16 ({}); falling back to default port {}",
+                tracing::warn!(
+                    "failed to parse {}='{}' as u16 ({}); falling back to default port {}",
                     var_name, raw, e, default
                 );
                 default
@@ -25,8 +25,8 @@ fn parse_port_env(var_name: &str, default: u16) -> u16 {
         },
         Err(std::env::VarError::NotPresent) => default,
         Err(e) => {
-            eprintln!(
-                "Warning: failed to read {} from environment ({}); falling back to default port {}",
+            tracing::warn!(
+                "failed to read {} from environment ({}); falling back to default port {}",
                 var_name, e, default
             );
             default
@@ -34,30 +34,35 @@ fn parse_port_env(var_name: &str, default: u16) -> u16 {
     }
 }
 
-fn base_port() -> u16 {
-    parse_port_env("PORT_RANGE_START", DEFAULT_BASE_PORT)
+/// Resolved port range, validated once at startup.
+#[derive(Debug, Clone, Copy)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
 }
 
-fn max_port() -> u16 {
-    let start = base_port();
-    let end = parse_port_env("PORT_RANGE_END", DEFAULT_MAX_PORT);
+impl PortRange {
+    /// Read and validate port range from environment. Call once at startup.
+    pub fn from_env() -> Self {
+        let start = parse_port_env("PORT_RANGE_START", DEFAULT_BASE_PORT);
+        let end = parse_port_env("PORT_RANGE_END", DEFAULT_MAX_PORT);
 
-    if end <= start {
-        panic!(
+        assert!(
+            end > start,
             "Invalid port range: PORT_RANGE_END ({}) must be greater than PORT_RANGE_START ({})",
             end, start
         );
-    }
 
-    let available_ports = end - start + 1;
-    if available_ports < PORTS_PER_INSTANCE {
-        panic!(
+        let available_ports = (end as u32) - (start as u32) + 1;
+        assert!(
+            available_ports >= PORTS_PER_INSTANCE as u32,
             "Invalid port range: [{}, {}] provides {} ports, but at least {} are required for one instance",
             start, end, available_ports, PORTS_PER_INSTANCE
         );
-    }
 
-    end
+        tracing::info!("port range: {}-{} ({} ports)", start, end, available_ports);
+        Self { start, end }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,12 +100,14 @@ pub struct Instance {
 #[derive(Debug)]
 pub struct InstanceStore {
     instances: HashMap<String, Instance>,
+    port_range: PortRange,
 }
 
 impl InstanceStore {
-    pub fn new() -> Self {
+    pub fn new(port_range: PortRange) -> Self {
         Self {
             instances: HashMap::new(),
+            port_range,
         }
     }
 
@@ -174,8 +181,8 @@ impl InstanceStore {
             .flat_map(|i| [i.gateway_port, i.ssh_port])
             .collect();
 
-        let start = base_port();
-        let end = max_port();
+        let start = self.port_range.start;
+        let end = self.port_range.end;
         let mut port = start;
         while let Some(next) = port.checked_add(1) {
             if next > end {
@@ -199,10 +206,14 @@ impl InstanceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Mutex to serialize tests that modify environment variables
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn range(start: u16, end: u16) -> PortRange {
+        PortRange { start, end }
+    }
+
+    fn default_range() -> PortRange {
+        range(DEFAULT_BASE_PORT, DEFAULT_MAX_PORT)
+    }
 
     fn test_instance(name: &str, gateway_port: u16, ssh_port: u16) -> Instance {
         Instance {
@@ -226,10 +237,7 @@ mod tests {
 
     #[test]
     fn test_next_available_ports_empty_store() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("PORT_RANGE_START");
-        std::env::remove_var("PORT_RANGE_END");
-        let store = InstanceStore::new();
+        let store = InstanceStore::new(default_range());
         let (gw, ssh) = store.next_available_ports().unwrap();
         assert_eq!(gw, DEFAULT_BASE_PORT);
         assert_eq!(ssh, DEFAULT_BASE_PORT + 1);
@@ -237,10 +245,7 @@ mod tests {
 
     #[test]
     fn test_next_available_ports_with_existing() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("PORT_RANGE_START");
-        std::env::remove_var("PORT_RANGE_END");
-        let mut store = InstanceStore::new();
+        let mut store = InstanceStore::new(default_range());
         store.add(test_instance("a", DEFAULT_BASE_PORT, DEFAULT_BASE_PORT + 1));
         let (gw, ssh) = store.next_available_ports().unwrap();
         assert_eq!(gw, DEFAULT_BASE_PORT + PORTS_PER_INSTANCE);
@@ -249,59 +254,42 @@ mod tests {
 
     #[test]
     fn test_next_available_ports_exhausted() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        // Use a small custom range to avoid creating thousands of instances
-        std::env::set_var("PORT_RANGE_START", "50001");
-        std::env::set_var("PORT_RANGE_END", "50004");
-        let mut store = InstanceStore::new();
+        let mut store = InstanceStore::new(range(50001, 50004));
         let mut port: u16 = 50001;
         while port + 1 <= 50004 {
             store.add(test_instance(&format!("inst-{}", port), port, port + 1));
             port += PORTS_PER_INSTANCE;
         }
         assert!(store.next_available_ports().is_err());
-        std::env::remove_var("PORT_RANGE_START");
-        std::env::remove_var("PORT_RANGE_END");
     }
 
     #[test]
     fn test_next_available_ports_custom_range() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        std::env::set_var("PORT_RANGE_START", "30001");
-        std::env::set_var("PORT_RANGE_END", "30010");
-        let store = InstanceStore::new();
+        let store = InstanceStore::new(range(30001, 30010));
         let (gw, ssh) = store.next_available_ports().unwrap();
         assert_eq!(gw, 30001);
         assert_eq!(ssh, 30002);
 
         // With one instance, should get the next pair
-        let mut store = InstanceStore::new();
+        let mut store = InstanceStore::new(range(30001, 30010));
         store.add(test_instance("a", 30001, 30002));
         let (gw, ssh) = store.next_available_ports().unwrap();
         assert_eq!(gw, 30003);
         assert_eq!(ssh, 30004);
-
-        std::env::remove_var("PORT_RANGE_START");
-        std::env::remove_var("PORT_RANGE_END");
     }
 
     #[test]
     fn test_next_available_ports_end_inclusive() {
-        let _lock = ENV_LOCK.lock().unwrap();
         // Range of exactly 2 ports — should fit one instance
-        std::env::set_var("PORT_RANGE_START", "40001");
-        std::env::set_var("PORT_RANGE_END", "40002");
-        let store = InstanceStore::new();
+        let store = InstanceStore::new(range(40001, 40002));
         let (gw, ssh) = store.next_available_ports().unwrap();
         assert_eq!(gw, 40001);
         assert_eq!(ssh, 40002);
-        std::env::remove_var("PORT_RANGE_START");
-        std::env::remove_var("PORT_RANGE_END");
     }
 
     #[test]
     fn test_store_crud() {
-        let mut store = InstanceStore::new();
+        let mut store = InstanceStore::new(default_range());
         assert!(!store.exists("foo"));
 
         store.add(test_instance("foo", 19001, 19002));
@@ -316,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_store_set_active() {
-        let mut store = InstanceStore::new();
+        let mut store = InstanceStore::new(default_range());
         store.add(test_instance("foo", 19001, 19002));
         assert!(store.get("foo").unwrap().active);
 
