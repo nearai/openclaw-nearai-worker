@@ -69,7 +69,7 @@ RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.ironclaw /home/agent/
 
 # Copy entrypoint and workspace bootstrap files
 COPY entrypoint.sh /app/entrypoint.sh
-COPY workspace/ /app/workspace/
+COPY workspace/ /app/init/workspace/
 RUN chmod +x /app/entrypoint.sh
 
 WORKDIR /home/agent
