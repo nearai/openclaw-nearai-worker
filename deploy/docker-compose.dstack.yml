@@ -54,6 +54,8 @@ services:
       - BASTION_SSH_EXTERNAL_PORT=${BASTION_SSH_EXTERNAL_PORT:-${BASTION_SSH_PORT:-2222}}
       - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID:-}
       - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      - PORT_RANGE_START=${PORT_RANGE_START:-19001}
+      - PORT_RANGE_END=${PORT_RANGE_END:-29999}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
       interval: 5s

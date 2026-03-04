@@ -31,7 +31,7 @@ mod store;
 use backup::BackupManager;
 use compose::{ComposeManager, DEFAULT_NEARAI_API_URL};
 use error::ApiError;
-use store::{Instance, InstanceStore};
+use store::{Instance, InstanceStore, PortRange};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -760,7 +760,8 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-    let mut instance_store = InstanceStore::new();
+    let port_range = PortRange::from_env();
+    let mut instance_store = InstanceStore::new(port_range);
     match compose.discover_instances() {
         Ok(discovered) => {
             if !discovered.is_empty() {
