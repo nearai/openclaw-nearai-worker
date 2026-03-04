@@ -9,7 +9,7 @@ set -euo pipefail
 # WARNING: Do not enable debug mode (set -x) as it will expose all variable values.
 
 # Ensure volume mount points are writable by agent
-mkdir -p /home/agent/.ironclaw /home/agent/workspace
+mkdir -p /home/agent/.ironclaw/channels /home/agent/workspace
 
 # ============================================
 # SSH Server Configuration

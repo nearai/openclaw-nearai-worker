@@ -61,7 +61,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 USER root
 
 # Configure SSH, directories, and agent environment
-RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.ironclaw /home/agent/workspace && \
+RUN mkdir -p /home/agent/.ssh /home/agent/ssh /home/agent/.ironclaw/channels /home/agent/workspace && \
     chmod 700 /home/agent/.ssh && \
     printf '%s\n' '[ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"' > /home/agent/.profile && \
     echo 'source "$HOME/.cargo/env"' >> /home/agent/.bashrc && \
