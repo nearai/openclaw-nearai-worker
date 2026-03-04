@@ -223,19 +223,14 @@ jobs:
           git checkout "$IRONCLAW_COMMIT"
           echo "Checked out ironclaw at $(git rev-parse HEAD)"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: ironclaw-src -> target
-
-      - name: Build ironclaw from source
+      - name: Build ironclaw from source (Bookworm container for GLIBC compatibility)
         run: |
-          cd ironclaw-src
-          cargo build --release --locked
-          cp target/release/ironclaw "${{ github.workspace }}/ironclaw-worker/ironclaw"
+          docker run --rm \
+            -v "${{ github.workspace }}/ironclaw-src:/src" \
+            -v "${{ github.workspace }}/ironclaw-worker:/out" \
+            -w /src \
+            rust:bookworm \
+            sh -c "cargo build --release --locked && cp target/release/ironclaw /out/ironclaw"
           echo "Built ironclaw binary successfully"
 
       - name: Build and push image
