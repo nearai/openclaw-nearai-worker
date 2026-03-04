@@ -50,6 +50,9 @@
     },
     "bind": "${OPENCLAW_GATEWAY_BIND}",
     "port": 18789,
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    },
     "http": {
       "endpoints": {
         "chatCompletions": {
