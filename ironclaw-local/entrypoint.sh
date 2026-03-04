@@ -9,7 +9,7 @@ set -euo pipefail
 #   NEARAI_API_KEY, OPENCLAW_GATEWAY_TOKEN, SECRETS_MASTER_KEY
 
 # Ensure volume mount points are writable by agent
-mkdir -p /home/agent/.ironclaw /home/agent/workspace
+mkdir -p /home/agent/.ironclaw/channels /home/agent/workspace
 
 # ============================================
 # SSH Server (optional, only if SSH_PUBKEY set)

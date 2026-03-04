@@ -56,7 +56,7 @@ COPY entrypoint.sh /app/entrypoint.sh
 COPY workspace/ /app/init/workspace/
 
 RUN chmod +x /app/entrypoint.sh && \
-    mkdir -p /home/agent/.ironclaw /home/agent/workspace && \
+    mkdir -p /home/agent/.ironclaw/channels /home/agent/workspace && \
     chown -R agent:agent /home/agent
 
 WORKDIR /home/agent
