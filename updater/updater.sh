@@ -390,9 +390,11 @@ bootstrap() {
         log "Bootstrap: fresh deploy, will start all services"
     fi
 
-    # Start/reconcile all services (idempotent — running services stay untouched)
+    # Start/reconcile all services except ourselves — compose would kill us
+    # mid-bootstrap if our config hash changed. Self-updates are handled
+    # separately by update_self() which uses a helper container.
     log "Bootstrap: ensuring all services are running..."
-    compose_up -d --remove-orphans
+    compose_up -d --remove-orphans cert-init nginx compose-api ssh-bastion datadog-agent
 
     if [ "$fresh_deploy" = true ]; then
         if wait_for_healthy "$HEALTH_TIMEOUT"; then
