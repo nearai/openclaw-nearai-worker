@@ -52,6 +52,8 @@ services:
       - BASTION_SSH_PUBKEY_PATH=/app/data/bastion/id_ed25519.pub
       - BASTION_SSH_PORT=${BASTION_SSH_PORT:-2222}
       - BASTION_SSH_EXTERNAL_PORT=${BASTION_SSH_EXTERNAL_PORT:-${BASTION_SSH_PORT:-2222}}
+      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID:-}
+      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET:-}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
       interval: 5s
@@ -143,6 +145,14 @@ configs:
           ''      close;
       }
 
+      # Extract instance name from OAuth state parameter (format: "instance:nonce").
+      # Used by auth.${OPENCLAW_DOMAIN} to route callbacks to the correct instance subdomain.
+      # Note: $$1 is needed because Docker Compose interpolates $VAR in config content.
+      map $$arg_state $$oauth_instance {
+          ~^([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)(?::.+)?$$   $$1;
+          default      "";
+      }
+
       server {
           listen 80 default_server;
           listen 443 ssl;
@@ -185,6 +195,35 @@ configs:
               proxy_set_header X-Real-IP $$remote_addr;
               proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
               proxy_set_header X-Forwarded-Proto $$scheme;
+          }
+      }
+
+      # OAuth auth proxy: receives callbacks from OAuth providers (e.g. Google)
+      # and redirects to the correct instance using the `state` query parameter.
+      # State format: "instance:nonce" — the map above extracts the instance name.
+      server {
+          listen 443 ssl;
+          server_name auth.${OPENCLAW_DOMAIN};
+
+          ssl_certificate /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/privkey.pem;
+
+          default_type application/json;
+
+          location = /oauth/callback {
+              if ($$arg_state = "") {
+                  return 400 '{"error":"missing_state","message":"OAuth callback missing state parameter"}';
+              }
+              if ($$oauth_instance = "") {
+                  return 400 '{"error":"invalid_state","message":"Could not extract instance name from state parameter"}';
+              }
+              # Redirect to the instance subdomain, preserving ALL original query params
+              # (code, state, error, scope, etc. — IronClaw needs state for CSRF check).
+              return 302 https://$$oauth_instance.${OPENCLAW_DOMAIN}/oauth/callback$$is_args$$args;
+          }
+
+          location / {
+              return 404 '{"error":"not_found","message":"Only /oauth/callback is served here"}';
           }
       }
 

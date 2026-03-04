@@ -27,6 +27,9 @@ pub enum ApiError {
 
     #[error("Not implemented: {0}")]
     NotImplemented(String),
+
+    #[error("Bad gateway: {0}")]
+    BadGateway(String),
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -51,6 +54,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             ApiError::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg.clone()),
+            ApiError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
         };
 
         (status, Json(json!({ "error": message }))).into_response()

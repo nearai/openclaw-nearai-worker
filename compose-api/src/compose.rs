@@ -9,6 +9,27 @@ use crate::store::Instance;
 /// Default NEAR AI Cloud API URL used when not specified per-instance.
 pub const DEFAULT_NEARAI_API_URL: &str = "https://cloud-api.near.ai/v1";
 
+/// Insert OAuth-related env vars into the given map.
+/// Shared by `up()` and `ensure_env_file()` to avoid duplication.
+fn insert_oauth_env_vars(
+    vars: &mut HashMap<String, String>,
+    instance_name: &str,
+    openclaw_domain: Option<&str>,
+    google_oauth_client_id: Option<&str>,
+    oauth_exchange_url: Option<&str>,
+) {
+    if let Some(domain) = openclaw_domain {
+        vars.insert("OPENCLAW_DOMAIN".into(), domain.into());
+        vars.insert("OPENCLAW_INSTANCE_NAME".into(), instance_name.into());
+    }
+    if let Some(client_id) = google_oauth_client_id {
+        vars.insert("GOOGLE_OAUTH_CLIENT_ID".into(), client_id.into());
+    }
+    if let Some(url) = oauth_exchange_url {
+        vars.insert("IRONCLAW_OAUTH_EXCHANGE_URL".into(), url.into());
+    }
+}
+
 pub struct ContainerHealth {
     pub state: String,
     pub health: String,
@@ -31,6 +52,13 @@ pub struct InstanceConfig<'a> {
     pub cpus: Option<&'a str>,
     /// Container storage limit (e.g. "10G", "20G"). Omit to use compose template default.
     pub storage_size: Option<&'a str>,
+    /// Domain for multi-tenant deployment (e.g. "agent0.near.ai").
+    /// When set, configures the OAuth auth proxy callback URL in the container.
+    pub openclaw_domain: Option<&'a str>,
+    /// Google OAuth client ID (public, not secret) for constructing auth URLs.
+    pub google_oauth_client_id: Option<&'a str>,
+    /// URL of the platform's OAuth token exchange proxy.
+    pub oauth_exchange_url: Option<&'a str>,
 }
 
 /// Manages one Docker Compose project per worker via the `docker compose` CLI.
@@ -147,6 +175,13 @@ impl ComposeManager {
         if let Some(v) = cfg.storage_size {
             vars.insert("STORAGE_SIZE".into(), v.into());
         }
+        insert_oauth_env_vars(
+            &mut vars,
+            cfg.name,
+            cfg.openclaw_domain,
+            cfg.google_oauth_client_id,
+            cfg.oauth_exchange_url,
+        );
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
         // Pull remote images via `docker pull` (compose v5 --pull is broken on ZFS).
@@ -697,7 +732,13 @@ impl ComposeManager {
 
     /// Reconstruct the env file for a discovered instance so that
     /// docker compose lifecycle commands (stop/start/restart) continue to work.
-    pub fn ensure_env_file(&self, inst: &Instance) -> Result<PathBuf, ApiError> {
+    pub fn ensure_env_file(
+        &self,
+        inst: &Instance,
+        openclaw_domain: Option<&str>,
+        google_oauth_client_id: Option<&str>,
+        oauth_exchange_url: Option<&str>,
+    ) -> Result<PathBuf, ApiError> {
         let mut vars = HashMap::new();
         vars.insert("NEARAI_API_KEY".into(), inst.nearai_api_key.clone());
         vars.insert(
@@ -722,6 +763,13 @@ impl ComposeManager {
             inst.service_type
                 .clone()
                 .unwrap_or_else(|| "openclaw".to_string()),
+        );
+        insert_oauth_env_vars(
+            &mut vars,
+            &inst.name,
+            openclaw_domain,
+            google_oauth_client_id,
+            oauth_exchange_url,
         );
         self.write_env_file(&inst.name, &vars)
     }

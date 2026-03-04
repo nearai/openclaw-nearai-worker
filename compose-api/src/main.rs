@@ -59,6 +59,8 @@ use store::{Instance, InstanceStore};
         set_config,
         delete_config_key,
         restart_management_service,
+        oauth_exchange,
+        oauth_refresh,
     ),
     components(schemas(
         VersionResponse,
@@ -75,6 +77,8 @@ use store::{Instance, InstanceStore};
         SseEvent,
         ErrorResponse,
         RestartServiceResponse,
+        OAuthExchangeRequest,
+        OAuthRefreshRequest,
     )),
     security(("bearer_auth" = [])),
     modifiers(&SecurityAddon),
@@ -111,6 +115,12 @@ struct AppState {
     backup: Option<Arc<BackupManager>>,
     /// Per-instance lock to prevent concurrent upgrades.
     upgrading: Arc<Mutex<HashSet<String>>>,
+    /// URL exposed to ironclaw containers for them to proxy OAuth token exchanges through this service
+    /// (e.g. "http://host.docker.internal:8080/oauth"). Set when both GOOGLE_OAUTH_CLIENT_ID and
+    /// GOOGLE_OAUTH_CLIENT_SECRET are configured.
+    oauth_exchange_url: Option<String>,
+    /// Shared HTTP client for outgoing requests (OAuth token exchange).
+    http_client: reqwest::Client,
 }
 
 struct AppConfig {
@@ -125,6 +135,10 @@ struct AppConfig {
     env_override_file: Option<PathBuf>,
     bastion_ssh_pubkey: Option<String>,
     bastion_ssh_port: Option<u16>,
+    /// Google OAuth client ID (public). Passed to ironclaw containers for auth URL construction.
+    google_oauth_client_id: Option<String>,
+    /// Google OAuth client secret (confidential). Used by the exchange proxy, never enters containers.
+    google_oauth_client_secret: Option<secrecy::SecretString>,
 }
 
 impl AppState {
@@ -153,6 +167,9 @@ impl AppState {
         let nearai_api_url = nearai_api_url.to_string();
         let service_type = service_type.to_string();
         let bastion_ssh_pubkey = self.config.bastion_ssh_pubkey.clone();
+        let openclaw_domain = self.config.openclaw_domain.clone();
+        let google_oauth_client_id = self.config.google_oauth_client_id.clone();
+        let oauth_exchange_url = self.oauth_exchange_url.clone();
         tokio::task::spawn_blocking(move || {
             compose.up(&compose::InstanceConfig {
                 name: &name,
@@ -168,11 +185,15 @@ impl AppState {
                 mem_limit: mem_limit.as_deref(),
                 cpus: cpus.as_deref(),
                 storage_size: storage_size.as_deref(),
+                openclaw_domain: openclaw_domain.as_deref(),
+                google_oauth_client_id: google_oauth_client_id.as_deref(),
+                oauth_exchange_url: oauth_exchange_url.as_deref(),
             })
         })
         .await
         .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
+
 
     async fn compose_down(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
@@ -327,6 +348,294 @@ impl FromRequestParts<AppState> for AdminAuth {
     }
 }
 
+/// Constant-time token comparison that does not leak length via timing.
+///
+/// Hand-rolled XOR rather than `subtle::ConstantTimeEq` because `ct_eq` requires
+/// equal-length slices, forcing a branch on length that leaks timing information.
+/// This version iterates `max(len_a, len_b)` and pads with zeros, so the work done
+/// is independent of which input is shorter.
+fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let max_len = ab.len().max(bb.len());
+    let mut diff: u8 = 0;
+    for i in 0..max_len {
+        let x = ab.get(i).copied().unwrap_or(0);
+        let y = bb.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0 && ab.len() == bb.len()
+}
+
+/// Extractor that validates an instance gateway token from the Authorization header.
+/// Returns the instance name if the token matches any known instance.
+struct InstanceAuth {
+    instance_name: String,
+}
+
+impl FromRequestParts<AppState> for InstanceAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_header = parts
+            .headers
+            .get("Authorization")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".into()))?;
+
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .or_else(|| auth_header.strip_prefix("bearer "))
+            .ok_or_else(|| {
+                ApiError::Unauthorized(
+                    "Invalid Authorization header format. Expected: Bearer <token>".into(),
+                )
+            })?
+            .trim();
+
+        // Scan all instances without early exit to avoid timing side-channels.
+        // Always call constant_time_token_eq to keep per-iteration time constant.
+        let store = state.store.read().await;
+        let mut matched_name: Option<String> = None;
+        for inst in store.all() {
+            let is_match = constant_time_token_eq(token, &inst.token);
+            if is_match && matched_name.is_none() {
+                matched_name = Some(inst.name.clone());
+            }
+        }
+
+        match matched_name {
+            Some(name) => Ok(InstanceAuth { instance_name: name }),
+            None => Err(ApiError::Unauthorized("Invalid instance token".into())),
+        }
+    }
+}
+
+// ── OAuth token exchange proxy ───────────────────────────────────────
+
+/// Google's token endpoint URL.
+const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct OAuthExchangeRequest {
+    provider: String,
+    code: String,
+    redirect_uri: String,
+    #[serde(default)]
+    code_verifier: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct OAuthRefreshRequest {
+    provider: String,
+    refresh_token: String,
+}
+
+/// Exchange an authorization code for tokens via the provider's token endpoint.
+/// The client secret stays on the platform — containers never see it.
+#[utoipa::path(
+    post,
+    path = "/oauth/exchange",
+    tag = "OAuth",
+    security(("bearer_auth" = [])),
+    request_body(content = OAuthExchangeRequest),
+    responses(
+        (status = 200, description = "Token exchange successful"),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 502, description = "Provider error"),
+    )
+)]
+async fn oauth_exchange(
+    auth: InstanceAuth,
+    State(state): State<AppState>,
+    Json(req): Json<OAuthExchangeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if req.provider != "google" {
+        return Err(ApiError::BadRequest(format!(
+            "Unsupported OAuth provider: {}. Only 'google' is supported.",
+            req.provider
+        )));
+    }
+
+    // Validate redirect_uri belongs to the platform's auth domain.
+    // Prevents a compromised container from exchanging codes destined for other instances.
+    // Fail closed: if OPENCLAW_DOMAIN is not configured, reject the request.
+    match &state.config.openclaw_domain {
+        Some(domain) => {
+            let expected_prefix = format!("https://auth.{}/", domain);
+            if !req.redirect_uri.starts_with(&expected_prefix) {
+                tracing::warn!(
+                    instance = %auth.instance_name,
+                    redirect_uri = %req.redirect_uri,
+                    "OAuth exchange rejected: redirect_uri does not match platform domain"
+                );
+                return Err(ApiError::BadRequest(format!(
+                    "redirect_uri must start with https://auth.{}/",
+                    domain
+                )));
+            }
+        }
+        None => {
+            return Err(ApiError::Internal(
+                "OPENCLAW_DOMAIN not configured; OAuth exchange is unavailable".into(),
+            ));
+        }
+    }
+
+    let client_id = state
+        .config
+        .google_oauth_client_id
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::Internal("GOOGLE_OAUTH_CLIENT_ID not configured on this platform".into())
+        })?;
+
+    use secrecy::ExposeSecret;
+    let secret_ref = state
+        .config
+        .google_oauth_client_secret
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::Internal("GOOGLE_OAUTH_CLIENT_SECRET not configured on this platform".into())
+        })?;
+    let client_secret: &str = secret_ref.expose_secret();
+
+    let mut params = vec![
+        ("grant_type", "authorization_code"),
+        ("code", &req.code),
+        ("redirect_uri", &req.redirect_uri),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+    ];
+
+    let code_verifier_val;
+    if let Some(ref cv) = req.code_verifier {
+        code_verifier_val = cv.clone();
+        params.push(("code_verifier", &code_verifier_val));
+    }
+
+    let response = state
+        .http_client
+        .post(GOOGLE_TOKEN_ENDPOINT)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to contact Google token endpoint: {}", e)))?;
+
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to parse Google response: {}", e)))?;
+
+    if !status.is_success() {
+        tracing::warn!(
+            "Google token exchange failed ({}): error={} description={}",
+            status,
+            body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            body.get("error_description").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        return Err(ApiError::BadGateway(format!(
+            "Google token exchange failed: {}",
+            body.get("error_description")
+                .or_else(|| body.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+        )));
+    }
+
+    Ok(Json(body))
+}
+
+/// Refresh an access token using a refresh token.
+/// The client secret stays on the platform — containers never see it.
+#[utoipa::path(
+    post,
+    path = "/oauth/refresh",
+    tag = "OAuth",
+    security(("bearer_auth" = [])),
+    request_body(content = OAuthRefreshRequest),
+    responses(
+        (status = 200, description = "Token refresh successful"),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 502, description = "Provider error"),
+    )
+)]
+async fn oauth_refresh(
+    _auth: InstanceAuth,
+    State(state): State<AppState>,
+    Json(req): Json<OAuthRefreshRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if req.provider != "google" {
+        return Err(ApiError::BadRequest(format!(
+            "Unsupported OAuth provider: {}. Only 'google' is supported.",
+            req.provider
+        )));
+    }
+
+    let client_id = state
+        .config
+        .google_oauth_client_id
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::Internal("GOOGLE_OAUTH_CLIENT_ID not configured on this platform".into())
+        })?;
+
+    use secrecy::ExposeSecret;
+    let secret_ref = state
+        .config
+        .google_oauth_client_secret
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::Internal("GOOGLE_OAUTH_CLIENT_SECRET not configured on this platform".into())
+        })?;
+    let client_secret: &str = secret_ref.expose_secret();
+
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", req.refresh_token.as_str()),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+    ];
+
+    let response = state
+        .http_client
+        .post(GOOGLE_TOKEN_ENDPOINT)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to contact Google token endpoint: {}", e)))?;
+
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to parse Google response: {}", e)))?;
+
+    if !status.is_success() {
+        tracing::warn!(
+            "Google token refresh failed ({}): error={} description={}",
+            status,
+            body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            body.get("error_description").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        return Err(ApiError::BadGateway(format!(
+            "Google token refresh failed: {}",
+            body.get("error_description")
+                .or_else(|| body.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+        )));
+    }
+
+    Ok(Json(body))
+}
+
 fn validate_admin_token(token: &str) -> anyhow::Result<()> {
     if token.len() != ADMIN_TOKEN_HEX_LEN {
         anyhow::bail!(
@@ -404,6 +713,13 @@ async fn main() -> anyhow::Result<()> {
         env_override_file: std::env::var("ENV_OVERRIDE_FILE").ok().map(PathBuf::from),
         bastion_ssh_pubkey,
         bastion_ssh_port,
+        google_oauth_client_id: std::env::var("GOOGLE_OAUTH_CLIENT_ID")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        google_oauth_client_secret: std::env::var("GOOGLE_OAUTH_CLIENT_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(secrecy::SecretString::from),
     });
 
     let mut compose_files = std::collections::HashMap::new();
@@ -428,13 +744,34 @@ async fn main() -> anyhow::Result<()> {
         config.bastion_ssh_pubkey.clone(),
     )?);
 
+    // Compute the internal OAuth exchange proxy URL for containers.
+    // Containers call this URL instead of Google directly, so the client_secret stays on the platform.
+    // Uses host.docker.internal because ironclaw containers run on a Docker bridge network
+    // and can't reach the host's 127.0.0.1. The compose template adds extra_hosts for this.
+    let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let listen_port = match listen_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.port().to_string(),
+        Err(_) => listen_addr.split(':').next_back().unwrap_or("8080").to_string(),
+    };
+    let oauth_exchange_url: Option<String> =
+        if config.google_oauth_client_id.is_some() && config.google_oauth_client_secret.is_some() {
+            Some(format!("http://host.docker.internal:{}/oauth", listen_port))
+        } else {
+            None
+        };
+
     let mut instance_store = InstanceStore::new();
     match compose.discover_instances() {
         Ok(discovered) => {
             if !discovered.is_empty() {
                 tracing::info!("discovered {} instances from Docker", discovered.len());
                 for inst in &discovered {
-                    if let Err(e) = compose.ensure_env_file(inst) {
+                    if let Err(e) = compose.ensure_env_file(
+                        inst,
+                        config.openclaw_domain.as_deref(),
+                        config.google_oauth_client_id.as_deref(),
+                        oauth_exchange_url.as_deref(),
+                    ) {
                         tracing::warn!("failed to write env file for {}: {}", inst.name, e);
                     }
                 }
@@ -468,6 +805,11 @@ async fn main() -> anyhow::Result<()> {
         config,
         backup,
         upgrading: Arc::new(Mutex::new(HashSet::new())),
+        oauth_exchange_url: oauth_exchange_url.clone(),
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client"),
     };
 
     update_nginx_now(&state).await;
@@ -498,6 +840,14 @@ async fn main() -> anyhow::Result<()> {
             "/admin/restart-service/{service}",
             post(restart_management_service),
         );
+
+    if state.config.google_oauth_client_id.is_some()
+        && state.config.google_oauth_client_secret.is_some()
+    {
+        app = app
+            .route("/oauth/exchange", post(oauth_exchange))
+            .route("/oauth/refresh", post(oauth_refresh));
+    }
 
     if state.backup.is_some() {
         app = app
@@ -2325,6 +2675,8 @@ impl AppConfig {
             env_override_file: None,
             bastion_ssh_pubkey: None,
             bastion_ssh_port: Some(15222),
+            google_oauth_client_id: None,
+            google_oauth_client_secret: None,
         }
     }
 }
@@ -2544,5 +2896,33 @@ mod tests {
         assert!(is_valid_instance_name("a-b-c"));
         assert!(!is_valid_instance_name("-leading"));
         assert!(!is_valid_instance_name("trailing-"));
+    }
+
+    // ── constant_time_token_eq ──────────────────────────────────────
+
+    #[test]
+    fn test_ct_eq_matching() {
+        assert!(constant_time_token_eq("abc123", "abc123"));
+    }
+
+    #[test]
+    fn test_ct_eq_different_content() {
+        assert!(!constant_time_token_eq("abc123", "xyz789"));
+    }
+
+    #[test]
+    fn test_ct_eq_different_length() {
+        assert!(!constant_time_token_eq("short", "muchlongertoken"));
+    }
+
+    #[test]
+    fn test_ct_eq_empty_strings() {
+        assert!(constant_time_token_eq("", ""));
+    }
+
+    #[test]
+    fn test_ct_eq_one_empty() {
+        assert!(!constant_time_token_eq("", "notempty"));
+        assert!(!constant_time_token_eq("notempty", ""));
     }
 }
