@@ -147,9 +147,8 @@ configs:
 
       # Extract instance name from OAuth state parameter (format: "instance:nonce").
       # Used by auth.${OPENCLAW_DOMAIN} to route callbacks to the correct instance subdomain.
-      # Note: $$1 is needed because Docker Compose interpolates $VAR in config content.
       map $$arg_state $$oauth_instance {
-          ~^([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)(?::.+)?$$   $$1;
+          ~^([^:]+):   $$1;
           default      "";
       }
 
