@@ -218,11 +218,9 @@ jobs:
             echo "::error::Invalid ironclaw_commit value"
             exit 1
           fi
-          git init ironclaw-src
+          git clone --filter=blob:none https://github.com/nearai/ironclaw.git ironclaw-src
           cd ironclaw-src
-          git remote add origin https://github.com/nearai/ironclaw.git
-          git fetch --depth 1 origin "$IRONCLAW_COMMIT"
-          git checkout FETCH_HEAD
+          git checkout "$IRONCLAW_COMMIT"
           echo "Checked out ironclaw at $(git rev-parse HEAD)"
 
       - name: Install Rust toolchain
