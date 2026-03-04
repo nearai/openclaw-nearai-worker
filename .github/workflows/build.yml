@@ -80,10 +80,12 @@ jobs:
         run: echo "IMAGE_REPOSITORY=${{ vars.DOCKER_REGISTRY_USER }}/${{ matrix.name }}" >> "$GITHUB_ENV"
 
       - name: Extract image tag from GitHub ref (branch or tag)
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
         run: |
           # Use manual input tag if provided via workflow_dispatch
-          if [[ -n "${{ inputs.tag }}" ]]; then
-            TAG="${{ inputs.tag }}"
+          if [[ -n "$TAG_INPUT" ]]; then
+            TAG="$TAG_INPUT"
             echo "Using '${TAG}' image tag from workflow_dispatch input"
           elif [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
             TAG=${GITHUB_REF_NAME#v}
@@ -196,21 +198,31 @@ jobs:
           password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
 
       - name: Set image metadata
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
         run: |
           echo "IMAGE_REPOSITORY=${{ vars.DOCKER_REGISTRY_USER }}/ironclaw-nearai-worker" >> "$GITHUB_ENV"
 
-          if [[ -n "${{ inputs.tag }}" ]]; then
-            TAG="${{ inputs.tag }}"
+          if [[ -n "$TAG_INPUT" ]]; then
+            TAG="$TAG_INPUT"
           else
             TAG='dev'
           fi
           echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ vars.DOCKER_REGISTRY_USER }}/ironclaw-nearai-worker:${TAG}" >> "$GITHUB_ENV"
 
       - name: Clone ironclaw source
+        env:
+          IRONCLAW_COMMIT: ${{ inputs.ironclaw_commit }}
         run: |
-          git clone https://github.com/nearai/ironclaw.git ironclaw-src
+          if ! [[ "$IRONCLAW_COMMIT" =~ ^[0-9A-Za-z._/-]+$ ]]; then
+            echo "::error::Invalid ironclaw_commit value"
+            exit 1
+          fi
+          git init ironclaw-src
           cd ironclaw-src
-          git checkout "${{ inputs.ironclaw_commit }}"
+          git remote add origin https://github.com/nearai/ironclaw.git
+          git fetch --depth 1 origin "$IRONCLAW_COMMIT"
+          git checkout FETCH_HEAD
           echo "Checked out ironclaw at $(git rev-parse HEAD)"
 
       - name: Install Rust toolchain
