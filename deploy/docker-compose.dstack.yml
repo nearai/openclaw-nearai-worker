@@ -86,7 +86,6 @@ services:
       - management-data:/app/data
       - compose-files:/app/compose-live
       - ${DEPLOY_DIR:-.}:/app/deploy
-      - /root/.docker:/root/.docker:ro
     environment:
       - UPDATER_COMPOSE_API_IMAGE=${COMPOSE_API_IMAGE_REPO:-}
       - UPDATER_WORKER_IMAGE=${WORKER_IMAGE_REPO:-}
