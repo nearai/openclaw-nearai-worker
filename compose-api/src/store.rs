@@ -6,10 +6,24 @@ fn default_active() -> bool {
     true
 }
 
-const BASE_PORT: u16 = 19001;
-const MAX_PORT: u16 = 19999;
+const DEFAULT_BASE_PORT: u16 = 19001;
+const DEFAULT_MAX_PORT: u16 = 19999;
 // Each instance gets 2 consecutive ports: gateway_port and gateway_port+1 (SSH)
 const PORTS_PER_INSTANCE: u16 = 2;
+
+fn base_port() -> u16 {
+    std::env::var("PORT_RANGE_START")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_BASE_PORT)
+}
+
+fn max_port() -> u16 {
+    std::env::var("PORT_RANGE_END")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_PORT)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
@@ -125,9 +139,9 @@ impl InstanceStore {
             .flat_map(|i| [i.gateway_port, i.ssh_port])
             .collect();
 
-        let mut port = BASE_PORT;
+        let mut port = base_port();
         while let Some(next) = port.checked_add(1) {
-            if next >= MAX_PORT {
+            if next >= max_port() {
                 break;
             }
             if !used_ports.contains(&port) && !used_ports.contains(&next) {
