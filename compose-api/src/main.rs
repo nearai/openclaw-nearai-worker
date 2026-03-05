@@ -1,5 +1,5 @@
 use axum::{
-    extract::{FromRequestParts, Path, Query, State},
+    extract::{Form, FromRequestParts, Path, Query, State},
     http::{request::Parts, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -419,8 +419,13 @@ impl FromRequestParts<AppState> for InstanceAuth {
 /// Google's token endpoint URL.
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
+fn default_provider_google() -> String {
+    "google".into()
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 struct OAuthExchangeRequest {
+    #[serde(default = "default_provider_google")]
     provider: String,
     code: String,
     redirect_uri: String,
@@ -430,6 +435,7 @@ struct OAuthExchangeRequest {
 
 #[derive(Deserialize, utoipa::ToSchema)]
 struct OAuthRefreshRequest {
+    #[serde(default = "default_provider_google")]
     provider: String,
     refresh_token: String,
 }
@@ -452,7 +458,7 @@ struct OAuthRefreshRequest {
 async fn oauth_exchange(
     auth: InstanceAuth,
     State(state): State<AppState>,
-    Json(req): Json<OAuthExchangeRequest>,
+    Form(req): Form<OAuthExchangeRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     if req.provider != "google" {
         return Err(ApiError::BadRequest(format!(
@@ -569,7 +575,7 @@ async fn oauth_exchange(
 async fn oauth_refresh(
     _auth: InstanceAuth,
     State(state): State<AppState>,
-    Json(req): Json<OAuthRefreshRequest>,
+    Form(req): Form<OAuthRefreshRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     if req.provider != "google" {
         return Err(ApiError::BadRequest(format!(
@@ -755,7 +761,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let oauth_exchange_url: Option<String> =
         if config.google_oauth_client_id.is_some() && config.google_oauth_client_secret.is_some() {
-            Some(format!("http://host.docker.internal:{}/oauth", listen_port))
+            Some(format!("http://host.docker.internal:{}", listen_port))
         } else {
             None
         };
