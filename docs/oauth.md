@@ -152,7 +152,7 @@ The platform's compose-api holds the Google client secret and proxies token exch
 │  IRONCLAW_OAUTH_CALLBACK_URL = https://auth.DOMAIN/oauth                       │
 │  IRONCLAW_INSTANCE_NAME      = alice          (from OPENCLAW_INSTANCE_NAME)    │
 │  GOOGLE_OAUTH_CLIENT_ID      = 637554...      (public, for auth URL)           │
-│  IRONCLAW_OAUTH_EXCHANGE_URL = http://host.docker.internal:8080/oauth          │
+│  IRONCLAW_OAUTH_EXCHANGE_URL = http://host.docker.internal:8080                │
 │  GATEWAY_AUTH_TOKEN           = <random hex>   (for exchange proxy auth)        │
 │                                                                                │
 │  NOT in container:                                                             │
@@ -176,5 +176,19 @@ The platform's compose-api holds the Google client secret and proxies token exch
 │  • Atomic remove from registry prevents replay attacks                         │
 │  • 5-minute expiry on pending flows                                            │
 │  • Falls back to direct exchange + TCP listener in local/desktop mode          │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│  EXCHANGE PROXY PROTOCOL                                                       │
+│                                                                                │
+│  IronClaw appends /oauth/exchange to IRONCLAW_OAUTH_EXCHANGE_URL.             │
+│  Request: POST, form-encoded (code, redirect_uri, code_verifier).             │
+│  Auth: Bearer <gateway_token>.                                                 │
+│  compose-api adds client_id + client_secret and forwards to Google.           │
+│  Response: JSON {access_token, refresh_token, expires_in}.                     │
+│                                                                                │
+│  Provider defaults to "google". To add providers (Microsoft, GitHub):          │
+│  1. Add *_CLIENT_ID / *_CLIENT_SECRET env vars + AppConfig fields             │
+│  2. Add provider registry: provider → (token_endpoint, credentials)           │
+│  3. WASM tools send provider=<name> as a form param                            │
+│  4. No ironclaw core changes needed                                            │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
