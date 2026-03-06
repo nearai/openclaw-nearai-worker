@@ -102,7 +102,7 @@ services:
       - UPDATER_COSIGN_IDENTITY_REGEXP=${UPDATER_COSIGN_IDENTITY:-}
       - UPDATER_COSIGN_ISSUER=https://token.actions.githubusercontent.com
       - UPDATER_HEALTH_URL=http://127.0.0.1:8080/health
-      - UPDATER_HEALTH_TIMEOUT=60
+      - UPDATER_HEALTH_TIMEOUT=${UPDATER_HEALTH_TIMEOUT:-120}
       - UPDATER_STATE_FILE=/app/data/updater-state.json
     restart: unless-stopped
     depends_on:
