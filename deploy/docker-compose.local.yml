@@ -145,15 +145,6 @@ configs:
           ''      close;
       }
 
-      # DDoS protection
-      limit_req_zone $$binary_remote_addr zone=gateway_req:10m rate=10r/s;
-      limit_req_zone $$binary_remote_addr zone=api_req:5m rate=5r/s;
-      limit_conn_zone $$binary_remote_addr zone=per_ip_conn:10m;
-      limit_req_status 429;
-      limit_conn_status 429;
-      limit_req_log_level warn;
-      limit_conn_log_level warn;
-
       server {
           listen 80 default_server;
           listen 443 ssl;
@@ -163,7 +154,6 @@ configs:
           ssl_certificate_key /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/privkey.pem;
 
           default_type application/json;
-          limit_conn per_ip_conn 50;
           client_max_body_size 1m;
           client_header_timeout 10s;
           client_body_timeout 30s;
@@ -173,7 +163,6 @@ configs:
                   return 503 '{"error":"instance_not_available","message":"This instance is stopped or does not exist"}';
               }
 
-              limit_req zone=gateway_req burst=20 nodelay;
               proxy_pass $$openclaw_backend;
               proxy_http_version 1.1;
               proxy_set_header Upgrade $$http_upgrade;
@@ -195,7 +184,6 @@ configs:
           ssl_certificate /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/fullchain.pem;
           ssl_certificate_key /etc/letsencrypt/live/${OPENCLAW_DOMAIN}/privkey.pem;
 
-          limit_conn per_ip_conn 20;
           client_max_body_size 2m;
           client_header_timeout 5s;
           client_body_timeout 10s;
@@ -207,7 +195,6 @@ configs:
           }
 
           location / {
-              limit_req zone=api_req burst=10 nodelay;
               proxy_pass http://127.0.0.1:8080;
               proxy_set_header Host $$host;
               proxy_set_header X-Real-IP $$remote_addr;
