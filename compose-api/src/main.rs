@@ -642,6 +642,135 @@ async fn oauth_refresh(
     Ok(Json(body))
 }
 
+/// Set up iptables DOCKER-USER chain rules to block container egress to RFC1918.
+///
+/// Uses source matching (-s 172.16.0.0/12) so only container-originated traffic
+/// is blocked. Host-to-container DNAT traffic (source 127.0.0.1) is unaffected.
+///
+/// Controlled by CONTAINER_FIREWALL env var (default: "true").
+/// Idempotent: checks existing rules before inserting.
+/// Never panics or fails startup — logs warnings on errors.
+fn setup_container_firewall() {
+    let enabled = std::env::var("CONTAINER_FIREWALL").unwrap_or_else(|_| "true".to_string());
+
+    if enabled != "true" {
+        tracing::info!(
+            "Container firewall disabled (CONTAINER_FIREWALL={})",
+            enabled
+        );
+        return;
+    }
+
+    tracing::info!("Setting up container egress firewall (DOCKER-USER chain)");
+
+    // Source = Docker bridge subnet (container-originated traffic only).
+    // This preserves host-to-container DNAT traffic (nginx, bastion) which has src=127.0.0.1.
+    let source = "172.16.0.0/12";
+
+    // Block container access to non-Docker RFC1918 ranges.
+    // We intentionally do NOT block 172.16.0.0/12 as destination because
+    // containers need to reach each other on the Docker bridge.
+    let dest_cidrs = ["10.0.0.0/8", "192.168.0.0/16"];
+
+    for dest in &dest_cidrs {
+        // Check if rule already exists (idempotent)
+        let exists = std::process::Command::new("iptables")
+            .args(["-C", "DOCKER-USER", "-s", source, "-d", dest, "-j", "REJECT"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if exists {
+            tracing::info!(
+                "Firewall: REJECT rule for {} -> {} already exists, skipping",
+                source,
+                dest
+            );
+            continue;
+        }
+
+        // Try REJECT first (preferred: causes immediate socket close via ICMP unreachable).
+        // Fall back to DROP if REJECT not supported (some nft backends).
+        let result = std::process::Command::new("iptables")
+            .args([
+                "-I",
+                "DOCKER-USER",
+                "1",
+                "-s",
+                source,
+                "-d",
+                dest,
+                "-j",
+                "REJECT",
+            ])
+            .output();
+
+        match result {
+            Ok(o) if o.status.success() => {
+                tracing::info!("Firewall: added REJECT rule for {} -> {}", source, dest);
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::warn!(
+                    "Firewall: REJECT failed for {} -> {} ({}), trying DROP",
+                    source,
+                    dest,
+                    stderr.trim()
+                );
+                let drop_result = std::process::Command::new("iptables")
+                    .args([
+                        "-I",
+                        "DOCKER-USER",
+                        "1",
+                        "-s",
+                        source,
+                        "-d",
+                        dest,
+                        "-j",
+                        "DROP",
+                    ])
+                    .output();
+                match drop_result {
+                    Ok(o2) if o2.status.success() => {
+                        tracing::info!(
+                            "Firewall: added DROP rule for {} -> {} (fallback)",
+                            source,
+                            dest
+                        );
+                    }
+                    Ok(o2) => {
+                        tracing::warn!(
+                            "Firewall: DROP also failed for {} -> {}: {}",
+                            source,
+                            dest,
+                            String::from_utf8_lossy(&o2.stderr).trim()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Firewall: iptables exec failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Firewall: iptables not available ({}). Container egress is unrestricted.",
+                    e
+                );
+                return;
+            }
+        }
+    }
+
+    // Log final state for Datadog visibility
+    if let Ok(o) = std::process::Command::new("iptables")
+        .args(["-L", "DOCKER-USER", "-n", "-v"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        tracing::info!("Firewall: DOCKER-USER chain:\n{}", stdout);
+    }
+}
+
 fn validate_admin_token(token: &str) -> anyhow::Result<()> {
     if token.len() != ADMIN_TOKEN_HEX_LEN {
         anyhow::bail!(
@@ -664,6 +793,8 @@ async fn main() -> anyhow::Result<()> {
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    setup_container_firewall();
 
     let admin_token_raw = std::env::var("ADMIN_TOKEN").expect("ADMIN_TOKEN must be set");
     let admin_token = admin_token_raw.trim().to_string();
