@@ -663,6 +663,18 @@ fn setup_container_firewall() {
 
     tracing::info!("Setting up container egress firewall (DOCKER-USER chain)");
 
+    // Detect working iptables binary. Docker uses iptables-legacy for its chains,
+    // but the default `iptables` in Debian bookworm is the nft variant which fails
+    // inside containers with "Could not fetch rule set generation id: Invalid argument".
+    let iptables = detect_iptables_binary();
+    let Some(iptables) = iptables else {
+        tracing::warn!(
+            "Firewall: no working iptables binary found. Container egress is unrestricted."
+        );
+        return;
+    };
+    tracing::info!("Firewall: using {}", iptables);
+
     // Source = Docker bridge subnet (container-originated traffic only).
     // This preserves host-to-container DNAT traffic (nginx, bastion) which has src=127.0.0.1.
     let source = "172.16.0.0/12";
@@ -674,7 +686,7 @@ fn setup_container_firewall() {
 
     for dest in &dest_cidrs {
         // Check if REJECT rule already exists (idempotent)
-        let reject_exists = std::process::Command::new("iptables")
+        let reject_exists = std::process::Command::new(iptables)
             .args(["-C", "DOCKER-USER", "-s", source, "-d", dest, "-j", "REJECT"])
             .output()
             .map(|o| o.status.success())
@@ -690,7 +702,7 @@ fn setup_container_firewall() {
         }
 
         // Check if DROP rule already exists (from a previous fallback)
-        let drop_exists = std::process::Command::new("iptables")
+        let drop_exists = std::process::Command::new(iptables)
             .args(["-C", "DOCKER-USER", "-s", source, "-d", dest, "-j", "DROP"])
             .output()
             .map(|o| o.status.success())
@@ -706,8 +718,8 @@ fn setup_container_firewall() {
         }
 
         // Try REJECT first (preferred: causes immediate socket close via ICMP unreachable).
-        // Fall back to DROP if REJECT not supported (some nft backends).
-        let result = std::process::Command::new("iptables")
+        // Fall back to DROP if REJECT not supported.
+        let result = std::process::Command::new(iptables)
             .args([
                 "-I",
                 "DOCKER-USER",
@@ -733,7 +745,7 @@ fn setup_container_firewall() {
                     dest,
                     stderr.trim()
                 );
-                let drop_result = std::process::Command::new("iptables")
+                let drop_result = std::process::Command::new(iptables)
                     .args([
                         "-I",
                         "DOCKER-USER",
@@ -769,7 +781,8 @@ fn setup_container_firewall() {
             }
             Err(e) => {
                 tracing::warn!(
-                    "Firewall: iptables not available ({}). Container egress is unrestricted.",
+                    "Firewall: {} not available ({}). Container egress is unrestricted.",
+                    iptables,
                     e
                 );
                 return;
@@ -778,13 +791,34 @@ fn setup_container_firewall() {
     }
 
     // Log final state for Datadog visibility
-    if let Ok(o) = std::process::Command::new("iptables")
+    if let Ok(o) = std::process::Command::new(iptables)
         .args(["-L", "DOCKER-USER", "-n", "-v"])
         .output()
     {
         let stdout = String::from_utf8_lossy(&o.stdout);
         tracing::info!("Firewall: DOCKER-USER chain:\n{}", stdout);
     }
+}
+
+/// Detect a working iptables binary by trying to list the DOCKER-USER chain.
+/// Prefers iptables-legacy (what Docker uses) over iptables (nft variant).
+fn detect_iptables_binary() -> Option<&'static str> {
+    for bin in &["iptables-legacy", "iptables"] {
+        if let Ok(o) = std::process::Command::new(bin)
+            .args(["-L", "DOCKER-USER", "-n"])
+            .output()
+        {
+            if o.status.success() {
+                return Some(bin);
+            }
+            tracing::debug!(
+                "Firewall: {} failed: {}",
+                bin,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+    }
+    None
 }
 
 fn validate_admin_token(token: &str) -> anyhow::Result<()> {
