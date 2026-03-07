@@ -221,7 +221,6 @@ configs:
           client_body_timeout 10s;
 
           location = /health {
-              limit_req off;
               proxy_pass http://127.0.0.1:8080;
               proxy_set_header Host $$host;
               proxy_set_header X-Real-IP $$remote_addr;
