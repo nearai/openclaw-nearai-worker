@@ -653,7 +653,7 @@ async fn oauth_refresh(
 fn setup_container_firewall() {
     let enabled = std::env::var("CONTAINER_FIREWALL").unwrap_or_else(|_| "true".to_string());
 
-    if enabled != "true" {
+    if enabled.to_lowercase() != "true" {
         tracing::info!(
             "Container firewall disabled (CONTAINER_FIREWALL={})",
             enabled
@@ -673,16 +673,32 @@ fn setup_container_firewall() {
     let dest_cidrs = ["10.0.0.0/8", "192.168.0.0/16"];
 
     for dest in &dest_cidrs {
-        // Check if rule already exists (idempotent)
-        let exists = std::process::Command::new("iptables")
+        // Check if REJECT rule already exists (idempotent)
+        let reject_exists = std::process::Command::new("iptables")
             .args(["-C", "DOCKER-USER", "-s", source, "-d", dest, "-j", "REJECT"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
 
-        if exists {
+        if reject_exists {
             tracing::info!(
                 "Firewall: REJECT rule for {} -> {} already exists, skipping",
+                source,
+                dest
+            );
+            continue;
+        }
+
+        // Check if DROP rule already exists (from a previous fallback)
+        let drop_exists = std::process::Command::new("iptables")
+            .args(["-C", "DOCKER-USER", "-s", source, "-d", dest, "-j", "DROP"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if drop_exists {
+            tracing::info!(
+                "Firewall: DROP rule for {} -> {} already exists, skipping",
                 source,
                 dest
             );
