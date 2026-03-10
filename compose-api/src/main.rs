@@ -2869,6 +2869,100 @@ impl AppConfig {
     }
 }
 
+/// Management services that should be monitored and auto-restarted if not running.
+/// These are the same services defined in docker-compose.dstack.yml with `restart: unless-stopped`.
+/// If a service exits and Docker's restart policy fails to bring it back, the monitor will
+/// attempt `docker start` to recover it.
+const MONITORED_SERVICES: &[&str] = &[
+    "nginx",
+    "ssh-bastion",
+    "openclaw-updater",
+    "datadog-agent",
+];
+
+/// Check management services and restart any that are not running.
+/// Uses `docker ps -a` with service label filter to find containers in any state,
+/// then `docker start` for non-running ones (preserving the original container).
+fn check_and_restart_services() {
+    for &service in MONITORED_SERVICES {
+        // Find container by compose service label (including stopped containers with -a)
+        let find = match std::process::Command::new("docker")
+            .args([
+                "ps",
+                "-a",
+                "--format",
+                "{{.ID}} {{.State}}",
+                "--filter",
+                &format!("label=com.docker.compose.service={}", service),
+            ])
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!("service_monitor: failed to run docker ps for {}: {}", service, e);
+                continue;
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&find.stdout);
+        let line = stdout.trim();
+
+        if line.is_empty() {
+            // No container exists at all — nothing to start
+            continue;
+        }
+
+        // Take only the first container if multiple exist
+        let first_line = line.lines().next().unwrap_or("");
+        let mut parts = first_line.split_whitespace();
+        let container_id = match parts.next() {
+            Some(id) => id,
+            None => continue,
+        };
+        let container_state = parts.next().unwrap_or("");
+
+        if container_state == "running" {
+            continue;
+        }
+
+        tracing::warn!(
+            "service_monitor: service '{}' is {} (container={}), attempting docker start",
+            service,
+            container_state,
+            container_id
+        );
+
+        match std::process::Command::new("docker")
+            .args(["start", container_id])
+            .output()
+        {
+            Ok(result) if result.status.success() => {
+                tracing::info!(
+                    "service_monitor: successfully started '{}' (container={})",
+                    service,
+                    container_id
+                );
+            }
+            Ok(result) => {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                tracing::error!(
+                    "service_monitor: docker start failed for '{}' (container={}): {}",
+                    service,
+                    container_id,
+                    stderr.trim()
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "service_monitor: failed to run docker start for '{}': {}",
+                    service,
+                    e
+                );
+            }
+        }
+    }
+}
+
 async fn background_sync_loop(state: AppState) {
     let domain = match &state.config.openclaw_domain {
         Some(d) => d.clone(),
@@ -2878,6 +2972,10 @@ async fn background_sync_loop(state: AppState) {
     // Scheduled backups every 6 hours (6 * 60 * 60 / 5 = 4320 ticks at 5s interval)
     let mut backup_tick: u32 = 0;
     const BACKUP_INTERVAL: u32 = 4320;
+
+    // Service monitor every 30s (30 / 5 = 6 ticks at 5s interval)
+    let mut service_monitor_tick: u32 = 0;
+    const SERVICE_MONITOR_INTERVAL: u32 = 6;
 
     tracing::info!("Background sync loop started (domain: {})", domain);
 
@@ -2917,6 +3015,17 @@ async fn background_sync_loop(state: AppState) {
             nginx_conf::write_backends_map(&instances, &domain, &state.config.nginx_map_path);
         if changed {
             nginx_conf::reload_nginx(&state.config.ingress_container_name);
+        }
+
+        // Monitor management services and auto-restart if not running.
+        service_monitor_tick += 1;
+        if service_monitor_tick >= SERVICE_MONITOR_INTERVAL {
+            service_monitor_tick = 0;
+            if let Err(e) = tokio::task::spawn_blocking(check_and_restart_services)
+                .await
+            {
+                tracing::warn!("service_monitor: task panicked: {}", e);
+            }
         }
 
         backup_tick += 1;
