@@ -194,7 +194,6 @@ impl AppState {
         .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-
     async fn compose_down(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
@@ -408,7 +407,9 @@ impl FromRequestParts<AppState> for InstanceAuth {
         }
 
         match matched_name {
-            Some(name) => Ok(InstanceAuth { instance_name: name }),
+            Some(name) => Ok(InstanceAuth {
+                instance_name: name,
+            }),
             None => Err(ApiError::Unauthorized("Invalid instance token".into())),
         }
     }
@@ -530,7 +531,9 @@ async fn oauth_exchange(
         .form(&params)
         .send()
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to contact Google token endpoint: {}", e)))?;
+        .map_err(|e| {
+            ApiError::Internal(format!("Failed to contact Google token endpoint: {}", e))
+        })?;
 
     let status = response.status();
     let body: serde_json::Value = response
@@ -542,8 +545,12 @@ async fn oauth_exchange(
         tracing::warn!(
             "Google token exchange failed ({}): error={} description={}",
             status,
-            body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"),
-            body.get("error_description").and_then(|v| v.as_str()).unwrap_or("")
+            body.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            body.get("error_description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
         );
         return Err(ApiError::BadGateway(format!(
             "Google token exchange failed: {}",
@@ -615,7 +622,9 @@ async fn oauth_refresh(
         .form(&params)
         .send()
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to contact Google token endpoint: {}", e)))?;
+        .map_err(|e| {
+            ApiError::Internal(format!("Failed to contact Google token endpoint: {}", e))
+        })?;
 
     let status = response.status();
     let body: serde_json::Value = response
@@ -627,8 +636,12 @@ async fn oauth_refresh(
         tracing::warn!(
             "Google token refresh failed ({}): error={} description={}",
             status,
-            body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"),
-            body.get("error_description").and_then(|v| v.as_str()).unwrap_or("")
+            body.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            body.get("error_description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
         );
         return Err(ApiError::BadGateway(format!(
             "Google token refresh failed: {}",
@@ -687,7 +700,16 @@ fn setup_container_firewall() {
     for dest in &dest_cidrs {
         // Check if REJECT rule already exists (idempotent)
         let reject_exists = std::process::Command::new(iptables)
-            .args(["-C", "DOCKER-USER", "-s", source, "-d", dest, "-j", "REJECT"])
+            .args([
+                "-C",
+                "DOCKER-USER",
+                "-s",
+                source,
+                "-d",
+                dest,
+                "-j",
+                "REJECT",
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -938,7 +960,11 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listen_port = match listen_addr.parse::<std::net::SocketAddr>() {
         Ok(addr) => addr.port().to_string(),
-        Err(_) => listen_addr.split(':').next_back().unwrap_or("8080").to_string(),
+        Err(_) => listen_addr
+            .split(':')
+            .next_back()
+            .unwrap_or("8080")
+            .to_string(),
     };
     let oauth_exchange_url: Option<String> =
         if config.google_oauth_client_id.is_some() && config.google_oauth_client_secret.is_some() {
@@ -1956,89 +1982,128 @@ async fn restart_instance(
                 let stype = match inst.service_type.as_deref() {
                     Some(st) => st,
                     None => {
-                        let _ = tx.send(sse_error(&format!(
-                            "Instance '{}' has no service_type set; refusing to upgrade \
+                        let _ = tx
+                            .send(sse_error(&format!(
+                                "Instance '{}' has no service_type set; refusing to upgrade \
                              (would use wrong compose file and lose data)",
-                            name
-                        ))).await;
+                                name
+                            )))
+                            .await;
                         state.upgrading.lock().await.remove(&name);
                         return;
                     }
                 };
 
-                let _ = tx.send(sse_stage("exporting", "Exporting workspace and config...")).await;
+                let _ = tx
+                    .send(sse_stage("exporting", "Exporting workspace and config..."))
+                    .await;
 
                 let tar_bytes = match state.compose_export_instance_data(&name, Some(stype)).await {
                     Ok(bytes) => {
                         if bytes.len() > MAX_EXPORT_BYTES {
-                            let _ = tx.send(sse_error(&format!(
-                                "Workspace export too large ({} MB, limit {} MB). \
+                            let _ = tx
+                                .send(sse_error(&format!(
+                                    "Workspace export too large ({} MB, limit {} MB). \
                                  Clean up large files before upgrading.",
-                                bytes.len() / (1024 * 1024),
-                                MAX_EXPORT_BYTES / (1024 * 1024),
-                            ))).await;
+                                    bytes.len() / (1024 * 1024),
+                                    MAX_EXPORT_BYTES / (1024 * 1024),
+                                )))
+                                .await;
                             state.upgrading.lock().await.remove(&name);
                             return;
                         }
                         bytes
                     }
                     Err(e) => {
-                        let _ = tx.send(sse_error(&format!("Failed to export workspace: {}", e))).await;
+                        let _ = tx
+                            .send(sse_error(&format!("Failed to export workspace: {}", e)))
+                            .await;
                         state.upgrading.lock().await.remove(&name);
                         return;
                     }
                 };
 
-                let _ = tx.send(sse_stage("stopping", "Stopping and removing old container...")).await;
+                let _ = tx
+                    .send(sse_stage(
+                        "stopping",
+                        "Stopping and removing old container...",
+                    ))
+                    .await;
 
                 if let Err(e) = state.compose_down(&name, Some(stype)).await {
-                    let _ = tx.send(sse_error(&format!("Failed to stop old container: {}", e))).await;
+                    let _ = tx
+                        .send(sse_error(&format!("Failed to stop old container: {}", e)))
+                        .await;
                     state.upgrading.lock().await.remove(&name);
                     return;
                 }
 
-                let _ = tx.send(sse_stage("container_starting", &format!("Starting new container with image {}...", image))).await;
+                let _ = tx
+                    .send(sse_stage(
+                        "container_starting",
+                        &format!("Starting new container with image {}...", image),
+                    ))
+                    .await;
 
                 let old_image = inst.image.as_deref().unwrap_or(image);
-                if let Err(e) = state.compose_up(
-                    &name,
-                    &inst.nearai_api_key,
-                    &inst.token,
-                    inst.gateway_port,
-                    inst.ssh_port,
-                    &inst.ssh_pubkey,
-                    image,
-                    inst.nearai_api_url.as_deref().unwrap_or(DEFAULT_NEARAI_API_URL),
-                    stype,
-                    inst.mem_limit.clone(),
-                    inst.cpus.clone(),
-                    inst.storage_size.clone(),
-                ).await {
-                    // Attempt rollback with the original image
-                    let _ = tx.send(sse_stage("rolling_back", &format!(
-                        "Failed to start with new image ({}), rolling back to {}...", e, old_image
-                    ))).await;
-                    if let Err(rb_err) = state.compose_up(
+                if let Err(e) = state
+                    .compose_up(
                         &name,
                         &inst.nearai_api_key,
                         &inst.token,
                         inst.gateway_port,
                         inst.ssh_port,
                         &inst.ssh_pubkey,
-                        old_image,
-                        inst.nearai_api_url.as_deref().unwrap_or(DEFAULT_NEARAI_API_URL),
+                        image,
+                        inst.nearai_api_url
+                            .as_deref()
+                            .unwrap_or(DEFAULT_NEARAI_API_URL),
                         stype,
                         inst.mem_limit.clone(),
                         inst.cpus.clone(),
                         inst.storage_size.clone(),
-                    ).await {
+                    )
+                    .await
+                {
+                    // Attempt rollback with the original image
+                    let _ = tx
+                        .send(sse_stage(
+                            "rolling_back",
+                            &format!(
+                                "Failed to start with new image ({}), rolling back to {}...",
+                                e, old_image
+                            ),
+                        ))
+                        .await;
+                    if let Err(rb_err) = state
+                        .compose_up(
+                            &name,
+                            &inst.nearai_api_key,
+                            &inst.token,
+                            inst.gateway_port,
+                            inst.ssh_port,
+                            &inst.ssh_pubkey,
+                            old_image,
+                            inst.nearai_api_url
+                                .as_deref()
+                                .unwrap_or(DEFAULT_NEARAI_API_URL),
+                            stype,
+                            inst.mem_limit.clone(),
+                            inst.cpus.clone(),
+                            inst.storage_size.clone(),
+                        )
+                        .await
+                    {
                         let mut store = state.store.write().await;
                         let _ = store.set_active(&name, false);
                         drop(store);
                         update_nginx_now(&state).await;
-                        let _ = tx.send(sse_error(&format!(
-                            "Rollback also failed ({}). Instance needs manual recreation.", rb_err
-                        ))).await;
+                        let _ = tx
+                            .send(sse_error(&format!(
+                                "Rollback also failed ({}). Instance needs manual recreation.",
+                                rb_err
+                            )))
+                            .await;
                         state.upgrading.lock().await.remove(&name);
                         return;
                     }
@@ -2046,9 +2111,12 @@ async fn restart_instance(
                     if !tar_bytes.is_empty() {
                         let _ = state.compose_import_instance_data(&name, tar_bytes).await;
                     }
-                    let _ = tx.send(sse_error(&format!(
-                        "Upgrade failed, rolled back to previous image: {}", e
-                    ))).await;
+                    let _ = tx
+                        .send(sse_error(&format!(
+                            "Upgrade failed, rolled back to previous image: {}",
+                            e
+                        )))
+                        .await;
                     state.upgrading.lock().await.remove(&name);
                     // Still run health polling for the rolled-back container
                     poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx).await;
@@ -2063,11 +2131,18 @@ async fn restart_instance(
                     let _ = store.set_image(&name, Some(image.clone()), image_digest.clone());
                 }
                 if let Some(ref digest) = image_digest {
-                    let _ = tx.send(sse_stage("image_resolved", &format!("Image digest: {}", digest))).await;
+                    let _ = tx
+                        .send(sse_stage(
+                            "image_resolved",
+                            &format!("Image digest: {}", digest),
+                        ))
+                        .await;
                 }
 
                 if !tar_bytes.is_empty() {
-                    let _ = tx.send(sse_stage("restoring", "Restoring workspace and config...")).await;
+                    let _ = tx
+                        .send(sse_stage("restoring", "Restoring workspace and config..."))
+                        .await;
 
                     if let Err(e) = state.compose_import_instance_data(&name, tar_bytes).await {
                         let _ = tx.send(sse_error(&format!(
@@ -2079,10 +2154,17 @@ async fn restart_instance(
                 state.upgrading.lock().await.remove(&name);
             } else {
                 // Simple restart
-                let _ = tx.send(sse_stage("container_starting", "Restarting container...")).await;
+                let _ = tx
+                    .send(sse_stage("container_starting", "Restarting container..."))
+                    .await;
 
-                if let Err(e) = state.compose_restart(&name, inst.service_type.as_deref()).await {
-                    let _ = tx.send(sse_error(&format!("Failed to restart container: {}", e))).await;
+                if let Err(e) = state
+                    .compose_restart(&name, inst.service_type.as_deref())
+                    .await
+                {
+                    let _ = tx
+                        .send(sse_error(&format!("Failed to restart container: {}", e)))
+                        .await;
                     return;
                 }
 
@@ -2627,12 +2709,7 @@ async fn delete_config_key(
 
 /// Management service names (Docker Compose service labels) used by both the
 /// admin restart endpoint and the background service monitor.
-const MANAGEMENT_SERVICES: &[&str] = &[
-    "openclaw-updater",
-    "nginx",
-    "ssh-bastion",
-    "datadog-agent",
-];
+const MANAGEMENT_SERVICES: &[&str] = &["openclaw-updater", "nginx", "ssh-bastion", "datadog-agent"];
 
 #[derive(Serialize, utoipa::ToSchema)]
 struct RestartServiceResponse {
@@ -2889,7 +2966,11 @@ fn check_and_restart_services() {
         {
             Ok(out) => out,
             Err(e) => {
-                tracing::warn!("service_monitor: failed to run docker ps for {}: {}", service, e);
+                tracing::warn!(
+                    "service_monitor: failed to run docker ps for {}: {}",
+                    service,
+                    e
+                );
                 continue;
             }
         };
@@ -3011,7 +3092,11 @@ async fn background_sync_loop(state: AppState) {
                         is_running,
                     );
                     if let Err(e) = store.set_active(&inst.name, is_running) {
-                        tracing::warn!("background_sync: Failed to set active state for instance {}: {}", inst.name, e);
+                        tracing::warn!(
+                            "background_sync: Failed to set active state for instance {}: {}",
+                            inst.name,
+                            e
+                        );
                     }
                 }
             }
@@ -3032,9 +3117,7 @@ async fn background_sync_loop(state: AppState) {
         service_monitor_tick += 1;
         if service_monitor_tick >= SERVICE_MONITOR_INTERVAL {
             service_monitor_tick = 0;
-            if let Err(e) = tokio::task::spawn_blocking(check_and_restart_services)
-                .await
-            {
+            if let Err(e) = tokio::task::spawn_blocking(check_and_restart_services).await {
                 tracing::warn!("service_monitor: task panicked: {}", e);
             }
         }

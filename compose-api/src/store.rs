@@ -18,7 +18,10 @@ fn parse_port_env(var_name: &str, default: u16) -> u16 {
             Err(e) => {
                 tracing::warn!(
                     "failed to parse {}='{}' as u16 ({}); falling back to default port {}",
-                    var_name, raw, e, default
+                    var_name,
+                    raw,
+                    e,
+                    default
                 );
                 default
             }
@@ -27,7 +30,9 @@ fn parse_port_env(var_name: &str, default: u16) -> u16 {
         Err(e) => {
             tracing::warn!(
                 "failed to read {} from environment ({}); falling back to default port {}",
-                var_name, e, default
+                var_name,
+                e,
+                default
             );
             default
         }
@@ -50,7 +55,8 @@ impl PortRange {
         assert!(
             end > start,
             "Invalid port range: PORT_RANGE_END ({}) must be greater than PORT_RANGE_START ({})",
-            end, start
+            end,
+            start
         );
 
         let available_ports = (end as u32) - (start as u32) + 1;
@@ -256,7 +262,7 @@ mod tests {
     fn test_next_available_ports_exhausted() {
         let mut store = InstanceStore::new(range(50001, 50004));
         let mut port: u16 = 50001;
-        while port + 1 <= 50004 {
+        while port < 50004 {
             store.add(test_instance(&format!("inst-{}", port), port, port + 1));
             port += PORTS_PER_INSTANCE;
         }
