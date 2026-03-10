@@ -3055,6 +3055,55 @@ fn check_and_restart_services() {
     }
 }
 
+/// Check disk space on key mount points and log warnings/errors.
+fn check_disk_space() {
+    const MOUNTS_TO_CHECK: &[&str] = &["/", "/var/lib/docker"];
+    const CRITICAL_THRESHOLD_PCT: u32 = 95;
+    const WARNING_THRESHOLD_PCT: u32 = 85;
+
+    for mount in MOUNTS_TO_CHECK {
+        let output = match std::process::Command::new("df")
+            .args(["-P", mount])
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::debug!("disk_monitor: failed to run df for {}: {}", mount, e);
+                continue;
+            }
+        };
+        if !output.status.success() {
+            // /var/lib/docker may not be a separate mount — silently skip
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // df -P output: header line, then one data line per filesystem
+        // Fields: Filesystem, 1024-blocks, Used, Available, Capacity, Mounted-on
+        // Capacity field looks like "42%"
+        if let Some(line) = stdout.lines().nth(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 5 {
+                let pct_str = fields[4].trim_end_matches('%');
+                if let Ok(pct) = pct_str.parse::<u32>() {
+                    if pct > CRITICAL_THRESHOLD_PCT {
+                        tracing::error!(
+                            "disk_monitor: {} is {}% full — critically low disk space",
+                            mount,
+                            pct
+                        );
+                    } else if pct > WARNING_THRESHOLD_PCT {
+                        tracing::warn!(
+                            "disk_monitor: {} is {}% full — disk space running low",
+                            mount,
+                            pct
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn background_sync_loop(state: AppState) {
     let domain = match &state.config.openclaw_domain {
         Some(d) => d.clone(),
@@ -3068,6 +3117,10 @@ async fn background_sync_loop(state: AppState) {
     // Service monitor every 30s (30 / 5 = 6 ticks at 5s interval)
     let mut service_monitor_tick: u32 = 0;
     const SERVICE_MONITOR_INTERVAL: u32 = 6;
+
+    // Disk space monitoring every 5 minutes (5 * 60 / 5 = 60 ticks at 5s interval)
+    let mut disk_monitor_tick: u32 = 0;
+    const DISK_MONITOR_INTERVAL: u32 = 60;
 
     tracing::info!("Background sync loop started (domain: {})", domain);
 
@@ -3119,6 +3172,15 @@ async fn background_sync_loop(state: AppState) {
             service_monitor_tick = 0;
             if let Err(e) = tokio::task::spawn_blocking(check_and_restart_services).await {
                 tracing::warn!("service_monitor: task panicked: {}", e);
+            }
+        }
+
+        // Monitor disk space.
+        disk_monitor_tick += 1;
+        if disk_monitor_tick >= DISK_MONITOR_INTERVAL {
+            disk_monitor_tick = 0;
+            if let Err(e) = tokio::task::spawn_blocking(check_disk_space).await {
+                tracing::warn!("disk_monitor: task panicked: {}", e);
             }
         }
 
