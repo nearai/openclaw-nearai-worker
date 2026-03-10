@@ -430,6 +430,8 @@ impl ComposeManager {
     /// Export both the config volume and workspace volume from an instance's
     /// gateway container as a single tar archive.
     /// Uses `docker exec tar` to capture both directories relative to `/home/agent/`.
+    /// `service_type` must match the instance (ironclaw vs openclaw); if it is wrong,
+    /// the wrong dirs are archived and restore will create the wrong paths in the new container.
     pub fn export_instance_data(
         &self,
         name: &str,
@@ -438,7 +440,19 @@ impl ComposeManager {
         let container = format!("openclaw-{}-gateway-1", name);
         let (config_dir, workspace_dir) = match service_type {
             Some("ironclaw") => (".ironclaw", "workspace"),
-            _ => (".openclaw", "openclaw"),
+            Some("openclaw") => (".openclaw", "openclaw"),
+            None => {
+                return Err(ApiError::Internal(format!(
+                    "Cannot export instance '{}': service_type is unknown (set SERVICE_TYPE in .env or recreate with correct type)",
+                    name
+                )));
+            }
+            Some(other) => {
+                return Err(ApiError::Internal(format!(
+                    "Unknown service_type for export: '{}' (instance '{}')",
+                    other, name
+                )));
+            }
         };
         let output = Command::new("docker")
             .args([
@@ -460,8 +474,8 @@ impl ComposeManager {
             // Fresh instances may not have workspace/config dirs yet — treat as empty export.
             // Both GNU tar and BusyBox tar emit "Cannot stat" / "No such file or directory"
             // when a source path doesn't exist.
-            let is_missing_dir = stderr.contains("Cannot stat")
-                || stderr.contains("No such file or directory");
+            let is_missing_dir =
+                stderr.contains("Cannot stat") || stderr.contains("No such file or directory");
             let is_docker_error = stderr.contains("No such container")
                 || stderr.contains("is not running")
                 || stderr.contains("Error response from daemon");
@@ -640,7 +654,8 @@ impl ComposeManager {
             .cloned()
             .filter(|s| !s.is_empty());
         let image_env = env_map.get("OPENCLAW_IMAGE").cloned();
-        // Resolve service_type: label (most reliable) → container env → persisted .env file
+        // Resolve service_type: label → container env → persisted .env file → infer from image.
+        // Infer from image name so e.g. ironclaw-nearai-worker → ironclaw.
         let service_type = v
             .pointer("/Config/Labels/openclaw.service_type")
             .and_then(|s| s.as_str())
@@ -652,7 +667,26 @@ impl ComposeManager {
                     .cloned()
                     .filter(|s| !s.is_empty())
             })
-            .or_else(|| self.read_service_type_from_env_file(name));
+            .or_else(|| self.read_service_type_from_env_file(name))
+            .or_else(|| {
+                let img = v
+                    .pointer("/Config/Image")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("");
+                if img.to_lowercase().contains("ironclaw") {
+                    tracing::info!(
+                        "Instance '{}': no SERVICE_TYPE in label/env/.env, inferring 'ironclaw' from image '{}'",
+                        name, img
+                    );
+                    Some("ironclaw".to_string())
+                } else {
+                    tracing::info!(
+                        "Instance '{}': no SERVICE_TYPE in label/env/.env, inferring 'openclaw' from image '{}'",
+                        name, img
+                    );
+                    Some("openclaw".to_string())
+                }
+            });
 
         if service_type.is_none() {
             tracing::warn!(
@@ -758,12 +792,15 @@ impl ComposeManager {
         if let Some(ref image) = inst.image {
             vars.insert("OPENCLAW_IMAGE".into(), image.clone());
         }
-        vars.insert(
-            "SERVICE_TYPE".into(),
-            inst.service_type
-                .clone()
-                .unwrap_or_else(|| "openclaw".to_string()),
-        );
+        // Prefer in-memory service_type, then existing .env value; only then default to openclaw.
+        // Avoids overwriting a correct SERVICE_TYPE=ironclaw in .env when instance was discovered
+        // without label/env and .env hadn't been read yet.
+        let service_type = inst
+            .service_type
+            .clone()
+            .or_else(|| self.read_service_type_from_env_file(&inst.name))
+            .unwrap_or_else(|| "openclaw".to_string());
+        vars.insert("SERVICE_TYPE".into(), service_type);
         insert_oauth_env_vars(
             &mut vars,
             &inst.name,
