@@ -2625,8 +2625,9 @@ async fn delete_config_key(
 
 // ── Admin: management service restart ────────────────────────────────
 
-/// Docker Compose service names that may be restarted via the admin API.
-const RESTARTABLE_SERVICES: &[&str] = &[
+/// Management service names (Docker Compose service labels) used by both the
+/// admin restart endpoint and the background service monitor.
+const MANAGEMENT_SERVICES: &[&str] = &[
     "openclaw-updater",
     "nginx",
     "ssh-bastion",
@@ -2658,11 +2659,11 @@ async fn restart_management_service(
     _auth: AdminAuth,
     Path(service): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if !RESTARTABLE_SERVICES.contains(&service.as_str()) {
+    if !MANAGEMENT_SERVICES.contains(&service.as_str()) {
         return Err(ApiError::BadRequest(format!(
             "Service '{}' not in allowlist. Allowed: {}",
             service,
-            RESTARTABLE_SERVICES.join(", ")
+            MANAGEMENT_SERVICES.join(", ")
         )));
     }
 
@@ -2869,22 +2870,11 @@ impl AppConfig {
     }
 }
 
-/// Management services that should be monitored and auto-restarted if not running.
-/// These are the same services defined in docker-compose.dstack.yml with `restart: unless-stopped`.
-/// If a service exits and Docker's restart policy fails to bring it back, the monitor will
-/// attempt `docker start` to recover it.
-const MONITORED_SERVICES: &[&str] = &[
-    "nginx",
-    "ssh-bastion",
-    "openclaw-updater",
-    "datadog-agent",
-];
-
-/// Check management services and restart any that are not running.
+/// Check management services and start any that are not running.
 /// Uses `docker ps -a` with service label filter to find containers in any state,
 /// then `docker start` for non-running ones (preserving the original container).
 fn check_and_restart_services() {
-    for &service in MONITORED_SERVICES {
+    for &service in MANAGEMENT_SERVICES {
         // Find container by compose service label (including stopped containers with -a)
         let find = match std::process::Command::new("docker")
             .args([
@@ -2904,16 +2894,37 @@ fn check_and_restart_services() {
             }
         };
 
-        let stdout = String::from_utf8_lossy(&find.stdout);
-        let line = stdout.trim();
-
-        if line.is_empty() {
-            // No container exists at all — nothing to start
+        if !find.status.success() {
+            let stderr = String::from_utf8_lossy(&find.stderr);
+            tracing::warn!(
+                "service_monitor: docker ps failed for '{}': {}",
+                service,
+                stderr.trim()
+            );
             continue;
         }
 
-        // Take only the first container if multiple exist
-        let first_line = line.lines().next().unwrap_or("");
+        let stdout = String::from_utf8_lossy(&find.stdout);
+        let trimmed = stdout.trim();
+
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut lines = trimmed.lines();
+        let first_line = match lines.next() {
+            Some(l) => l,
+            None => continue,
+        };
+
+        if lines.next().is_some() {
+            tracing::error!(
+                "service_monitor: multiple containers found for service '{}', skipping",
+                service
+            );
+            continue;
+        }
+
         let mut parts = first_line.split_whitespace();
         let container_id = match parts.next() {
             Some(id) => id,
