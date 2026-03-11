@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -252,6 +252,15 @@ impl AppState {
     ) -> Result<std::collections::HashMap<String, String>, ApiError> {
         let compose = self.compose.clone();
         tokio::task::spawn_blocking(move || compose.all_statuses())
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_all_health_statuses(
+        &self,
+    ) -> Result<std::collections::HashMap<String, compose::ContainerHealth>, ApiError> {
+        let compose = self.compose.clone();
+        tokio::task::spawn_blocking(move || compose.all_health_statuses())
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
@@ -1456,6 +1465,7 @@ async fn poll_health_to_ready(
     name: &str,
     service_type: Option<&str>,
     tx: &tokio::sync::mpsc::Sender<Event>,
+    health_ok: Option<Arc<AtomicBool>>,
 ) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
     let mut last_stage = String::new();
@@ -1544,6 +1554,9 @@ async fn poll_health_to_ready(
             let _ = tx.send(sse_stage(stage, msg)).await;
 
             if stage == "healthy" {
+                if let Some(ref flag) = health_ok {
+                    flag.store(true, Ordering::Release);
+                }
                 let _ = tx
                     .send(sse_stage("ready", &format!("Instance '{}' is ready", name)))
                     .await;
@@ -1735,9 +1748,6 @@ async fn create_instance(
             return;
         }
 
-        yield Ok(sse_stage("configuring_routing", "Updating nginx routing table..."));
-        update_nginx_now(&state).await;
-
         // Resolve the image digest now that the container is running
         let image_digest = state.compose_resolve_image_digest(&name).await;
         if let Some(ref digest) = image_digest {
@@ -1752,15 +1762,24 @@ async fn create_instance(
 
         // Poll health until ready (with auto-retry on failure)
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let health_ok = Arc::new(AtomicBool::new(false));
         let poll_state = state.clone();
         let poll_name = name.clone();
         let poll_service_type = service_type.clone();
+        let poll_health_ok = health_ok.clone();
         tokio::spawn(async move {
-            poll_health_to_ready(&poll_state, &poll_name, Some(&poll_service_type), &tx).await;
+            poll_health_to_ready(&poll_state, &poll_name, Some(&poll_service_type), &tx, Some(poll_health_ok)).await;
         });
 
         while let Some(event) = rx.recv().await {
             yield Ok(event);
+        }
+
+        // Only add to nginx routing after health check passes — avoids 502s
+        // during the startup window before the gateway is ready.
+        if health_ok.load(Ordering::Acquire) {
+            yield Ok(sse_stage("configuring_routing", "Updating nginx routing table..."));
+            update_nginx_now(&state).await;
         }
     };
 
@@ -2119,7 +2138,7 @@ async fn restart_instance(
                         .await;
                     state.upgrading.lock().await.remove(&name);
                     // Still run health polling for the rolled-back container
-                    poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx).await;
+                    poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx, None).await;
                     return;
                 }
 
@@ -2180,7 +2199,7 @@ async fn restart_instance(
             }
 
             // Health polling always runs, even after a partial restore failure
-            poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx).await;
+            poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx, None).await;
         });
     }
 
@@ -2265,28 +2284,32 @@ async fn start_instance(
             return;
         }
 
-        yield Ok(sse_stage("configuring_routing", "Restoring routing..."));
-
-        {
-            let mut store = state.store.write().await;
-            if let Err(e) = store.set_active(&name, true) {
-                tracing::warn!("Failed to mark instance active: {}", e);
-            }
-        }
-
-        update_nginx_now(&state).await;
         tracing::info!("Started instance: {}", name);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let health_ok = Arc::new(AtomicBool::new(false));
         let poll_state = state.clone();
         let poll_name = name.clone();
         let poll_service_type = inst.service_type.clone();
+        let poll_health_ok = health_ok.clone();
         tokio::spawn(async move {
-            poll_health_to_ready(&poll_state, &poll_name, poll_service_type.as_deref(), &tx).await;
+            poll_health_to_ready(&poll_state, &poll_name, poll_service_type.as_deref(), &tx, Some(poll_health_ok)).await;
         });
 
         while let Some(event) = rx.recv().await {
             yield Ok(event);
+        }
+
+        // Only restore routing after health check passes
+        if health_ok.load(Ordering::Acquire) {
+            {
+                let mut store = state.store.write().await;
+                if let Err(e) = store.set_active(&name, true) {
+                    tracing::warn!("Failed to mark instance active: {}", e);
+                }
+            }
+            yield Ok(sse_stage("configuring_routing", "Restoring routing..."));
+            update_nginx_now(&state).await;
         }
     };
 
@@ -3077,21 +3100,28 @@ async fn background_sync_loop(state: AppState) {
         // Reconcile in-memory `active` flags with actual Docker container state.
         // This catches containers that recovered (e.g. after CVM reboot) or died
         // without the API being notified — ensuring nginx routes stay in sync.
-        if let Ok(docker_statuses) = state.compose_all_statuses().await {
+        // Only mark an instance active if the container is running AND healthy —
+        // a "running" container with a crashed gateway process would cause 502s.
+        if let Ok(docker_statuses) = state.compose_all_health_statuses().await {
             let mut store = state.store.write().await;
             for inst in store.list() {
-                let is_running = docker_statuses
+                let should_be_active = docker_statuses
                     .get(&inst.name)
-                    .map(|s| s == "running")
+                    .map(|h| h.state == "running" && h.health == "healthy")
                     .unwrap_or(false);
-                if inst.active != is_running {
+                if inst.active != should_be_active {
+                    let health_info = docker_statuses
+                        .get(&inst.name)
+                        .map(|h| format!("state={}, health={}", h.state, h.health))
+                        .unwrap_or_else(|| "not found".to_string());
                     tracing::info!(
-                        "background_sync: reconciling instance {} active {} -> {}",
+                        "background_sync: reconciling instance {} active {} -> {} ({})",
                         inst.name,
                         inst.active,
-                        is_running,
+                        should_be_active,
+                        health_info,
                     );
-                    if let Err(e) = store.set_active(&inst.name, is_running) {
+                    if let Err(e) = store.set_active(&inst.name, should_be_active) {
                         tracing::warn!(
                             "background_sync: Failed to set active state for instance {}: {}",
                             inst.name,

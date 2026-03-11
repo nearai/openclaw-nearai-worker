@@ -190,9 +190,17 @@ configs:
               proxy_set_header X-Real-IP $$remote_addr;
               proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
               proxy_set_header X-Forwarded-Proto $$scheme;
+              proxy_connect_timeout 5s;
               proxy_read_timeout 86400s;
               proxy_buffering off;
               proxy_cache off;
+
+              error_page 502 = @instance_starting;
+          }
+
+          location @instance_starting {
+              default_type application/json;
+              return 502 '{"error":"instance_starting","message":"This instance is starting up, please retry in a few seconds"}';
           }
       }
 

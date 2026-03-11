@@ -394,6 +394,67 @@ impl ComposeManager {
         })
     }
 
+    /// Like `all_statuses()` but returns `(state, health)` per instance,
+    /// so callers can distinguish "running but unhealthy" from "running and healthy".
+    pub fn all_health_statuses(&self) -> Result<HashMap<String, ContainerHealth>, ApiError> {
+        let output = Command::new("docker")
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                "label=openclaw.managed=true",
+                "--format",
+                "{{.Names}}\t{{.State}}\t{{.Status}}",
+            ])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("failed to run docker ps: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!("docker ps failed: {stderr}")));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let map = stdout
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                let mut parts = line.splitn(3, '\t');
+                let container_name = parts.next()?;
+                let state = parts.next()?;
+                let status_text = parts.next().unwrap_or("");
+                let name = container_name
+                    .strip_prefix("openclaw-")
+                    .and_then(|s| s.strip_suffix("-gateway-1"))?;
+                if !crate::is_valid_instance_name(name) {
+                    return None;
+                }
+                // Docker's --format {{.Status}} contains health info in parens, e.g.
+                // "Up 2 hours (healthy)" or "Up 5 minutes (health: starting)"
+                let health = if status_text.contains("(healthy)") {
+                    "healthy"
+                } else if status_text.contains("(unhealthy)") {
+                    "unhealthy"
+                } else if status_text.contains("(health: starting)") {
+                    "starting"
+                } else {
+                    "none"
+                };
+                Some((
+                    name.to_string(),
+                    ContainerHealth {
+                        state: state.to_string(),
+                        health: health.to_string(),
+                    },
+                ))
+            })
+            .collect();
+        Ok(map)
+    }
+
     /// Resolve the registry digest for an instance's gateway container image.
     /// Returns e.g. `docker.io/openclaw/worker@sha256:abcdef...` or `None` for local-only images.
     pub fn resolve_image_digest(&self, name: &str) -> Option<String> {
