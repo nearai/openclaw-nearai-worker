@@ -397,6 +397,8 @@ impl ComposeManager {
     /// Like `all_statuses()` but returns `(state, health)` per instance,
     /// so callers can distinguish "running but unhealthy" from "running and healthy".
     pub fn all_health_statuses(&self) -> Result<HashMap<String, ContainerHealth>, ApiError> {
+        // Use {{.Health}} which directly returns "starting", "healthy", "unhealthy",
+        // or "" — avoids brittle parsing of human-readable {{.Status}} text.
         let output = Command::new("docker")
             .args([
                 "ps",
@@ -404,7 +406,7 @@ impl ComposeManager {
                 "--filter",
                 "label=openclaw.managed=true",
                 "--format",
-                "{{.Names}}\t{{.State}}\t{{.Status}}",
+                "{{.Names}}\t{{.State}}\t{{.Health}}",
             ])
             .output()
             .map_err(|e| ApiError::Internal(format!("failed to run docker ps: {e}")))?;
@@ -425,23 +427,17 @@ impl ComposeManager {
                 let mut parts = line.splitn(3, '\t');
                 let container_name = parts.next()?;
                 let state = parts.next()?;
-                let status_text = parts.next().unwrap_or("");
+                let health_text = parts.next().unwrap_or("");
                 let name = container_name
                     .strip_prefix("openclaw-")
                     .and_then(|s| s.strip_suffix("-gateway-1"))?;
                 if !crate::is_valid_instance_name(name) {
                     return None;
                 }
-                // Docker's --format {{.Status}} contains health info in parens, e.g.
-                // "Up 2 hours (healthy)" or "Up 5 minutes (health: starting)"
-                let health = if status_text.contains("(healthy)") {
-                    "healthy"
-                } else if status_text.contains("(unhealthy)") {
-                    "unhealthy"
-                } else if status_text.contains("(health: starting)") {
-                    "starting"
-                } else {
+                let health = if health_text.is_empty() {
                     "none"
+                } else {
+                    health_text
                 };
                 Some((
                     name.to_string(),
