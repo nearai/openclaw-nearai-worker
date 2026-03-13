@@ -2749,14 +2749,14 @@ struct RestartServiceResponse {
 }
 
 #[utoipa::path(post, path = "/admin/restart-service/{service}", tag = "Admin",
-    params(("service" = String, Path, description = "Management service name to restart (openclaw-updater, nginx, ssh-bastion, datadog-agent)")),
+    params(("service" = String, Path, description = "Management service name to restart or start (openclaw-updater, nginx, ssh-bastion, datadog-agent). Restarts running containers; starts stopped/exited containers.")),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "Service restarted successfully", body = RestartServiceResponse),
+        (status = 200, description = "Service restarted or started successfully", body = RestartServiceResponse),
         (status = 400, description = "Service name not in allowlist", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Container not found for service", body = ErrorResponse),
-        (status = 500, description = "Docker restart failed", body = ErrorResponse),
+        (status = 500, description = "Docker restart/start failed", body = ErrorResponse),
     )
 )]
 async fn restart_management_service(
@@ -2772,65 +2772,105 @@ async fn restart_management_service(
     }
 
     let service_clone = service.clone();
-    let (container_id, restart_result) = tokio::task::spawn_blocking(move || {
-        // Find the container by Docker Compose service label
-        let find = std::process::Command::new("docker")
-            .args([
-                "ps",
-                "-q",
-                "--filter",
-                &format!("label=com.docker.compose.service={}", service_clone),
-            ])
+    let (container_id, action) = tokio::task::spawn_blocking(move || {
+        let filter = format!("label=com.docker.compose.service={}", service_clone);
+
+        // First, look for a running container
+        let find_running = std::process::Command::new("docker")
+            .args(["ps", "-q", "--filter", &filter])
             .output()
             .map_err(|e| ApiError::Internal(format!("Failed to run docker ps: {}", e)))?;
 
-        let container_id = String::from_utf8_lossy(&find.stdout).trim().to_string();
-        if container_id.is_empty() {
+        let running_id = String::from_utf8_lossy(&find_running.stdout)
+            .trim()
+            .to_string();
+
+        if !running_id.is_empty() {
+            // Running container found — validate single match, then restart
+            let mut lines = running_id.lines();
+            let container_id = lines.next().unwrap().to_string();
+            if lines.next().is_some() {
+                return Err(ApiError::BadRequest(format!(
+                    "Multiple containers found for service '{}'. Restarting multi-replica services is not supported.",
+                    service_clone
+                )));
+            }
+
+            let restart = std::process::Command::new("docker")
+                .args(["restart", &container_id])
+                .output()
+                .map_err(|e| {
+                    ApiError::Internal(format!("Failed to run docker restart: {}", e))
+                })?;
+
+            if !restart.status.success() {
+                let stderr = String::from_utf8_lossy(&restart.stderr);
+                return Err(ApiError::Internal(format!(
+                    "docker restart failed: {}",
+                    stderr
+                )));
+            }
+
+            return Ok((container_id, "restarted"));
+        }
+
+        // No running container — look for stopped/exited containers
+        let find_all = std::process::Command::new("docker")
+            .args(["ps", "-a", "-q", "--filter", &filter])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("Failed to run docker ps -a: {}", e)))?;
+
+        let all_id = String::from_utf8_lossy(&find_all.stdout)
+            .trim()
+            .to_string();
+
+        if all_id.is_empty() {
             return Err(ApiError::NotFound(format!(
-                "No running container found for service '{}'",
+                "No container found for service '{}'",
                 service_clone
             )));
         }
 
-        // Fail explicitly if multiple containers match — partial restarts are dangerous
-        let mut lines = container_id.lines();
-        let container_id = lines.next().unwrap().to_string(); // .is_empty() check above makes this safe
+        // Validate single match
+        let mut lines = all_id.lines();
+        let container_id = lines.next().unwrap().to_string();
         if lines.next().is_some() {
             return Err(ApiError::BadRequest(format!(
-                "Multiple containers found for service '{}'. Restarting multi-replica services is not supported.",
+                "Multiple containers found for service '{}'. Starting multi-replica services is not supported.",
                 service_clone
             )));
         }
 
-        let restart = std::process::Command::new("docker")
-            .args(["restart", &container_id])
+        let start = std::process::Command::new("docker")
+            .args(["start", &container_id])
             .output()
-            .map_err(|e| ApiError::Internal(format!("Failed to run docker restart: {}", e)))?;
+            .map_err(|e| ApiError::Internal(format!("Failed to run docker start: {}", e)))?;
 
-        if !restart.status.success() {
-            let stderr = String::from_utf8_lossy(&restart.stderr);
+        if !start.status.success() {
+            let stderr = String::from_utf8_lossy(&start.stderr);
             return Err(ApiError::Internal(format!(
-                "docker restart failed: {}",
+                "docker start failed: {}",
                 stderr
             )));
         }
 
-        Ok(container_id)
+        Ok((container_id, "started"))
     })
     .await
     .map_err(|e| ApiError::Internal(format!("task join: {e}")))
-    .and_then(|r| r.map(|id| (id.clone(), "restarted".to_string())))?;
+    .and_then(|r| r)?;
 
     tracing::info!(
-        "Management service '{}' restarted (container={})",
+        "Management service '{}' {} (container={})",
         service,
+        action,
         container_id
     );
 
     Ok(Json(RestartServiceResponse {
         service,
         container_id,
-        status: restart_result,
+        status: action.to_string(),
     }))
 }
 
