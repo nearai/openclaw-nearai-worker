@@ -2005,6 +2005,10 @@ async fn restart_instance(
         tokio::spawn(async move {
             if let Some(ref image) = new_image {
                 // Full upgrade: export workspace → down -v → up with new image → restore workspace
+
+                // Infer service types from the existing container image (if any) and from the
+                // requested new image. This gives us a source-of-truth independent of the
+                // stored Instance.service_type field, which may be stale.
                 let inferred_old = inst
                     .image
                     .as_deref()
@@ -2013,6 +2017,9 @@ async fn restart_instance(
                     .compose
                     .infer_service_type_from_image(Some(image.as_str()));
 
+                // Safety check: if we can infer a type from the existing image and it disagrees
+                // with the type inferred from the new image, abort the upgrade rather than
+                // risk migrating an openclaw workspace into an ironclaw template (or vice versa).
                 if let Some(old_ty) = inferred_old {
                     if old_ty != inferred_new {
                         let _ = tx
@@ -2028,6 +2035,12 @@ async fn restart_instance(
 
                 let inferred = inferred_new;
 
+                // Reconcile the stored service_type with what we infer from images:
+                // - If they agree, use the stored value.
+                // - If they disagree, prefer the image-based inference but log a warning, since
+                //   the stored value is likely stale.
+                // - If service_type is entirely missing, keep the legacy behavior and refuse to
+                //   upgrade, because we can't be confident which compose file is correct.
                 let stype = match inst.service_type.as_deref() {
                     Some(st) if st == inferred => st,
                     Some(st) => {
