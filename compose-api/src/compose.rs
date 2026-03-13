@@ -105,6 +105,17 @@ impl ComposeManager {
         })
     }
 
+    /// Infer service type from image name: "ironclaw" if image contains "ironclaw", otherwise
+    /// "openclaw". Does not depend on which compose files are currently loaded.
+    pub fn infer_service_type_from_image(&self, image: Option<&str>) -> &'static str {
+        let img_lower = image.unwrap_or("").to_lowercase();
+        if img_lower.contains("ironclaw") {
+            "ironclaw"
+        } else {
+            "openclaw"
+        }
+    }
+
     /// Resolve the compose file for a given service type, falling back to openclaw.
     fn compose_file_for(&self, service_type: Option<&str>) -> &Path {
         service_type

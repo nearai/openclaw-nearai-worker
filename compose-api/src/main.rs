@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -2002,8 +2005,40 @@ async fn restart_instance(
         tokio::spawn(async move {
             if let Some(ref image) = new_image {
                 // Full upgrade: export workspace → down -v → up with new image → restore workspace
+                let inferred_old = inst
+                    .image
+                    .as_deref()
+                    .map(|img| state.compose.infer_service_type_from_image(Some(img)));
+                let inferred_new = state
+                    .compose
+                    .infer_service_type_from_image(Some(image.as_str()));
+
+                if let Some(old_ty) = inferred_old {
+                    if old_ty != inferred_new {
+                        let _ = tx
+                            .send(sse_error(&format!(
+                                "Instance '{}' image types do not match: old '{}' vs new '{}'; refusing to upgrade.",
+                                name, old_ty, inferred_new
+                            )))
+                            .await;
+                        state.upgrading.lock().await.remove(&name);
+                        return;
+                    }
+                }
+
+                let inferred = inferred_new;
+
                 let stype = match inst.service_type.as_deref() {
-                    Some(st) => st,
+                    Some(st) if st == inferred => st,
+                    Some(st) => {
+                        tracing::warn!(
+                            "Instance '{}': stored service_type '{}' differs from inferred '{}'; using inferred value",
+                            name,
+                            st,
+                            inferred
+                        );
+                        inferred
+                    }
                     None => {
                         let _ = tx
                             .send(sse_error(&format!(
@@ -2142,7 +2177,8 @@ async fn restart_instance(
                         .await;
                     state.upgrading.lock().await.remove(&name);
                     // Still run health polling for the rolled-back container
-                    poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx, None).await;
+                    poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx, None)
+                        .await;
                     return;
                 }
 
@@ -2901,9 +2937,7 @@ struct ServicesStatusResponse {
         (status = 500, description = "Docker command failed", body = ErrorResponse),
     )
 )]
-async fn get_services_status(
-    _auth: AdminAuth,
-) -> Result<impl IntoResponse, ApiError> {
+async fn get_services_status(_auth: AdminAuth) -> Result<impl IntoResponse, ApiError> {
     let services = tokio::task::spawn_blocking(|| {
         let mut results = Vec::with_capacity(MANAGEMENT_SERVICES.len());
 
@@ -2942,7 +2976,11 @@ async fn get_services_status(
 
                 results.push(ServiceStatus {
                     service: svc.to_string(),
-                    container_id: if id_str.is_empty() { None } else { Some(id_str) },
+                    container_id: if id_str.is_empty() {
+                        None
+                    } else {
+                        Some(id_str)
+                    },
                     state,
                     status,
                 });
