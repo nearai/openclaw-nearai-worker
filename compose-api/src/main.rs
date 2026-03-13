@@ -2905,9 +2905,9 @@ async fn get_services_status(
     _auth: AdminAuth,
 ) -> Result<impl IntoResponse, ApiError> {
     let services = tokio::task::spawn_blocking(|| {
-        let mut results = Vec::with_capacity(RESTARTABLE_SERVICES.len());
+        let mut results = Vec::with_capacity(MANAGEMENT_SERVICES.len());
 
-        for &svc in RESTARTABLE_SERVICES {
+        for &svc in MANAGEMENT_SERVICES {
             let output = std::process::Command::new("docker")
                 .args([
                     "ps",
