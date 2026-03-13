@@ -2905,49 +2905,67 @@ async fn get_services_status(
     _auth: AdminAuth,
 ) -> Result<impl IntoResponse, ApiError> {
     let services = tokio::task::spawn_blocking(|| {
-        let mut results = Vec::with_capacity(MANAGEMENT_SERVICES.len());
+        // Single `docker ps` call for all management service containers.
+        // The format includes the compose service label so we can match each
+        // line back to its service name.
+        let output = std::process::Command::new("docker")
+            .args([
+                "ps",
+                "-a",
+                "--format",
+                "{{.Label \"com.docker.compose.service\"}}\t{{.ID}}\t{{.State}}\t{{.Status}}",
+            ])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("Failed to run docker ps: {}", e)))?;
 
-        for &svc in MANAGEMENT_SERVICES {
-            let output = std::process::Command::new("docker")
-                .args([
-                    "ps",
-                    "-a",
-                    "--format",
-                    "{{.ID}} {{.State}} {{.Status}}",
-                    "--filter",
-                    &format!("label=com.docker.compose.service={}", svc),
-                ])
-                .output()
-                .map_err(|e| ApiError::Internal(format!("Failed to run docker ps: {}", e)))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let line = stdout.trim();
-
+        // Build a lookup: service name -> (id, state, status) from the first
+        // matching line for each management service.
+        let mut found: std::collections::HashMap<&str, (&str, &str, &str)> =
+            std::collections::HashMap::new();
+        for line in stdout.lines() {
+            let line = line.trim();
             if line.is_empty() {
-                results.push(ServiceStatus {
+                continue;
+            }
+            // Format: "<service>\t<ID>\t<State>\t<Status...>"
+            let mut parts = line.splitn(4, '\t');
+            let svc_label = parts.next().unwrap_or("");
+            if !MANAGEMENT_SERVICES.contains(&svc_label) {
+                continue;
+            }
+            // Only take the first container per service.
+            if found.contains_key(svc_label) {
+                continue;
+            }
+            let id_str = parts.next().unwrap_or("");
+            let state = parts.next().unwrap_or("unknown");
+            let status = parts.next().unwrap_or("");
+            found.insert(svc_label, (id_str, state, status));
+        }
+
+        let results = MANAGEMENT_SERVICES
+            .iter()
+            .map(|&svc| match found.get(svc) {
+                Some(&(id_str, state, status)) => ServiceStatus {
+                    service: svc.to_string(),
+                    container_id: if id_str.is_empty() {
+                        None
+                    } else {
+                        Some(id_str.to_string())
+                    },
+                    state: state.to_string(),
+                    status: status.to_string(),
+                },
+                None => ServiceStatus {
                     service: svc.to_string(),
                     container_id: None,
                     state: "not_found".to_string(),
                     status: String::new(),
-                });
-            } else {
-                // Format: "<ID> <State> <Status...>"
-                // Status may contain spaces, so split into at most 3 parts.
-                // If multiple containers match, take only the first line.
-                let first_line = line.lines().next().unwrap_or("");
-                let mut parts = first_line.splitn(3, ' ');
-                let id_str = parts.next().unwrap_or("").to_string();
-                let state = parts.next().unwrap_or("unknown").to_string();
-                let status = parts.next().unwrap_or("").to_string();
-
-                results.push(ServiceStatus {
-                    service: svc.to_string(),
-                    container_id: if id_str.is_empty() { None } else { Some(id_str) },
-                    state,
-                    status,
-                });
-            }
-        }
+                },
+            })
+            .collect();
 
         Ok::<_, ApiError>(results)
     })
@@ -3098,57 +3116,60 @@ impl AppConfig {
 }
 
 /// Check management services and start any that are not running.
-/// Uses `docker ps -a` with service label filter to find containers in any state,
+/// Uses a single `docker ps -a` call to find all management containers,
 /// then `docker start` for non-running ones (preserving the original container).
 fn check_and_restart_services() {
+    // Single `docker ps` call for all containers — we filter management
+    // services from the output rather than issuing one call per service.
+    let find = match std::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--format",
+            "{{.Label \"com.docker.compose.service\"}}\t{{.ID}}\t{{.State}}",
+        ])
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!("service_monitor: failed to run docker ps: {}", e);
+            return;
+        }
+    };
+
+    if !find.status.success() {
+        let stderr = String::from_utf8_lossy(&find.stderr);
+        tracing::warn!("service_monitor: docker ps failed: {}", stderr.trim());
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&find.stdout);
+
+    // Collect (service_name -> Vec<(container_id, state)>) for management services.
+    let mut service_containers: std::collections::HashMap<&str, Vec<(&str, &str)>> =
+        std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let svc_label = parts.next().unwrap_or("");
+        if !MANAGEMENT_SERVICES.contains(&svc_label) {
+            continue;
+        }
+        let id = parts.next().unwrap_or("");
+        let state = parts.next().unwrap_or("");
+        service_containers.entry(svc_label).or_default().push((id, state));
+    }
+
     for &service in MANAGEMENT_SERVICES {
-        // Find container by compose service label (including stopped containers with -a)
-        let find = match std::process::Command::new("docker")
-            .args([
-                "ps",
-                "-a",
-                "--format",
-                "{{.ID}} {{.State}}",
-                "--filter",
-                &format!("label=com.docker.compose.service={}", service),
-            ])
-            .output()
-        {
-            Ok(out) => out,
-            Err(e) => {
-                tracing::warn!(
-                    "service_monitor: failed to run docker ps for {}: {}",
-                    service,
-                    e
-                );
-                continue;
-            }
+        let containers = match service_containers.get(service) {
+            Some(c) => c,
+            None => continue, // no container found, skip
         };
 
-        if !find.status.success() {
-            let stderr = String::from_utf8_lossy(&find.stderr);
-            tracing::warn!(
-                "service_monitor: docker ps failed for '{}': {}",
-                service,
-                stderr.trim()
-            );
-            continue;
-        }
-
-        let stdout = String::from_utf8_lossy(&find.stdout);
-        let trimmed = stdout.trim();
-
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let mut lines = trimmed.lines();
-        let first_line = match lines.next() {
-            Some(l) => l,
-            None => continue,
-        };
-
-        if lines.next().is_some() {
+        if containers.len() > 1 {
             tracing::error!(
                 "service_monitor: multiple containers found for service '{}', skipping",
                 service
@@ -3156,12 +3177,10 @@ fn check_and_restart_services() {
             continue;
         }
 
-        let mut parts = first_line.split_whitespace();
-        let container_id = match parts.next() {
-            Some(id) => id,
-            None => continue,
-        };
-        let container_state = parts.next().unwrap_or("");
+        let (container_id, container_state) = containers[0];
+        if container_id.is_empty() {
+            continue;
+        }
 
         if container_state == "running" {
             continue;
