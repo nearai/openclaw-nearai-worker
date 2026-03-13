@@ -2873,13 +2873,13 @@ async fn get_services_status(
                 // If multiple containers match, take only the first line.
                 let first_line = line.lines().next().unwrap_or("");
                 let mut parts = first_line.splitn(3, ' ');
-                let id = parts.next().unwrap_or("").to_string();
+                let id_str = parts.next().unwrap_or("").to_string();
                 let state = parts.next().unwrap_or("unknown").to_string();
                 let status = parts.next().unwrap_or("").to_string();
 
                 results.push(ServiceStatus {
                     service: svc.to_string(),
-                    container_id: Some(id),
+                    container_id: if id_str.is_empty() { None } else { Some(id_str) },
                     state,
                     status,
                 });
