@@ -296,11 +296,16 @@ restore_config() {
 # Execute the command with automatic restart (openclaw is installed globally)
 # The loop keeps the container alive and restarts the gateway if it exits
 RESTART_DELAY="${OPENCLAW_RESTART_DELAY:-5}"
+LAUNCH_COUNT=0
 
 while true; do
-  echo "Starting: $*"
-  # Fix ownership before each launch — subdirs may have been created as root
-  chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw 2>/dev/null || true
+  LAUNCH_COUNT=$((LAUNCH_COUNT + 1))
+  echo "Starting (launch #$LAUNCH_COUNT): $*"
+  # Fix ownership on first launch only — subsequent restarts skip this to reduce
+  # startup latency (the gateway process doesn't change file ownership)
+  if [ "$LAUNCH_COUNT" -eq 1 ]; then
+    chown -R agent:agent /home/agent/.openclaw /home/agent/openclaw 2>/dev/null || true
+  fi
   # Validate config integrity before each launch
   if ! validate_config; then
     restore_config
