@@ -59,6 +59,7 @@ use store::{Instance, InstanceStore, PortRange};
         set_config,
         delete_config_key,
         restart_management_service,
+        get_services_status,
         oauth_exchange,
         oauth_refresh,
     ),
@@ -77,6 +78,8 @@ use store::{Instance, InstanceStore, PortRange};
         SseEvent,
         ErrorResponse,
         RestartServiceResponse,
+        ServiceStatus,
+        ServicesStatusResponse,
         OAuthExchangeRequest,
         OAuthRefreshRequest,
     )),
@@ -1062,7 +1065,8 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/restart-service/{service}",
             post(restart_management_service),
-        );
+        )
+        .route("/admin/services", get(get_services_status));
 
     if state.config.google_oauth_client_id.is_some()
         && state.config.google_oauth_client_secret.is_some()
@@ -2828,6 +2832,89 @@ async fn restart_management_service(
         container_id,
         status: restart_result,
     }))
+}
+
+// ── Admin: management services status ───────────────────────────────
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct ServiceStatus {
+    /// Service name
+    service: String,
+    /// Docker container ID (empty if not found)
+    container_id: Option<String>,
+    /// Container state: "running", "exited", "restarting", "paused", "not_found", etc.
+    state: String,
+    /// Docker's full status string, e.g. "Up 2 days" or "Exited (1) 3 hours ago"
+    status: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct ServicesStatusResponse {
+    services: Vec<ServiceStatus>,
+}
+
+#[utoipa::path(get, path = "/admin/services", tag = "Admin",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Status of all management services", body = ServicesStatusResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Docker command failed", body = ErrorResponse),
+    )
+)]
+async fn get_services_status(
+    _auth: AdminAuth,
+) -> Result<impl IntoResponse, ApiError> {
+    let services = tokio::task::spawn_blocking(|| {
+        let mut results = Vec::with_capacity(RESTARTABLE_SERVICES.len());
+
+        for &svc in RESTARTABLE_SERVICES {
+            let output = std::process::Command::new("docker")
+                .args([
+                    "ps",
+                    "-a",
+                    "--format",
+                    "{{.ID}} {{.State}} {{.Status}}",
+                    "--filter",
+                    &format!("label=com.docker.compose.service={}", svc),
+                ])
+                .output()
+                .map_err(|e| ApiError::Internal(format!("Failed to run docker ps: {}", e)))?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let line = stdout.trim();
+
+            if line.is_empty() {
+                results.push(ServiceStatus {
+                    service: svc.to_string(),
+                    container_id: None,
+                    state: "not_found".to_string(),
+                    status: String::new(),
+                });
+            } else {
+                // Format: "<ID> <State> <Status...>"
+                // Status may contain spaces, so split into at most 3 parts.
+                // If multiple containers match, take only the first line.
+                let first_line = line.lines().next().unwrap_or("");
+                let mut parts = first_line.splitn(3, ' ');
+                let id_str = parts.next().unwrap_or("").to_string();
+                let state = parts.next().unwrap_or("unknown").to_string();
+                let status = parts.next().unwrap_or("").to_string();
+
+                results.push(ServiceStatus {
+                    service: svc.to_string(),
+                    container_id: if id_str.is_empty() { None } else { Some(id_str) },
+                    state,
+                    status,
+                });
+            }
+        }
+
+        Ok::<_, ApiError>(results)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("task join: {e}")))??;
+
+    Ok(Json(ServicesStatusResponse { services }))
 }
 
 // ── Utilities ────────────────────────────────────────────────────────
