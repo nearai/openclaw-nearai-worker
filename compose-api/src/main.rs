@@ -2738,6 +2738,51 @@ async fn delete_config_key(
 /// admin restart endpoint and the background service monitor.
 const MANAGEMENT_SERVICES: &[&str] = &["openclaw-updater", "nginx", "ssh-bastion", "datadog-agent"];
 
+/// Format string for `docker ps` output used by both `get_services_status` and
+/// `check_and_restart_services`.  Produces tab-delimited columns:
+///   service_label \t container_id \t state \t status_text
+const DOCKER_PS_FORMAT: &str =
+    "{{.Label \"com.docker.compose.service\"}}\t{{.ID}}\t{{.State}}\t{{.Status}}";
+
+/// Shorter variant without the trailing Status column, used by the service monitor.
+const DOCKER_PS_FORMAT_SHORT: &str =
+    "{{.Label \"com.docker.compose.service\"}}\t{{.ID}}\t{{.State}}";
+
+/// Parsed container info from a `docker ps` output line.
+#[derive(Debug, Clone, PartialEq)]
+struct ParsedContainer<'a> {
+    id: &'a str,
+    state: &'a str,
+    status: &'a str,
+}
+
+/// Parse tab-delimited `docker ps` output (with 3 or 4 columns) into a map of
+/// service_name -> Vec<ParsedContainer>.  Only services present in
+/// `MANAGEMENT_SERVICES` are included.
+fn parse_docker_ps_output(stdout: &str) -> std::collections::HashMap<&str, Vec<ParsedContainer<'_>>> {
+    let mut map: std::collections::HashMap<&str, Vec<ParsedContainer<'_>>> =
+        std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Support both 3-column (short) and 4-column (full) formats.
+        let mut parts = line.splitn(4, '\t');
+        let svc_label = parts.next().unwrap_or("");
+        if !MANAGEMENT_SERVICES.contains(&svc_label) {
+            continue;
+        }
+        let id = parts.next().unwrap_or("");
+        let state = parts.next().unwrap_or("unknown");
+        let status = parts.next().unwrap_or("");
+        map.entry(svc_label)
+            .or_default()
+            .push(ParsedContainer { id, state, status });
+    }
+    map
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 struct RestartServiceResponse {
     /// Service that was restarted
@@ -2906,57 +2951,34 @@ async fn get_services_status(
 ) -> Result<impl IntoResponse, ApiError> {
     let services = tokio::task::spawn_blocking(|| {
         // Single `docker ps` call for all management service containers.
-        // The format includes the compose service label so we can match each
-        // line back to its service name.
         let output = std::process::Command::new("docker")
-            .args([
-                "ps",
-                "-a",
-                "--format",
-                "{{.Label \"com.docker.compose.service\"}}\t{{.ID}}\t{{.State}}\t{{.Status}}",
-            ])
+            .args(["ps", "-a", "--format", DOCKER_PS_FORMAT])
             .output()
             .map_err(|e| ApiError::Internal(format!("Failed to run docker ps: {}", e)))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // Build a lookup: service name -> (id, state, status) from the first
-        // matching line for each management service.
-        let mut found: std::collections::HashMap<&str, (&str, &str, &str)> =
-            std::collections::HashMap::new();
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            // Format: "<service>\t<ID>\t<State>\t<Status...>"
-            let mut parts = line.splitn(4, '\t');
-            let svc_label = parts.next().unwrap_or("");
-            if !MANAGEMENT_SERVICES.contains(&svc_label) {
-                continue;
-            }
-            // Only take the first container per service.
-            if found.contains_key(svc_label) {
-                continue;
-            }
-            let id_str = parts.next().unwrap_or("");
-            let state = parts.next().unwrap_or("unknown");
-            let status = parts.next().unwrap_or("");
-            found.insert(svc_label, (id_str, state, status));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!(
+                "docker ps failed: {}",
+                stderr.trim()
+            )));
         }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let found = parse_docker_ps_output(&stdout);
 
         let results = MANAGEMENT_SERVICES
             .iter()
-            .map(|&svc| match found.get(svc) {
-                Some(&(id_str, state, status)) => ServiceStatus {
+            .map(|&svc| match found.get(svc).and_then(|v| v.first()) {
+                Some(c) => ServiceStatus {
                     service: svc.to_string(),
-                    container_id: if id_str.is_empty() {
+                    container_id: if c.id.is_empty() {
                         None
                     } else {
-                        Some(id_str.to_string())
+                        Some(c.id.to_string())
                     },
-                    state: state.to_string(),
-                    status: status.to_string(),
+                    state: c.state.to_string(),
+                    status: c.status.to_string(),
                 },
                 None => ServiceStatus {
                     service: svc.to_string(),
@@ -3122,12 +3144,7 @@ fn check_and_restart_services() {
     // Single `docker ps` call for all containers — we filter management
     // services from the output rather than issuing one call per service.
     let find = match std::process::Command::new("docker")
-        .args([
-            "ps",
-            "-a",
-            "--format",
-            "{{.Label \"com.docker.compose.service\"}}\t{{.ID}}\t{{.State}}",
-        ])
+        .args(["ps", "-a", "--format", DOCKER_PS_FORMAT_SHORT])
         .output()
     {
         Ok(out) => out,
@@ -3144,24 +3161,7 @@ fn check_and_restart_services() {
     }
 
     let stdout = String::from_utf8_lossy(&find.stdout);
-
-    // Collect (service_name -> Vec<(container_id, state)>) for management services.
-    let mut service_containers: std::collections::HashMap<&str, Vec<(&str, &str)>> =
-        std::collections::HashMap::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(3, '\t');
-        let svc_label = parts.next().unwrap_or("");
-        if !MANAGEMENT_SERVICES.contains(&svc_label) {
-            continue;
-        }
-        let id = parts.next().unwrap_or("");
-        let state = parts.next().unwrap_or("");
-        service_containers.entry(svc_label).or_default().push((id, state));
-    }
+    let service_containers = parse_docker_ps_output(&stdout);
 
     for &service in MANAGEMENT_SERVICES {
         let containers = match service_containers.get(service) {
@@ -3177,7 +3177,9 @@ fn check_and_restart_services() {
             continue;
         }
 
-        let (container_id, container_state) = containers[0];
+        let container = &containers[0];
+        let container_id = container.id;
+        let container_state = container.state;
         if container_id.is_empty() {
             continue;
         }
@@ -3553,5 +3555,74 @@ mod tests {
     fn test_ct_eq_one_empty() {
         assert!(!constant_time_token_eq("", "notempty"));
         assert!(!constant_time_token_eq("notempty", ""));
+    }
+
+    // ── parse_docker_ps_output ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_docker_ps_empty_output() {
+        let map = parse_docker_ps_output("");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_docker_ps_whitespace_only() {
+        let map = parse_docker_ps_output("  \n  \n");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_docker_ps_typical_output() {
+        let output = "\
+nginx\tabc123\trunning\tUp 2 hours
+openclaw-updater\tdef456\texited\tExited (0) 5 minutes ago
+ssh-bastion\tghi789\trunning\tUp 3 hours
+some-other-service\tjkl012\trunning\tUp 1 hour
+";
+        let map = parse_docker_ps_output(output);
+        assert_eq!(map.len(), 3); // nginx, openclaw-updater, ssh-bastion
+        assert!(map.get("some-other-service").is_none());
+
+        let nginx = &map["nginx"];
+        assert_eq!(nginx.len(), 1);
+        assert_eq!(nginx[0].id, "abc123");
+        assert_eq!(nginx[0].state, "running");
+        assert_eq!(nginx[0].status, "Up 2 hours");
+
+        let updater = &map["openclaw-updater"];
+        assert_eq!(updater[0].state, "exited");
+    }
+
+    #[test]
+    fn test_parse_docker_ps_multiple_containers_same_service() {
+        let output = "\
+nginx\tabc123\trunning\tUp 2 hours
+nginx\tdef456\trunning\tUp 1 hour
+";
+        let map = parse_docker_ps_output(output);
+        let nginx = &map["nginx"];
+        assert_eq!(nginx.len(), 2);
+        assert_eq!(nginx[0].id, "abc123");
+        assert_eq!(nginx[1].id, "def456");
+    }
+
+    #[test]
+    fn test_parse_docker_ps_short_format_3_columns() {
+        // The short format used by check_and_restart_services has no Status column.
+        let output = "nginx\tabc123\trunning\n\
+                      datadog-agent\tdef456\texited\n";
+        let map = parse_docker_ps_output(output);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["nginx"][0].state, "running");
+        assert_eq!(map["nginx"][0].status, ""); // no status column
+        assert_eq!(map["datadog-agent"][0].state, "exited");
+    }
+
+    #[test]
+    fn test_parse_docker_ps_ignores_non_management_services() {
+        let output = "my-app\tabc123\trunning\tUp 1 hour\n\
+                      worker-1\tdef456\trunning\tUp 2 hours\n";
+        let map = parse_docker_ps_output(output);
+        assert!(map.is_empty());
     }
 }
