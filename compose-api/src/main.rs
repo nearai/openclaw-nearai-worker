@@ -2190,8 +2190,7 @@ async fn restart_instance(
                         .await;
                     state.upgrading.lock().await.remove(&name);
                     // Still run health polling for the rolled-back container
-                    poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx, None)
-                        .await;
+                    poll_health_to_ready(&state, &name, Some(stype), &tx, None).await;
                     return;
                 }
 
