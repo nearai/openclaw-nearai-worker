@@ -810,6 +810,7 @@ impl ComposeManager {
             mem_limit: None,
             cpus: None,
             storage_size: None,
+            extra_env: None,
         })
     }
 
@@ -872,6 +873,11 @@ impl ComposeManager {
             google_oauth_client_id,
             oauth_exchange_url,
         );
+        if let Some(ref extra) = inst.extra_env {
+            for (k, v) in extra {
+                vars.insert(k.clone(), v.clone());
+            }
+        }
         self.write_env_file(&inst.name, &vars)
     }
 

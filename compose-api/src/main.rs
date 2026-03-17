@@ -1715,6 +1715,7 @@ async fn create_instance(
         mem_limit: req.mem_limit.clone(),
         cpus: req.cpus.clone(),
         storage_size: req.storage_size.clone(),
+        extra_env: req.extra_env.clone(),
     };
 
     // Save to store before streaming so it's persisted immediately
@@ -2092,7 +2093,7 @@ async fn restart_instance(
                         inst.mem_limit.clone(),
                         inst.cpus.clone(),
                         inst.storage_size.clone(),
-                        None,
+                        inst.extra_env.clone(),
                     )
                     .await
                 {
@@ -2122,7 +2123,7 @@ async fn restart_instance(
                             inst.mem_limit.clone(),
                             inst.cpus.clone(),
                             inst.storage_size.clone(),
-                            None,
+                            inst.extra_env.clone(),
                         )
                         .await
                     {

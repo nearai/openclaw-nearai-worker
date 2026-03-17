@@ -101,6 +101,9 @@ pub struct Instance {
     /// Container storage limit override (e.g. "10G", "20G")
     #[serde(default)]
     pub storage_size: Option<String>,
+    /// Additional environment variables (e.g. CHANNEL_RELAY_URL, CHANNEL_RELAY_API_KEY).
+    #[serde(default)]
+    pub extra_env: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug)]
