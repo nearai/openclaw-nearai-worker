@@ -59,6 +59,8 @@ pub struct InstanceConfig<'a> {
     pub google_oauth_client_id: Option<&'a str>,
     /// URL of the platform's OAuth token exchange proxy.
     pub oauth_exchange_url: Option<&'a str>,
+    /// Additional environment variables.
+    pub extra_env: Option<&'a std::collections::HashMap<String, String>>,
 }
 
 /// Manages one Docker Compose project per worker via the `docker compose` CLI.
@@ -182,6 +184,11 @@ impl ComposeManager {
             cfg.google_oauth_client_id,
             cfg.oauth_exchange_url,
         );
+        if let Some(extra) = cfg.extra_env {
+            for (k, v) in extra {
+                vars.insert(k.clone(), v.clone());
+            }
+        }
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
         // Pull remote images via `docker pull` (compose v5 --pull is broken on ZFS).

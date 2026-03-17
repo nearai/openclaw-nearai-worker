@@ -160,6 +160,7 @@ impl AppState {
         mem_limit: Option<String>,
         cpus: Option<String>,
         storage_size: Option<String>,
+        extra_env: Option<std::collections::HashMap<String, String>>,
     ) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
@@ -191,6 +192,7 @@ impl AppState {
                 openclaw_domain: openclaw_domain.as_deref(),
                 google_oauth_client_id: google_oauth_client_id.as_deref(),
                 oauth_exchange_url: oauth_exchange_url.as_deref(),
+                extra_env: extra_env.as_ref(),
             })
         })
         .await
@@ -1198,6 +1200,9 @@ struct CreateInstanceRequest {
     /// Container storage limit (e.g. "10G", "20G"). Default: "10G"
     #[serde(default)]
     storage_size: Option<String>,
+    /// Additional environment variables to inject into the container.
+    #[serde(default)]
+    extra_env: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -1723,6 +1728,7 @@ async fn create_instance(
     let mem_limit = req.mem_limit.clone();
     let cpus = req.cpus.clone();
     let storage_size = req.storage_size.clone();
+    let extra_env = req.extra_env.clone();
 
     let stream = async_stream::stream! {
         yield Ok(sse_created(&info));
@@ -1742,6 +1748,7 @@ async fn create_instance(
             mem_limit,
             cpus,
             storage_size,
+            extra_env,
         ).await {
             // Remove from store — container never started, instance is not functional
             {
@@ -2085,6 +2092,7 @@ async fn restart_instance(
                         inst.mem_limit.clone(),
                         inst.cpus.clone(),
                         inst.storage_size.clone(),
+                        None,
                     )
                     .await
                 {
@@ -2114,6 +2122,7 @@ async fn restart_instance(
                             inst.mem_limit.clone(),
                             inst.cpus.clone(),
                             inst.storage_size.clone(),
+                            None,
                         )
                         .await
                     {
