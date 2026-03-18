@@ -29,11 +29,11 @@ The platform's compose-api holds the Google client secret and proxies token exch
       │                          │                    │                      │
       │                          │  callback_url()    │                      │
       │                          │  = "https://auth   │                      │
-      │                          │    .DOMAIN/oauth"  │                      │
+      │                          │    .DOMAIN"        │                      │
       │                          │                    │                      │
       │                          │  redirect_uri =    │                      │
       │                          │  callback_url()    │                      │
-      │                          │  + "/callback"     │                      │
+      │                          │+ "/oauth/callback" │                      │
       │                          │  = "https://auth.  │                      │
       │                          │  DOMAIN/oauth/     │                      │
       │                          │  callback"         │                      │
@@ -149,7 +149,7 @@ The platform's compose-api holds the Google client secret and proxies token exch
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │  ENV VARS (set by ironclaw-worker/entrypoint.sh)                               │
 │                                                                                │
-│  IRONCLAW_OAUTH_CALLBACK_URL = https://auth.DOMAIN/oauth                       │
+│  IRONCLAW_OAUTH_CALLBACK_URL = https://auth.DOMAIN                             │
 │  IRONCLAW_INSTANCE_NAME      = alice          (from OPENCLAW_INSTANCE_NAME)    │
 │  GOOGLE_OAUTH_CLIENT_ID      = 637554...      (public, for auth URL)           │
 │  IRONCLAW_OAUTH_EXCHANGE_URL = http://host.docker.internal:8080                │
