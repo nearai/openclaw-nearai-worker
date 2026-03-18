@@ -79,7 +79,7 @@ export GATEWAY_AUTH_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-changeme}"
 # The auth proxy (auth.DOMAIN) reads the state parameter to route callbacks
 # back to the correct instance (INSTANCE.DOMAIN/oauth/callback).
 if [ -n "${OPENCLAW_DOMAIN:-}" ] && [ -n "${OPENCLAW_INSTANCE_NAME:-}" ]; then
-    export IRONCLAW_OAUTH_CALLBACK_URL="https://auth.${OPENCLAW_DOMAIN}/oauth"
+    export IRONCLAW_OAUTH_CALLBACK_URL="https://auth.${OPENCLAW_DOMAIN}"
     export IRONCLAW_INSTANCE_NAME="${OPENCLAW_INSTANCE_NAME}"
 fi
 
