@@ -198,12 +198,17 @@ Generic providers (MCP, etc.) can send their own credentials in the exchange req
 │  Auth: Bearer <gateway_token>.                                                 │
 │                                                                                │
 │  Mode 1 — Platform credentials (Google):                                       │
-│    Fields: code, redirect_uri, code_verifier (optional)                        │
-│    compose-api adds client_id + client_secret from env, POSTs to Google.       │
+│    IronClaw may send code, redirect_uri, code_verifier, token_url, client_id,  │
+│    and access_token_field. compose-api treats missing / empty client creds,     │
+│    or a client_id matching the platform Google app, as platform-credential      │
+│    mode. In that mode it injects the platform client_secret server-side and     │
+│    only allows the built-in Google token endpoint.                              │
 │                                                                                │
 │  Mode 2 — Request credentials (generic/MCP):                                   │
 │    Fields: code, redirect_uri, token_url, client_id, client_secret (optional)  │
-│    compose-api forwards to the provided token_url with provided credentials.   │
+│    plus provider-specific extras such as resource. compose-api forwards these   │
+│    to the provided token_url after URL validation, and never injects platform   │
+│    secrets for non-platform credentials.                                        │
 │                                                                                │
 │  Response: JSON {access_token, refresh_token, expires_in, ...}.                │
 └─────────────────────────────────────────────────────────────────────────────────┘
