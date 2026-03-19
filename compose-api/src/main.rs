@@ -506,8 +506,8 @@ fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
 ///
 /// OAuth providers redirect to `https://auth.DOMAIN/oauth/callback?code=...&state=...`.
 /// This handler decodes the state parameter to extract the instance name, then
-/// 302-redirects to `https://{instance}.DOMAIN/oauth/callback?...` preserving all
-/// query parameters.
+/// issues a 307 Temporary Redirect to
+/// `https://{instance}.DOMAIN/oauth/callback?...` preserving all query parameters.
 #[utoipa::path(
     get,
     path = "/oauth/callback",
@@ -518,7 +518,7 @@ fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
         ("code" = Option<String>, Query, description = "Authorization code from the OAuth provider"),
     ),
     responses(
-        (status = 302, description = "Redirect to the correct instance"),
+        (status = 307, description = "Temporary Redirect to the correct instance"),
         (status = 400, description = "Missing or invalid state parameter"),
         (status = 500, description = "Platform domain not configured"),
     )

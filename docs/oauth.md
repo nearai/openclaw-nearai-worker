@@ -64,7 +64,7 @@ Generic providers (MCP, etc.) can send their own credentials in the exchange req
       │                                                                │    │
       │  6. Provider redirects browser                                 │    │
       │◄───────────────────────────────────────────────────────────────┘    │
-      │  302 → https://auth.DOMAIN/oauth/callback                          │
+      │  Redirect → https://auth.DOMAIN/oauth/callback                     │
       │         ?code=AUTH_CODE_ABC                                         │
       │         &state=ic2.eyJ...                                          │
       │                                                                     │
@@ -77,7 +77,7 @@ Generic providers (MCP, etc.) can send their own credentials in the exchange req
       │         │  ic2.{payload}.{cksum}   │                                │
       │         │   → instance = "alice"   │                                │
       │         │                          │                                │
-      │  7.     │  302 redirect to:        │                                │
+      │  7.     │  307 redirect to:        │                                │
       │◄────────│  https://alice.DOMAIN/   │                                │
       │         │  oauth/callback          │                                │
       │         │  ?code=AUTH_CODE_ABC     │                                │
