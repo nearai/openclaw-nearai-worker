@@ -1,27 +1,28 @@
 # OAuth Flow — Hosted Mode (E2E)
 
 A single OAuth redirect URI (`https://auth.DOMAIN/oauth/callback`) serves all instances.
-Nginx routes callbacks to the correct instance by parsing the instance name from the `state` query parameter.
-The platform's compose-api holds the Google client secret and proxies token exchanges so containers never see it.
+Compose-api routes callbacks to the correct instance by decoding the state parameter.
+The platform holds provider secrets and proxies token exchanges so containers never see them.
+Generic providers (MCP, etc.) can send their own credentials in the exchange request.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                    OAUTH FLOW — HOSTED MODE (E2E)                              │
 │                                                                                │
-│  Actors:  Browser │ Web UI (JS) │ Gateway │ ExtMgr │ Nginx │ Google │ Secrets  │
+│  Actors:  Browser │ Web UI (JS) │ Gateway │ ExtMgr │ compose-api │ Provider   │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
  Browser/Web UI                    IronClaw Container              Platform / External
  ─────────────                     ──────────────────              ────────────────────
       │                                   │                                │
-      │  1. Click "Configure" on Gmail     │                                │
+      │  1. Click "Configure" on ext      │                                │
       │──────────────────────────────────► │                                │
-      │  POST /api/extensions/gmail/setup  │                                │
-      │  {client_id, client_secret}        │                                │
+      │  POST /api/extensions/{name}/setup│                                │
+      │  {client_id, client_secret}       │                                │
       │                                    │                                │
       │  2. Click "Activate"               │                                │
       │──────────────────────────────────► │                                │
-      │  POST /api/extensions/gmail/activate                                │
+      │  POST /api/extensions/{name}/activate                              │
       │                                    │                                │
       │                          ┌─────────┴─────────┐                      │
       │                          │  ExtensionManager  │                      │
@@ -34,18 +35,17 @@ The platform's compose-api holds the Google client secret and proxies token exch
       │                          │  redirect_uri =    │                      │
       │                          │  callback_url()    │                      │
       │                          │+ "/oauth/callback" │                      │
-      │                          │  = "https://auth.  │                      │
-      │                          │  DOMAIN/oauth/     │                      │
-      │                          │  callback"         │                      │
       │                          │                    │                      │
       │                          │  state =           │                      │
-      │                          │  "alice:rand_nonce"│                      │
-      │                          │  (instance prefix  │                      │
-      │                          │   from env var)    │                      │
+      │                          │  "ic2.{base64      │                      │
+      │                          │   payload}.{cksum}"│                      │
+      │                          │  (contains         │                      │
+      │                          │   instance_name    │                      │
+      │                          │   + flow_id)       │                      │
       │                          │                    │                      │
       │                          │  Store pending     │                      │
       │                          │  flow keyed by     │                      │
-      │                          │  full state string │                      │
+      │                          │  flow_id           │                      │
       │                          └─────────┬─────────┘                      │
       │                                    │                                │
       │  3. Returns {auth_url, callback_type: "gateway"}                    │
@@ -53,68 +53,68 @@ The platform's compose-api holds the Google client secret and proxies token exch
       │                                    │                                │
       │  4. Open popup window                                               │
       │─────────────────────────────────────────────────────────────────────►│
-      │  https://accounts.google.com/o/oauth2/v2/auth                       │
-      │    ?client_id=637554...                                             │
+      │  https://provider.example.com/oauth/authorize                       │
+      │    ?client_id=...                                                   │
       │    &redirect_uri=https://auth.DOMAIN/oauth/callback                 │
-      │    &state=alice:rand_nonce                                          │
-      │    &scope=gmail.modify+gmail.compose                                │
-      │    &access_type=offline                                             │
-      │    &prompt=consent                                          Google   │
-      │                                                              OAuth   │
-      │  5. User consents                                            Server  │
-      │                                                                │     │
-      │  6. Google redirects browser                                   │     │
-      │◄───────────────────────────────────────────────────────────────┘     │
-      │  302 → https://auth.DOMAIN/oauth/callback                           │
-      │         ?code=AUTH_CODE_ABC                                          │
-      │         &state=alice:rand_nonce                                      │
-      │                                                                      │
-      │                                                                      │
-      │         ┌──────────────────────────┐                                 │
-      │         │  Nginx (auth.DOMAIN)     │                                 │
-      │────────►│                          │                                 │
-      │         │  map $arg_state:         │                                 │
-      │         │  "alice:rand_nonce"      │                                 │
-      │         │   → instance = "alice"   │                                 │
-      │         │                          │                                 │
-      │  7.     │  302 redirect to:        │                                 │
-      │◄────────│  https://alice.DOMAIN/   │                                 │
-      │         │  oauth/callback          │                                 │
-      │         │  ?code=AUTH_CODE_ABC     │                                 │
-      │         │  &state=alice:rand_nonce │                                 │
-      │         └──────────────────────────┘                                 │
-      │                                                                      │
-      │  8. Browser follows redirect                                         │
-      │──────────────────────────────────►│                                  │
-      │  GET /oauth/callback              │                                  │
-      │   ?code=AUTH_CODE_ABC             │                                  │
-      │   &state=alice:rand_nonce         │                                  │
-      │                                   │                                  │
-      │                          ┌────────┴────────┐                         │
-      │                          │ oauth_callback_  │                         │
-      │                          │ handler()        │                         │
-      │                          │                  │                         │
-      │                          │ Lookup pending   │                         │
-      │                          │ flow by full     │                         │
-      │                          │ state string     │                         │
-      │                          │ (atomic remove)  │                         │
-      │                          │                  │        compose-api      │
-      │                          │ 9. Exchange code │        (platform)       │
-      │                          │──────────────────────────►┌──────────┐    │
-      │                          │ POST http://host.docker   │ /oauth/  │    │
-      │                          │  .internal:8080/oauth/    │ exchange │    │
-      │                          │  exchange                 │          │    │
-      │                          │  Auth: Bearer <gw_token>  │          │    │
-      │                          │  {provider: "google",     │ Adds     │    │
-      │                          │   code: AUTH_CODE_ABC,    │ client_  │    │
-      │                          │   redirect_uri: ...,     │ secret   │───►│
-      │                          │   code_verifier: ...}    │          │    │
-      │                          │                          │ POST to  │    │
-      │                          │                          │ Google   │    │
-      │                          │                          │ token    │    │
-      │                          │ 10. Receive tokens       │ endpoint │    │
-      │                          │◄─────────────────────────┤          │◄───│
-      │                          │  {access_token,          └──────────┘    │
+      │    &state=ic2.eyJ...                                                │
+      │    &scope=...                                                       │
+      │                                                             Provider│
+      │                                                              OAuth  │
+      │  5. User consents                                            Server │
+      │                                                                │    │
+      │  6. Provider redirects browser                                 │    │
+      │◄───────────────────────────────────────────────────────────────┘    │
+      │  Redirect → https://auth.DOMAIN/oauth/callback                     │
+      │         ?code=AUTH_CODE_ABC                                         │
+      │         &state=ic2.eyJ...                                          │
+      │                                                                     │
+      │                                                                     │
+      │         ┌──────────────────────────┐                                │
+      │         │  compose-api             │                                │
+      │         │  /oauth/callback         │                                │
+      │────────►│                          │                                │
+      │         │  decode state:           │                                │
+      │         │  ic2.{payload}.{cksum}   │                                │
+      │         │   → instance = "alice"   │                                │
+      │         │                          │                                │
+      │  7.     │  307 redirect to:        │                                │
+      │◄────────│  https://alice.DOMAIN/   │                                │
+      │         │  oauth/callback          │                                │
+      │         │  ?code=AUTH_CODE_ABC     │                                │
+      │         │  &state=ic2.eyJ...      │                                │
+      │         └──────────────────────────┘                                │
+      │                                                                     │
+      │  8. Browser follows redirect                                        │
+      │──────────────────────────────────►│                                 │
+      │  GET /oauth/callback              │                                 │
+      │   ?code=AUTH_CODE_ABC             │                                 │
+      │   &state=ic2.eyJ...              │                                 │
+      │                                   │                                 │
+      │                          ┌────────┴────────┐                        │
+      │                          │ oauth_callback_  │                        │
+      │                          │ handler()        │                        │
+      │                          │                  │                        │
+      │                          │ Decode state,    │                        │
+      │                          │ lookup pending   │                        │
+      │                          │ flow by flow_id  │                        │
+      │                          │ (atomic remove)  │                        │
+      │                          │                  │        compose-api     │
+      │                          │ 9. Exchange code │        (platform)      │
+      │                          │──────────────────────────►┌──────────┐   │
+      │                          │ POST http://host.docker   │ /oauth/  │   │
+      │                          │  .internal:8080/oauth/    │ exchange │   │
+      │                          │  exchange                 │          │   │
+      │                          │  Auth: Bearer <gw_token>  │          │   │
+      │                          │  {code, redirect_uri,     │ Resolves │   │
+      │                          │   token_url (optional),   │ creds &  │───►
+      │                          │   client_id (optional),   │ endpoint │   │
+      │                          │   code_verifier: ...}     │          │   │
+      │                          │                           │ POST to  │   │
+      │                          │                           │ provider │   │
+      │                          │                           │ token    │   │
+      │                          │ 10. Receive tokens        │ endpoint │   │
+      │                          │◄──────────────────────────┤          │◄──│
+      │                          │  {access_token,           └──────────┘   │
       │                          │   refresh_token,                         │
       │                          │   expires_in}                            │
       │                          │                  │                       │
@@ -134,34 +134,37 @@ The platform's compose-api holds the Google client secret and proxies token exch
       │                                   │                                │
       │  14. Return success HTML          │                                │
       │◄──────────────────────────────────│                                │
-      │  (popup shows "Google Connected") │                                │
+      │  (popup shows "Connected")        │                                │
       │                                   │                                │
       │  15. SSE: AuthCompleted           │                                │
       │◄──────────────────────────────────│                                │
-      │  {extension: "gmail",             │                                │
+      │  {extension: "...",               │                                │
       │   success: true}                  │                                │
       │                                   │                                │
       │  16. Web UI refreshes             │                                │
       │  extension list, shows            │                                │
-      │  Gmail as "active"                │                                │
+      │  extension as "active"            │                                │
 
 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  ENV VARS (set by ironclaw-worker/entrypoint.sh)                               │
+│  ENV VARS IN THE WORKER CONTAINER                                              │
 │                                                                                │
+│  Set by ironclaw-worker/entrypoint.sh:                                         │
 │  IRONCLAW_OAUTH_CALLBACK_URL = https://auth.DOMAIN                             │
 │  IRONCLAW_INSTANCE_NAME      = alice          (from OPENCLAW_INSTANCE_NAME)    │
+│  GATEWAY_AUTH_TOKEN          = <random hex>   (for exchange proxy auth)        │
+│                                                                                │
+│  Injected by compose-api when available:                                       │
 │  GOOGLE_OAUTH_CLIENT_ID      = 637554...      (public, for auth URL)           │
 │  IRONCLAW_OAUTH_EXCHANGE_URL = http://host.docker.internal:8080                │
-│  GATEWAY_AUTH_TOKEN           = <random hex>   (for exchange proxy auth)        │
 │                                                                                │
 │  NOT in container:                                                             │
 │  GOOGLE_OAUTH_CLIENT_SECRET  — stays on compose-api only                       │
 ├─────────────────────────────────────────────────────────────────────────────────┤
-│  GOOGLE CONSOLE — Authorized redirect URIs:                                    │
+│  PROVIDER CONSOLE — Authorized redirect URIs:                                  │
 │                                                                                │
 │  https://auth.DOMAIN/oauth/callback                                            │
-│  (single URI covers ALL instances — nginx routes by state param)               │
+│  (single URI covers ALL instances — compose-api routes by state param)         │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │  DNS:  auth.DOMAIN       → same server IP                                      │
 │        *.DOMAIN           → same server IP                                     │
@@ -170,25 +173,43 @@ The platform's compose-api holds the Google client secret and proxies token exch
 │  KEY DESIGN DECISIONS                                                          │
 │                                                                                │
 │  • Single redirect URI for all instances (no per-instance registration)        │
-│  • Instance routing via state param prefix ("alice:nonce"), not subdomain       │
-│  • Token exchange via platform proxy (client_secret never enters containers)   │
-│  • Flow registry keyed by full state string (including instance prefix)        │
-│  • Atomic remove from registry prevents replay attacks                         │
+│  • Instance routing via state param (compose-api decodes ic2 format + legacy)  │
+│  • Token exchange via platform proxy (platform Google secret stays off containers) │
+│  • Generic providers (MCP, etc.) send token_url + client_id in exchange req    │
+│  • Flow registry keyed by flow_id (atomic remove prevents replay)              │
 │  • 5-minute expiry on pending flows                                            │
 │  • Falls back to direct exchange + TCP listener in local/desktop mode          │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│  STATE PARAMETER FORMATS                                                       │
+│                                                                                │
+│  New (ic2): ic2.{base64url_json}.{sha256_checksum}                             │
+│    Payload JSON: {"flow_id":"...","instance_name":"alice","issued_at":...}      │
+│    Checksum: first 12 bytes of SHA256(payload), base64url-encoded              │
+│                                                                                │
+│  Legacy:    instance:nonce (e.g., "alice:abc123")                              │
+│    Instance name is the text before the first colon                            │
+│                                                                                │
+│  compose-api's /oauth/callback handler verifies ic2 checksums and decodes both formats. │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │  EXCHANGE PROXY PROTOCOL                                                       │
 │                                                                                │
 │  IronClaw appends /oauth/exchange to IRONCLAW_OAUTH_EXCHANGE_URL.             │
-│  Request: POST, form-encoded (code, redirect_uri, code_verifier).             │
+│  Request: POST, form-encoded.                                                  │
 │  Auth: Bearer <gateway_token>.                                                 │
-│  compose-api adds client_id + client_secret and forwards to Google.           │
-│  Response: JSON {access_token, refresh_token, expires_in}.                     │
 │                                                                                │
-│  Provider defaults to "google". To add providers (Microsoft, GitHub):          │
-│  1. Add *_CLIENT_ID / *_CLIENT_SECRET env vars + AppConfig fields             │
-│  2. Add provider registry: provider → (token_endpoint, credentials)           │
-│  3. WASM tools send provider=<name> as a form param                            │
-│  4. No ironclaw core changes needed                                            │
+│  Mode 1 — Platform credentials (Google):                                       │
+│    IronClaw may send code, redirect_uri, code_verifier, token_url, client_id,  │
+│    and access_token_field. compose-api treats missing / empty client creds,     │
+│    or a client_id matching the platform Google app, as platform-credential      │
+│    mode. In that mode it injects the platform client_secret server-side and     │
+│    only allows the built-in Google token endpoint.                              │
+│                                                                                │
+│  Mode 2 — Request credentials (generic/MCP):                                   │
+│    Fields: code, redirect_uri, token_url, client_id, client_secret (optional)  │
+│    plus provider-specific extras such as resource. compose-api forwards these   │
+│    to the provided token_url after URL validation, and never injects platform   │
+│    secrets for non-platform credentials.                                        │
+│                                                                                │
+│  Response: JSON {access_token, refresh_token, expires_in, ...}.                │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
