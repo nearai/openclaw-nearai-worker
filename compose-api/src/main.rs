@@ -446,6 +446,10 @@ fn default_provider_google() -> String {
     "google".into()
 }
 
+fn normalize_optional_oauth_field(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
 #[derive(Deserialize)]
 struct HostedOAuthStatePayload {
     #[serde(default)]
@@ -724,14 +728,37 @@ async fn validate_token_endpoint_url(
 /// This handles the case where IronClaw containers receive the web-app
 /// `GOOGLE_OAUTH_CLIENT_ID` via env but deliberately omit the secret (which
 /// stays on compose-api).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthCredentialSource {
+    Request,
+    Platform,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedClientCredentials {
+    client_id: String,
+    client_secret: Option<String>,
+    source: OAuthCredentialSource,
+}
+
+impl ResolvedClientCredentials {
+    fn uses_platform_credentials(&self) -> bool {
+        self.source == OAuthCredentialSource::Platform
+    }
+}
+
 fn resolve_client_credentials(
     req_client_id: &Option<String>,
     req_client_secret: &Option<String>,
     config: &AppConfig,
-) -> Result<(String, Option<String>), ApiError> {
+) -> Result<ResolvedClientCredentials, ApiError> {
     match (req_client_id, req_client_secret) {
         // Request provides both client_id and client_secret — use them directly
-        (Some(id), Some(secret)) if !id.is_empty() => Ok((id.clone(), Some(secret.clone()))),
+        (Some(id), Some(secret)) if !id.is_empty() => Ok(ResolvedClientCredentials {
+            client_id: id.clone(),
+            client_secret: Some(secret.clone()),
+            source: OAuthCredentialSource::Request,
+        }),
         // Request provides client_id but no secret — check if it matches the
         // platform's Google client_id and inject the platform secret if so.
         (Some(id), None) if !id.is_empty() => {
@@ -746,7 +773,19 @@ fn resolve_client_credentials(
                         .as_ref()
                         .map(|s| s.expose_secret().to_string())
                 });
-            Ok((id.clone(), platform_secret))
+            Ok(ResolvedClientCredentials {
+                client_id: id.clone(),
+                client_secret: platform_secret,
+                source: if config
+                    .google_oauth_client_id
+                    .as_deref()
+                    .is_some_and(|platform_id| platform_id == id)
+                {
+                    OAuthCredentialSource::Platform
+                } else {
+                    OAuthCredentialSource::Request
+                },
+            })
         }
         // No client creds in request — fall back to platform Google creds
         _ => {
@@ -764,9 +803,31 @@ fn resolve_client_credentials(
                 .google_oauth_client_secret
                 .as_ref()
                 .map(|s| s.expose_secret().to_string());
-            Ok((id, secret))
+            Ok(ResolvedClientCredentials {
+                client_id: id,
+                client_secret: secret,
+                source: OAuthCredentialSource::Platform,
+            })
         }
     }
+}
+
+fn resolve_token_endpoint_for_credentials(
+    token_url: &Option<String>,
+    provider: &str,
+    credentials: &ResolvedClientCredentials,
+) -> Result<String, ApiError> {
+    if credentials.uses_platform_credentials()
+        && token_url
+            .as_deref()
+            .is_some_and(|token_url| token_url != GOOGLE_TOKEN_ENDPOINT)
+    {
+        return Err(ApiError::BadRequest(
+            "token_url override is not allowed when using platform credentials".into(),
+        ));
+    }
+
+    resolve_token_endpoint(token_url, provider)
 }
 
 /// Exchange an authorization code for tokens via the provider's token endpoint.
@@ -805,39 +866,29 @@ async fn oauth_exchange(
     let redirect_uri = form
         .remove("redirect_uri")
         .ok_or_else(|| ApiError::BadRequest("Missing required field: redirect_uri".into()))?;
-    let code_verifier = form.remove("code_verifier");
-    let token_url = form.remove("token_url");
-    let req_client_id = form.remove("client_id");
-    let req_client_secret = form.remove("client_secret");
+    let code_verifier = normalize_optional_oauth_field(form.remove("code_verifier"));
+    let token_url = normalize_optional_oauth_field(form.remove("token_url"));
+    let req_client_id = normalize_optional_oauth_field(form.remove("client_id"));
+    let req_client_secret = normalize_optional_oauth_field(form.remove("client_secret"));
 
     // Remove fields that are only meaningful to compose-api, not the token endpoint.
     form.remove("access_token_field");
 
-    let token_endpoint = resolve_token_endpoint(&token_url, &provider)?;
+    let resolved_credentials =
+        resolve_client_credentials(&req_client_id, &req_client_secret, &state.config)?;
+    let token_endpoint =
+        resolve_token_endpoint_for_credentials(&token_url, &provider, &resolved_credentials)?;
     let token_endpoint = validate_token_endpoint_url(
         &token_endpoint,
         oauth_exchange_allows_private_token_endpoints(&state),
     )
     .await?;
 
-    let (resolved_client_id, resolved_client_secret) =
-        resolve_client_credentials(&req_client_id, &req_client_secret, &state.config)?;
-
-    // Platform creds are in use when: no client_id was provided (full fallback),
-    // or client_id matches the platform's Google app and compose-api injected its secret.
-    let uses_platform_creds = req_client_id.is_none()
-        || (req_client_secret.is_none()
-            && state
-                .config
-                .google_oauth_client_id
-                .as_deref()
-                .is_some_and(|pid| Some(pid) == req_client_id.as_deref()));
-
     // When using platform credentials, validate redirect_uri belongs to the platform domain.
     // This prevents a compromised container from exchanging codes destined for other instances.
     // When the container provides its own credentials (MCP/generic), skip this check —
     // the provider validates redirect_uri independently.
-    if uses_platform_creds {
+    if resolved_credentials.uses_platform_credentials() {
         match &state.config.openclaw_domain {
             Some(domain) => {
                 let expected_prefix = format!("https://auth.{}/", domain);
@@ -865,9 +916,9 @@ async fn oauth_exchange(
         ("grant_type".into(), "authorization_code".into()),
         ("code".into(), code),
         ("redirect_uri".into(), redirect_uri),
-        ("client_id".into(), resolved_client_id),
+        ("client_id".into(), resolved_credentials.client_id),
     ];
-    if let Some(secret) = resolved_client_secret {
+    if let Some(secret) = resolved_credentials.client_secret {
         params.push(("client_secret".into(), secret));
     }
     if let Some(cv) = code_verifier {
@@ -952,21 +1003,25 @@ async fn oauth_refresh(
     State(state): State<AppState>,
     Form(req): Form<OAuthRefreshRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let token_endpoint = resolve_token_endpoint(&req.token_url, &req.provider)?;
+    let token_url = normalize_optional_oauth_field(req.token_url.clone());
+    let client_id = normalize_optional_oauth_field(req.client_id.clone());
+    let client_secret = normalize_optional_oauth_field(req.client_secret.clone());
+    let resolved_credentials =
+        resolve_client_credentials(&client_id, &client_secret, &state.config)?;
+    let token_endpoint =
+        resolve_token_endpoint_for_credentials(&token_url, &req.provider, &resolved_credentials)?;
     let token_endpoint = validate_token_endpoint_url(
         &token_endpoint,
         oauth_exchange_allows_private_token_endpoints(&state),
     )
     .await?;
-    let (resolved_client_id, resolved_client_secret) =
-        resolve_client_credentials(&req.client_id, &req.client_secret, &state.config)?;
 
     let mut params: Vec<(&str, String)> = vec![
         ("grant_type", "refresh_token".to_string()),
         ("refresh_token", req.refresh_token.clone()),
-        ("client_id", resolved_client_id),
+        ("client_id", resolved_credentials.client_id),
     ];
-    if let Some(ref secret) = resolved_client_secret {
+    if let Some(ref secret) = resolved_credentials.client_secret {
         params.push(("client_secret", secret.clone()));
     }
 
@@ -4141,9 +4196,10 @@ mod tests {
             &config,
         );
         assert!(result.is_ok());
-        let (id, secret) = result.unwrap();
-        assert_eq!(id, "my-client-id");
-        assert_eq!(secret, Some("my-secret".to_string()));
+        let resolved = result.unwrap();
+        assert_eq!(resolved.client_id, "my-client-id");
+        assert_eq!(resolved.client_secret, Some("my-secret".to_string()));
+        assert_eq!(resolved.source, OAuthCredentialSource::Request);
     }
 
     #[test]
@@ -4151,10 +4207,11 @@ mod tests {
         let config = AppConfig::test_default();
         let result = resolve_client_credentials(&Some("my-client-id".into()), &None, &config);
         assert!(result.is_ok());
-        let (id, secret) = result.unwrap();
-        assert_eq!(id, "my-client-id");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.client_id, "my-client-id");
         // Non-platform client_id with no secret → no secret injected
-        assert_eq!(secret, None);
+        assert_eq!(resolved.client_secret, None);
+        assert_eq!(resolved.source, OAuthCredentialSource::Request);
     }
 
     #[test]
@@ -4169,13 +4226,14 @@ mod tests {
         // → compose-api should inject the platform secret
         let result = resolve_client_credentials(&Some("web-app-id-123".into()), &None, &config);
         assert!(result.is_ok());
-        let (id, secret) = result.unwrap();
-        assert_eq!(id, "web-app-id-123");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.client_id, "web-app-id-123");
         assert_eq!(
-            secret,
+            resolved.client_secret,
             Some("web-app-secret-xyz".to_string()),
             "platform secret must be injected when client_id matches"
         );
+        assert_eq!(resolved.source, OAuthCredentialSource::Platform);
     }
 
     #[test]
@@ -4189,12 +4247,13 @@ mod tests {
         // client_id does NOT match platform → no secret injected
         let result = resolve_client_credentials(&Some("notion-dcr-abc".into()), &None, &config);
         assert!(result.is_ok());
-        let (id, secret) = result.unwrap();
-        assert_eq!(id, "notion-dcr-abc");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.client_id, "notion-dcr-abc");
         assert_eq!(
-            secret, None,
+            resolved.client_secret, None,
             "must NOT inject platform secret for non-matching client_id"
         );
+        assert_eq!(resolved.source, OAuthCredentialSource::Request);
     }
 
     #[test]
@@ -4205,9 +4264,10 @@ mod tests {
             Some(secrecy::SecretString::from("google-secret".to_string()));
         let result = resolve_client_credentials(&None, &None, &config);
         assert!(result.is_ok());
-        let (id, secret) = result.unwrap();
-        assert_eq!(id, "google-id");
-        assert_eq!(secret, Some("google-secret".to_string()));
+        let resolved = result.unwrap();
+        assert_eq!(resolved.client_id, "google-id");
+        assert_eq!(resolved.client_secret, Some("google-secret".to_string()));
+        assert_eq!(resolved.source, OAuthCredentialSource::Platform);
     }
 
     #[test]
@@ -4225,8 +4285,9 @@ mod tests {
             Some(secrecy::SecretString::from("google-secret".to_string()));
         let result = resolve_client_credentials(&Some("".to_string()), &None, &config);
         assert!(result.is_ok());
-        let (id, _) = result.unwrap();
-        assert_eq!(id, "google-id");
+        let resolved = result.unwrap();
+        assert_eq!(resolved.client_id, "google-id");
+        assert_eq!(resolved.source, OAuthCredentialSource::Platform);
     }
 
     // ── oauth_callback_router integration ───────────────────────────
@@ -4630,20 +4691,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_exchange_google_backward_compat_uses_platform_creds() {
+    async fn test_exchange_rejects_custom_token_url_for_platform_creds() {
         use axum::body::Body;
         use tower::ServiceExt;
 
-        let (mock_url, _shutdown, captured) = start_mock_token_server(serde_json::json!({
+        let (mock_url, _shutdown, _captured) = start_mock_token_server(serde_json::json!({
             "access_token": "google-token",
             "refresh_token": "google-refresh",
             "expires_in": 3600
         }))
         .await;
 
-        // Point the handler to our mock by providing token_url (since we can't override
-        // the GOOGLE_TOKEN_ENDPOINT const, we still provide token_url but rely on
-        // platform creds being used when no client_id is in the request)
         let token_url = format!("{}/token", mock_url);
         let (app, instance_token) = test_exchange_app(
             Some("example.com"),
@@ -4651,7 +4709,6 @@ mod tests {
             Some("google-platform-secret"),
         );
 
-        // Google extension: no client_id in request → uses platform creds
         let body = serde_urlencoded::to_string([
             ("code", "GOOGLE_AUTH_CODE"),
             ("redirect_uri", "https://auth.example.com/oauth/callback"),
@@ -4668,20 +4725,7 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let params = captured.lock().await;
-        let params = params.as_ref().expect("mock should have captured params");
-        assert_eq!(
-            params.get("client_id").unwrap(),
-            "google-platform-id",
-            "should use platform Google client_id"
-        );
-        assert_eq!(
-            params.get("client_secret").unwrap(),
-            "google-platform-secret",
-            "should use platform Google client_secret"
-        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -4699,7 +4743,7 @@ mod tests {
         let body = serde_urlencoded::to_string([
             ("code", "CODE"),
             ("redirect_uri", "https://evil.com/callback"),
-            ("token_url", "https://accounts.google.com/token"),
+            ("token_url", GOOGLE_TOKEN_ENDPOINT),
         ])
         .unwrap();
 
@@ -4902,11 +4946,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_exchange_google_web_app_injects_platform_secret() {
+    async fn test_exchange_rejects_custom_token_url_when_platform_secret_would_be_injected() {
         use axum::body::Body;
         use tower::ServiceExt;
 
-        let (mock_url, _shutdown, captured) = start_mock_token_server(serde_json::json!({
+        let (mock_url, _shutdown, _captured) = start_mock_token_server(serde_json::json!({
             "access_token": "google-web-token",
             "refresh_token": "google-web-refresh",
             "expires_in": 3600
@@ -4914,16 +4958,12 @@ mod tests {
         .await;
 
         let token_url = format!("{}/token", mock_url);
-        // Configure platform with web-app Google creds
         let (app, instance_token) = test_exchange_app(
             Some("example.com"),
             Some("web-app-id-123"),
             Some("web-app-secret-xyz"),
         );
 
-        // IronClaw sends client_id (web-app, from env) but NO client_secret
-        // (suppressed because built-in desktop secret doesn't match web-app).
-        // compose-api should recognize client_id matches platform and inject secret.
         let body = serde_urlencoded::to_string([
             ("code", "GOOGLE_CODE"),
             ("redirect_uri", "https://auth.example.com/oauth/callback"),
@@ -4941,16 +4981,7 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let params = captured.lock().await;
-        let params = params.as_ref().expect("mock should have captured params");
-        assert_eq!(params.get("client_id").unwrap(), "web-app-id-123");
-        assert_eq!(
-            params.get("client_secret").unwrap(),
-            "web-app-secret-xyz",
-            "platform web-app secret must be injected when client_id matches"
-        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -5070,6 +5101,43 @@ mod tests {
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_rejects_custom_token_url_for_platform_creds() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (mock_url, _shutdown, _captured) = start_mock_token_server(serde_json::json!({
+            "access_token": "refreshed-token",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let token_url = format!("{}/token", mock_url);
+        let (app, instance_token) = test_exchange_app(
+            Some("example.com"),
+            Some("google-platform-id"),
+            Some("google-platform-secret"),
+        );
+
+        let body = serde_urlencoded::to_string([
+            ("provider", "google"),
+            ("refresh_token", "REFRESH_TOKEN"),
+            ("token_url", &token_url),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/refresh")
             .header("Authorization", format!("Bearer {}", instance_token))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(Body::from(body))
