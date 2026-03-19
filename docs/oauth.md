@@ -147,13 +147,16 @@ Generic providers (MCP, etc.) can send their own credentials in the exchange req
 
 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  ENV VARS (set by ironclaw-worker/entrypoint.sh)                               │
+│  ENV VARS IN THE WORKER CONTAINER                                              │
 │                                                                                │
+│  Set by ironclaw-worker/entrypoint.sh:                                         │
 │  IRONCLAW_OAUTH_CALLBACK_URL = https://auth.DOMAIN                             │
 │  IRONCLAW_INSTANCE_NAME      = alice          (from OPENCLAW_INSTANCE_NAME)    │
+│  GATEWAY_AUTH_TOKEN          = <random hex>   (for exchange proxy auth)        │
+│                                                                                │
+│  Injected by compose-api when available:                                       │
 │  GOOGLE_OAUTH_CLIENT_ID      = 637554...      (public, for auth URL)           │
 │  IRONCLAW_OAUTH_EXCHANGE_URL = http://host.docker.internal:8080                │
-│  GATEWAY_AUTH_TOKEN           = <random hex>   (for exchange proxy auth)        │
 │                                                                                │
 │  NOT in container:                                                             │
 │  GOOGLE_OAUTH_CLIENT_SECRET  — stays on compose-api only                       │
