@@ -1,19 +1,24 @@
 use axum::{
-    extract::{Form, FromRequestParts, Path, Query, State},
+    extract::{Form, FromRequestParts, Path, Query, RawQuery, State},
     http::{request::Parts, StatusCode},
     response::{
         sse::{Event, Sse},
-        IntoResponse,
+        IntoResponse, Redirect,
     },
     routing::{delete, get, post, put},
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -60,6 +65,7 @@ use store::{Instance, InstanceStore, PortRange};
         delete_config_key,
         restart_management_service,
         get_services_status,
+        oauth_callback_router,
         oauth_exchange,
         oauth_refresh,
     ),
@@ -109,6 +115,7 @@ const ADMIN_TOKEN_HEX_LEN: usize = 32;
 
 /// Max workspace export size (512 MB). Protects against OOM during upgrades.
 const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
+const HOSTED_STATE_CHECKSUM_BYTES: usize = 12;
 
 #[derive(Clone)]
 struct AppState {
@@ -119,11 +126,14 @@ struct AppState {
     /// Per-instance lock to prevent concurrent upgrades.
     upgrading: Arc<Mutex<HashSet<String>>>,
     /// URL exposed to ironclaw containers for them to proxy OAuth token exchanges through this service
-    /// (e.g. "http://host.docker.internal:8080/oauth"). Set when both GOOGLE_OAUTH_CLIENT_ID and
-    /// GOOGLE_OAUTH_CLIENT_SECRET are configured.
+    /// (e.g. "http://host.docker.internal:8080"). Always set when the service is running — generic
+    /// OAuth providers send their own credentials, so this is not gated on Google creds.
     oauth_exchange_url: Option<String>,
     /// Shared HTTP client for outgoing requests (OAuth token exchange).
     http_client: reqwest::Client,
+    #[cfg(test)]
+    /// Test-only escape hatch for local mock token endpoints.
+    allow_private_oauth_token_endpoints: bool,
 }
 
 struct AppConfig {
@@ -429,32 +439,341 @@ impl FromRequestParts<AppState> for InstanceAuth {
 
 // ── OAuth token exchange proxy ───────────────────────────────────────
 
-/// Google's token endpoint URL.
+/// Google's token endpoint URL (used as fallback when no token_url is provided).
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
 fn default_provider_google() -> String {
     "google".into()
 }
 
+#[derive(Deserialize)]
+struct HostedOAuthStatePayload {
+    #[serde(default)]
+    instance_name: Option<String>,
+}
+
+fn hosted_state_checksum(payload_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(payload_bytes);
+    URL_SAFE_NO_PAD.encode(&digest[..HOSTED_STATE_CHECKSUM_BYTES])
+}
+
+/// Extract the instance name from an OAuth state parameter.
+///
+/// Supports two formats:
+/// - **New (ic2):** `ic2.{base64_payload}.{checksum}` where payload is JSON containing `instance_name`
+/// - **Legacy:** `instance:nonce` where instance is a DNS label before the first colon
+fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
+    // Try new ic2 format: ic2.{base64_payload}.{checksum}
+    if let Some(rest) = state.strip_prefix("ic2.") {
+        if let Some((payload_b64, checksum)) = rest.rsplit_once('.') {
+            if let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload_b64) {
+                let expected_checksum = hosted_state_checksum(&payload_bytes);
+                if checksum != expected_checksum {
+                    return Err(ApiError::BadRequest(
+                        "Hosted OAuth state checksum mismatch".into(),
+                    ));
+                }
+                if let Ok(payload) =
+                    serde_json::from_slice::<HostedOAuthStatePayload>(&payload_bytes)
+                {
+                    if let Some(instance) = payload.instance_name.filter(|s| !s.is_empty()) {
+                        return Ok(instance);
+                    }
+                }
+            }
+        }
+    }
+
+    // Legacy: instance:nonce
+    if let Some((instance, nonce)) = state.split_once(':') {
+        if !instance.is_empty() && !nonce.is_empty() {
+            return Ok(instance.to_string());
+        }
+    }
+
+    Err(ApiError::BadRequest(
+        "Could not extract instance name from state parameter".into(),
+    ))
+}
+
+/// Route OAuth callbacks to the correct IronClaw instance.
+///
+/// OAuth providers redirect to `https://auth.DOMAIN/oauth/callback?code=...&state=...`.
+/// This handler decodes the state parameter to extract the instance name, then
+/// 302-redirects to `https://{instance}.DOMAIN/oauth/callback?...` preserving all
+/// query parameters.
+#[utoipa::path(
+    get,
+    path = "/oauth/callback",
+    tag = "OAuth",
+    security(),
+    params(
+        ("state" = String, Query, description = "OAuth state parameter containing instance routing info"),
+        ("code" = Option<String>, Query, description = "Authorization code from the OAuth provider"),
+    ),
+    responses(
+        (status = 302, description = "Redirect to the correct instance"),
+        (status = 400, description = "Missing or invalid state parameter"),
+        (status = 500, description = "Platform domain not configured"),
+    )
+)]
+async fn oauth_callback_router(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<impl IntoResponse, ApiError> {
+    let state_param = params
+        .get("state")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("OAuth callback missing state parameter".into()))?;
+
+    let instance_name = extract_instance_from_state(state_param)?;
+
+    // Validate instance name is a safe DNS label (alphanumeric + hyphens)
+    if !instance_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(ApiError::BadRequest(
+            "Invalid instance name extracted from state parameter".into(),
+        ));
+    }
+
+    let domain = state.config.openclaw_domain.as_deref().ok_or_else(|| {
+        ApiError::Internal(
+            "OPENCLAW_DOMAIN not configured; OAuth callback routing unavailable".into(),
+        )
+    })?;
+
+    // Forward the raw query string as-is to preserve original encoding
+    let query_string = raw_query.unwrap_or_default();
+
+    let redirect_url = format!(
+        "https://{}.{}/oauth/callback?{}",
+        instance_name, domain, query_string
+    );
+
+    tracing::info!(
+        instance = %instance_name,
+        "OAuth callback routing to instance"
+    );
+
+    Ok(Redirect::temporary(&redirect_url))
+}
+
+/// Schema-only struct for OpenAPI documentation.
+/// The actual handler uses `Form<HashMap<String, String>>` to capture and forward
+/// extra provider-specific params (e.g., RFC 8707 `resource`) to the token endpoint.
 #[derive(Deserialize, utoipa::ToSchema)]
+#[allow(dead_code)]
 struct OAuthExchangeRequest {
+    /// Provider hint (e.g., "google"). Defaults to "google" for backward compatibility.
     #[serde(default = "default_provider_google")]
     provider: String,
+    /// Authorization code from the OAuth provider.
     code: String,
+    /// The redirect_uri used in the authorization request.
     redirect_uri: String,
+    /// PKCE code verifier (optional).
     #[serde(default)]
     code_verifier: Option<String>,
+    /// Provider's token endpoint URL. If not provided, falls back to built-in
+    /// endpoint for known providers (currently only Google).
+    #[serde(default)]
+    token_url: Option<String>,
+    /// OAuth client ID. If not provided, uses platform credentials for the provider.
+    #[serde(default)]
+    client_id: Option<String>,
+    /// OAuth client secret. If not provided, uses platform credentials for the provider.
+    #[serde(default)]
+    client_secret: Option<String>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
 struct OAuthRefreshRequest {
+    /// Provider hint (e.g., "google"). Defaults to "google" for backward compatibility.
     #[serde(default = "default_provider_google")]
     provider: String,
+    /// The refresh token to exchange for a new access token.
     refresh_token: String,
+    /// Provider's token endpoint URL. If not provided, falls back to built-in endpoint.
+    #[serde(default)]
+    token_url: Option<String>,
+    /// OAuth client ID. If not provided, uses platform credentials for the provider.
+    #[serde(default)]
+    client_id: Option<String>,
+    /// OAuth client secret. If not provided, uses platform credentials for the provider.
+    #[serde(default)]
+    client_secret: Option<String>,
+}
+
+/// Resolve the token endpoint URL from the request or built-in defaults.
+fn resolve_token_endpoint(token_url: &Option<String>, provider: &str) -> Result<String, ApiError> {
+    if let Some(url) = token_url {
+        if !url.is_empty() {
+            return Ok(url.clone());
+        }
+    }
+    if provider == "google" {
+        return Ok(GOOGLE_TOKEN_ENDPOINT.to_string());
+    }
+    Err(ApiError::BadRequest(format!(
+        "No token_url provided and provider '{}' has no built-in endpoint",
+        provider
+    )))
+}
+
+fn oauth_exchange_allows_private_token_endpoints(state: &AppState) -> bool {
+    #[cfg(test)]
+    {
+        state.allow_private_oauth_token_endpoints
+    }
+    #[cfg(not(test))]
+    {
+        let _ = state;
+        false
+    }
+}
+
+fn is_disallowed_oauth_endpoint_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+        }
+    }
+}
+
+async fn validate_token_endpoint_url(
+    token_url: &str,
+    allow_private: bool,
+) -> Result<String, ApiError> {
+    let parsed = reqwest::Url::parse(token_url)
+        .map_err(|_| ApiError::BadRequest("token_url must be a valid URL".into()))?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" if allow_private => {}
+        _ => {
+            return Err(ApiError::BadRequest("token_url must use https".into()));
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ApiError::BadRequest(
+            "token_url must not include embedded credentials".into(),
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(ApiError::BadRequest(
+            "token_url must not include a fragment".into(),
+        ));
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ApiError::BadRequest("token_url must include a host".into()))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| ApiError::BadRequest("token_url must include a known port".into()))?;
+
+    if allow_private {
+        return Ok(parsed.to_string());
+    }
+
+    let mut resolved_any = false;
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| ApiError::BadRequest("token_url host could not be resolved".into()))?;
+    for addr in resolved {
+        resolved_any = true;
+        if is_disallowed_oauth_endpoint_ip(addr.ip()) {
+            return Err(ApiError::BadRequest(
+                "token_url must not resolve to loopback, private, link-local, or multicast addresses"
+                    .into(),
+            ));
+        }
+    }
+    if !resolved_any {
+        return Err(ApiError::BadRequest(
+            "token_url host did not resolve to any address".into(),
+        ));
+    }
+
+    Ok(parsed.to_string())
+}
+
+/// Resolve OAuth client credentials from the request or platform config.
+///
+/// When a `client_id` is provided without a `client_secret`, and it matches
+/// the platform's Google OAuth client_id, the platform secret is injected.
+/// This handles the case where IronClaw containers receive the web-app
+/// `GOOGLE_OAUTH_CLIENT_ID` via env but deliberately omit the secret (which
+/// stays on compose-api).
+fn resolve_client_credentials(
+    req_client_id: &Option<String>,
+    req_client_secret: &Option<String>,
+    config: &AppConfig,
+) -> Result<(String, Option<String>), ApiError> {
+    match (req_client_id, req_client_secret) {
+        // Request provides both client_id and client_secret — use them directly
+        (Some(id), Some(secret)) if !id.is_empty() => Ok((id.clone(), Some(secret.clone()))),
+        // Request provides client_id but no secret — check if it matches the
+        // platform's Google client_id and inject the platform secret if so.
+        (Some(id), None) if !id.is_empty() => {
+            use secrecy::ExposeSecret;
+            let platform_secret = config
+                .google_oauth_client_id
+                .as_deref()
+                .filter(|platform_id| *platform_id == id.as_str())
+                .and_then(|_| {
+                    config
+                        .google_oauth_client_secret
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string())
+                });
+            Ok((id.clone(), platform_secret))
+        }
+        // No client creds in request — fall back to platform Google creds
+        _ => {
+            let id = config
+                .google_oauth_client_id
+                .as_deref()
+                .ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "No client_id provided and no platform credentials configured".into(),
+                    )
+                })?
+                .to_string();
+            use secrecy::ExposeSecret;
+            let secret = config
+                .google_oauth_client_secret
+                .as_ref()
+                .map(|s| s.expose_secret().to_string());
+            Ok((id, secret))
+        }
+    }
 }
 
 /// Exchange an authorization code for tokens via the provider's token endpoint.
-/// The client secret stays on the platform — containers never see it.
+///
+/// Supports two modes:
+/// - **Platform credentials:** Container sends only `code` + `redirect_uri`; compose-api
+///   adds Google client credentials from env vars. Used for Google OAuth extensions.
+/// - **Request credentials:** Container sends `token_url`, `client_id`, and optionally
+///   `client_secret`. Used for MCP OAuth and other generic providers.
 #[utoipa::path(
     post,
     path = "/oauth/exchange",
@@ -471,101 +790,121 @@ struct OAuthRefreshRequest {
 async fn oauth_exchange(
     auth: InstanceAuth,
     State(state): State<AppState>,
-    Form(req): Form<OAuthExchangeRequest>,
+    Form(mut form): Form<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if req.provider != "google" {
-        return Err(ApiError::BadRequest(format!(
-            "Unsupported OAuth provider: {}. Only 'google' is supported.",
-            req.provider
-        )));
-    }
+    // Extract known fields from the form data.
+    // Any remaining fields (e.g., RFC 8707 `resource`) are forwarded to the token endpoint.
+    let provider = form
+        .remove("provider")
+        .unwrap_or_else(default_provider_google);
+    let code = form
+        .remove("code")
+        .ok_or_else(|| ApiError::BadRequest("Missing required field: code".into()))?;
+    let redirect_uri = form
+        .remove("redirect_uri")
+        .ok_or_else(|| ApiError::BadRequest("Missing required field: redirect_uri".into()))?;
+    let code_verifier = form.remove("code_verifier");
+    let token_url = form.remove("token_url");
+    let req_client_id = form.remove("client_id");
+    let req_client_secret = form.remove("client_secret");
 
-    // Validate redirect_uri belongs to the platform's auth domain.
-    // Prevents a compromised container from exchanging codes destined for other instances.
-    // Fail closed: if OPENCLAW_DOMAIN is not configured, reject the request.
-    match &state.config.openclaw_domain {
-        Some(domain) => {
-            let expected_prefix = format!("https://auth.{}/", domain);
-            if !req.redirect_uri.starts_with(&expected_prefix) {
-                tracing::warn!(
-                    instance = %auth.instance_name,
-                    redirect_uri = %req.redirect_uri,
-                    "OAuth exchange rejected: redirect_uri does not match platform domain"
-                );
-                return Err(ApiError::BadRequest(format!(
-                    "redirect_uri must start with https://auth.{}/",
-                    domain
-                )));
+    // Remove fields that are only meaningful to compose-api, not the token endpoint.
+    form.remove("access_token_field");
+
+    let token_endpoint = resolve_token_endpoint(&token_url, &provider)?;
+    let token_endpoint = validate_token_endpoint_url(
+        &token_endpoint,
+        oauth_exchange_allows_private_token_endpoints(&state),
+    )
+    .await?;
+
+    let (resolved_client_id, resolved_client_secret) =
+        resolve_client_credentials(&req_client_id, &req_client_secret, &state.config)?;
+
+    // Platform creds are in use when: no client_id was provided (full fallback),
+    // or client_id matches the platform's Google app and compose-api injected its secret.
+    let uses_platform_creds = req_client_id.is_none()
+        || (req_client_secret.is_none()
+            && state
+                .config
+                .google_oauth_client_id
+                .as_deref()
+                .is_some_and(|pid| Some(pid) == req_client_id.as_deref()));
+
+    // When using platform credentials, validate redirect_uri belongs to the platform domain.
+    // This prevents a compromised container from exchanging codes destined for other instances.
+    // When the container provides its own credentials (MCP/generic), skip this check —
+    // the provider validates redirect_uri independently.
+    if uses_platform_creds {
+        match &state.config.openclaw_domain {
+            Some(domain) => {
+                let expected_prefix = format!("https://auth.{}/", domain);
+                if !redirect_uri.starts_with(&expected_prefix) {
+                    tracing::warn!(
+                        instance = %auth.instance_name,
+                        redirect_uri = %redirect_uri,
+                        "OAuth exchange rejected: redirect_uri does not match platform domain"
+                    );
+                    return Err(ApiError::BadRequest(format!(
+                        "redirect_uri must start with https://auth.{}/",
+                        domain
+                    )));
+                }
+            }
+            None => {
+                return Err(ApiError::Internal(
+                    "OPENCLAW_DOMAIN not configured; OAuth exchange with platform credentials is unavailable".into(),
+                ));
             }
         }
-        None => {
-            return Err(ApiError::Internal(
-                "OPENCLAW_DOMAIN not configured; OAuth exchange is unavailable".into(),
-            ));
-        }
     }
 
-    let client_id = state
-        .config
-        .google_oauth_client_id
-        .as_deref()
-        .ok_or_else(|| {
-            ApiError::Internal("GOOGLE_OAUTH_CLIENT_ID not configured on this platform".into())
-        })?;
-
-    use secrecy::ExposeSecret;
-    let secret_ref = state
-        .config
-        .google_oauth_client_secret
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::Internal("GOOGLE_OAUTH_CLIENT_SECRET not configured on this platform".into())
-        })?;
-    let client_secret: &str = secret_ref.expose_secret();
-
-    let mut params = vec![
-        ("grant_type", "authorization_code"),
-        ("code", &req.code),
-        ("redirect_uri", &req.redirect_uri),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
+    let mut params: Vec<(String, String)> = vec![
+        ("grant_type".into(), "authorization_code".into()),
+        ("code".into(), code),
+        ("redirect_uri".into(), redirect_uri),
+        ("client_id".into(), resolved_client_id),
     ];
-
-    let code_verifier_val;
-    if let Some(ref cv) = req.code_verifier {
-        code_verifier_val = cv.clone();
-        params.push(("code_verifier", &code_verifier_val));
+    if let Some(secret) = resolved_client_secret {
+        params.push(("client_secret".into(), secret));
+    }
+    if let Some(cv) = code_verifier {
+        params.push(("code_verifier".into(), cv));
+    }
+    // Forward any remaining form fields (e.g., RFC 8707 `resource`) to the token endpoint.
+    for (key, value) in &form {
+        params.push((key.clone(), value.clone()));
     }
 
     let response = state
         .http_client
-        .post(GOOGLE_TOKEN_ENDPOINT)
+        .post(&token_endpoint)
         .form(&params)
         .send()
         .await
         .map_err(|e| {
-            ApiError::Internal(format!("Failed to contact Google token endpoint: {}", e))
+            ApiError::Internal(format!(
+                "Failed to contact token endpoint {}: {}",
+                token_endpoint, e
+            ))
         })?;
 
     let status = response.status();
     let body: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to parse Google response: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to parse token response: {}", e)))?;
 
     if !status.is_success() {
         tracing::warn!(
-            "Google token exchange failed ({}): error={} description={}",
-            status,
-            body.get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown"),
-            body.get("error_description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            provider = %provider,
+            status = %status,
+            error = %body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            description = %body.get("error_description").and_then(|v| v.as_str()).unwrap_or(""),
+            "OAuth token exchange failed"
         );
         return Err(ApiError::BadGateway(format!(
-            "Google token exchange failed: {}",
+            "Token exchange failed: {}",
             body.get("error_description")
                 .or_else(|| body.get("error"))
                 .and_then(|v| v.as_str())
@@ -577,7 +916,10 @@ async fn oauth_exchange(
 }
 
 /// Refresh an access token using a refresh token.
-/// The client secret stays on the platform — containers never see it.
+///
+/// Supports the same two modes as `/oauth/exchange`:
+/// - Platform credentials (Google) when no `token_url`/`client_id` provided
+/// - Request credentials (generic/MCP) when `token_url` and `client_id` are in the request
 #[utoipa::path(
     post,
     path = "/oauth/refresh",
@@ -596,67 +938,53 @@ async fn oauth_refresh(
     State(state): State<AppState>,
     Form(req): Form<OAuthRefreshRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if req.provider != "google" {
-        return Err(ApiError::BadRequest(format!(
-            "Unsupported OAuth provider: {}. Only 'google' is supported.",
-            req.provider
-        )));
-    }
+    let token_endpoint = resolve_token_endpoint(&req.token_url, &req.provider)?;
+    let token_endpoint = validate_token_endpoint_url(
+        &token_endpoint,
+        oauth_exchange_allows_private_token_endpoints(&state),
+    )
+    .await?;
+    let (resolved_client_id, resolved_client_secret) =
+        resolve_client_credentials(&req.client_id, &req.client_secret, &state.config)?;
 
-    let client_id = state
-        .config
-        .google_oauth_client_id
-        .as_deref()
-        .ok_or_else(|| {
-            ApiError::Internal("GOOGLE_OAUTH_CLIENT_ID not configured on this platform".into())
-        })?;
-
-    use secrecy::ExposeSecret;
-    let secret_ref = state
-        .config
-        .google_oauth_client_secret
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::Internal("GOOGLE_OAUTH_CLIENT_SECRET not configured on this platform".into())
-        })?;
-    let client_secret: &str = secret_ref.expose_secret();
-
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", req.refresh_token.as_str()),
-        ("client_id", client_id),
-        ("client_secret", client_secret),
+    let mut params: Vec<(&str, String)> = vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", req.refresh_token.clone()),
+        ("client_id", resolved_client_id),
     ];
+    if let Some(ref secret) = resolved_client_secret {
+        params.push(("client_secret", secret.clone()));
+    }
 
     let response = state
         .http_client
-        .post(GOOGLE_TOKEN_ENDPOINT)
+        .post(&token_endpoint)
         .form(&params)
         .send()
         .await
         .map_err(|e| {
-            ApiError::Internal(format!("Failed to contact Google token endpoint: {}", e))
+            ApiError::Internal(format!(
+                "Failed to contact token endpoint {}: {}",
+                token_endpoint, e
+            ))
         })?;
 
     let status = response.status();
     let body: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to parse Google response: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to parse token response: {}", e)))?;
 
     if !status.is_success() {
         tracing::warn!(
-            "Google token refresh failed ({}): error={} description={}",
-            status,
-            body.get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown"),
-            body.get("error_description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            provider = %req.provider,
+            status = %status,
+            error = %body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"),
+            description = %body.get("error_description").and_then(|v| v.as_str()).unwrap_or(""),
+            "OAuth token refresh failed"
         );
         return Err(ApiError::BadGateway(format!(
-            "Google token refresh failed: {}",
+            "Token refresh failed: {}",
             body.get("error_description")
                 .or_else(|| body.get("error"))
                 .and_then(|v| v.as_str())
@@ -966,9 +1294,10 @@ async fn main() -> anyhow::Result<()> {
     )?);
 
     // Compute the internal OAuth exchange proxy URL for containers.
-    // Containers call this URL instead of Google directly, so the client_secret stays on the platform.
+    // Containers call this URL instead of providers directly, keeping client_secrets on the platform.
     // Uses host.docker.internal because ironclaw containers run on a Docker bridge network
     // and can't reach the host's 127.0.0.1. The compose template adds extra_hosts for this.
+    // Always available — generic OAuth providers send their own credentials in the exchange request.
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listen_port = match listen_addr.parse::<std::net::SocketAddr>() {
         Ok(addr) => addr.port().to_string(),
@@ -979,11 +1308,7 @@ async fn main() -> anyhow::Result<()> {
             .to_string(),
     };
     let oauth_exchange_url: Option<String> =
-        if config.google_oauth_client_id.is_some() && config.google_oauth_client_secret.is_some() {
-            Some(format!("http://host.docker.internal:{}", listen_port))
-        } else {
-            None
-        };
+        Some(format!("http://host.docker.internal:{}", listen_port));
 
     let port_range = PortRange::from_env();
     let mut instance_store = InstanceStore::new(port_range);
@@ -1036,6 +1361,8 @@ async fn main() -> anyhow::Result<()> {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client"),
+        #[cfg(test)]
+        allow_private_oauth_token_endpoints: false,
     };
 
     update_nginx_now(&state).await;
@@ -1068,13 +1395,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/services", get(get_services_status));
 
-    if state.config.google_oauth_client_id.is_some()
-        && state.config.google_oauth_client_secret.is_some()
-    {
-        app = app
-            .route("/oauth/exchange", post(oauth_exchange))
-            .route("/oauth/refresh", post(oauth_refresh));
-    }
+    // OAuth routes: callback router is public (no auth), exchange/refresh require instance auth.
+    // Always registered — generic providers send their own credentials in the request.
+    app = app
+        .route("/oauth/callback", get(oauth_callback_router))
+        .route("/oauth/exchange", post(oauth_exchange))
+        .route("/oauth/refresh", post(oauth_refresh));
 
     if state.backup.is_some() {
         app = app
@@ -2142,7 +2468,8 @@ async fn restart_instance(
                         .await;
                     state.upgrading.lock().await.remove(&name);
                     // Still run health polling for the rolled-back container
-                    poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx, None).await;
+                    poll_health_to_ready(&state, &name, inst.service_type.as_deref(), &tx, None)
+                        .await;
                     return;
                 }
 
@@ -2901,9 +3228,7 @@ struct ServicesStatusResponse {
         (status = 500, description = "Docker command failed", body = ErrorResponse),
     )
 )]
-async fn get_services_status(
-    _auth: AdminAuth,
-) -> Result<impl IntoResponse, ApiError> {
+async fn get_services_status(_auth: AdminAuth) -> Result<impl IntoResponse, ApiError> {
     let services = tokio::task::spawn_blocking(|| {
         let mut results = Vec::with_capacity(MANAGEMENT_SERVICES.len());
 
@@ -2942,7 +3267,11 @@ async fn get_services_status(
 
                 results.push(ServiceStatus {
                     service: svc.to_string(),
-                    container_id: if id_str.is_empty() { None } else { Some(id_str) },
+                    container_id: if id_str.is_empty() {
+                        None
+                    } else {
+                        Some(id_str)
+                    },
                     state,
                     status,
                 });
@@ -3534,5 +3863,1119 @@ mod tests {
     fn test_ct_eq_one_empty() {
         assert!(!constant_time_token_eq("", "notempty"));
         assert!(!constant_time_token_eq("notempty", ""));
+    }
+
+    // ── extract_instance_from_state ─────────────────────────────────
+
+    /// Build a valid ic2 state string for testing.
+    fn build_ic2_state(flow_id: &str, instance_name: Option<&str>) -> String {
+        let payload = serde_json::json!({
+            "flow_id": flow_id,
+            "instance_name": instance_name,
+            "issued_at": 1710000000u64,
+        });
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_bytes);
+        // Checksum: first 12 bytes of SHA256, base64url-encoded (matches IronClaw's format)
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&payload_bytes);
+        let checksum = URL_SAFE_NO_PAD.encode(&digest[..12]);
+        format!("ic2.{}.{}", payload_b64, checksum)
+    }
+
+    #[test]
+    fn test_extract_instance_ic2_format() {
+        let state = build_ic2_state("test-flow-id", Some("alice"));
+        let result = extract_instance_from_state(&state);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "alice");
+    }
+
+    #[test]
+    fn test_extract_instance_ic2_no_instance_name_falls_through() {
+        let state = build_ic2_state("test-flow-id", None);
+        let result = extract_instance_from_state(&state);
+        // No instance_name in payload, no legacy colon format → error
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_instance_ic2_empty_instance_name() {
+        let state = build_ic2_state("test-flow-id", Some(""));
+        let result = extract_instance_from_state(&state);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_instance_legacy_format() {
+        let result = extract_instance_from_state("alice:some-random-nonce");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "alice");
+    }
+
+    #[test]
+    fn test_extract_instance_legacy_with_hyphens() {
+        let result = extract_instance_from_state("brave-tiger:abc123");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "brave-tiger");
+    }
+
+    #[test]
+    fn test_extract_instance_legacy_empty_instance() {
+        let result = extract_instance_from_state(":some-nonce");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_instance_legacy_empty_nonce() {
+        let result = extract_instance_from_state("alice:");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_instance_no_colon_no_ic2() {
+        let result = extract_instance_from_state("justarandomnonce");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_instance_empty_string() {
+        let result = extract_instance_from_state("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_instance_ic2_invalid_base64() {
+        let result = extract_instance_from_state("ic2.!!!invalid!!!.checksum");
+        // Invalid base64 falls through to legacy check, no colon → error
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_instance_ic2_invalid_json() {
+        let garbage = URL_SAFE_NO_PAD.encode(b"not json at all");
+        let result = extract_instance_from_state(&format!("ic2.{}.fakechecksum", garbage));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_instance_ic2_bad_checksum_rejected() {
+        let state = build_ic2_state("test-flow-id", Some("alice"));
+        let tampered = format!("{state}broken");
+        let result = extract_instance_from_state(&tampered);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("checksum"));
+    }
+
+    // ── resolve_token_endpoint ──────────────────────────────────────
+
+    #[test]
+    fn test_resolve_token_endpoint_explicit_url() {
+        let url = Some("https://notion.so/oauth/token".to_string());
+        let result = resolve_token_endpoint(&url, "notion");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "https://notion.so/oauth/token");
+    }
+
+    #[test]
+    fn test_resolve_token_endpoint_google_fallback() {
+        let result = resolve_token_endpoint(&None, "google");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), GOOGLE_TOKEN_ENDPOINT);
+    }
+
+    #[test]
+    fn test_resolve_token_endpoint_unknown_provider_no_url() {
+        let result = resolve_token_endpoint(&None, "notion");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_token_endpoint_empty_url_falls_back() {
+        let result = resolve_token_endpoint(&Some("".to_string()), "google");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), GOOGLE_TOKEN_ENDPOINT);
+    }
+
+    #[test]
+    fn test_resolve_token_endpoint_empty_url_unknown_provider() {
+        let result = resolve_token_endpoint(&Some("".to_string()), "notion");
+        assert!(result.is_err());
+    }
+
+    // ── validate_token_endpoint_url ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_validate_token_endpoint_url_rejects_http_in_production_mode() {
+        let result = validate_token_endpoint_url("http://127.0.0.1:8080/token", false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_token_endpoint_url_rejects_loopback_https_in_production_mode() {
+        let result = validate_token_endpoint_url("https://127.0.0.1/token", false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_token_endpoint_url_rejects_embedded_credentials() {
+        let result =
+            validate_token_endpoint_url("https://user:pass@example.com/token", false).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_token_endpoint_url_allows_test_loopback_override() {
+        let result = validate_token_endpoint_url("http://127.0.0.1:8080/token", true).await;
+        assert!(result.is_ok());
+    }
+
+    // ── resolve_client_credentials ──────────────────────────────────
+
+    #[test]
+    fn test_resolve_creds_from_request() {
+        let config = AppConfig::test_default();
+        let result = resolve_client_credentials(
+            &Some("my-client-id".into()),
+            &Some("my-secret".into()),
+            &config,
+        );
+        assert!(result.is_ok());
+        let (id, secret) = result.unwrap();
+        assert_eq!(id, "my-client-id");
+        assert_eq!(secret, Some("my-secret".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_creds_from_request_id_only_non_platform() {
+        let config = AppConfig::test_default();
+        let result = resolve_client_credentials(&Some("my-client-id".into()), &None, &config);
+        assert!(result.is_ok());
+        let (id, secret) = result.unwrap();
+        assert_eq!(id, "my-client-id");
+        // Non-platform client_id with no secret → no secret injected
+        assert_eq!(secret, None);
+    }
+
+    #[test]
+    fn test_resolve_creds_injects_platform_secret_when_client_id_matches() {
+        let mut config = AppConfig::test_default();
+        config.google_oauth_client_id = Some("web-app-id-123".to_string());
+        config.google_oauth_client_secret = Some(secrecy::SecretString::from(
+            "web-app-secret-xyz".to_string(),
+        ));
+
+        // client_id matches platform Google client_id, no secret provided
+        // → compose-api should inject the platform secret
+        let result = resolve_client_credentials(&Some("web-app-id-123".into()), &None, &config);
+        assert!(result.is_ok());
+        let (id, secret) = result.unwrap();
+        assert_eq!(id, "web-app-id-123");
+        assert_eq!(
+            secret,
+            Some("web-app-secret-xyz".to_string()),
+            "platform secret must be injected when client_id matches"
+        );
+    }
+
+    #[test]
+    fn test_resolve_creds_does_not_inject_secret_for_non_matching_id() {
+        let mut config = AppConfig::test_default();
+        config.google_oauth_client_id = Some("web-app-id-123".to_string());
+        config.google_oauth_client_secret = Some(secrecy::SecretString::from(
+            "web-app-secret-xyz".to_string(),
+        ));
+
+        // client_id does NOT match platform → no secret injected
+        let result = resolve_client_credentials(&Some("notion-dcr-abc".into()), &None, &config);
+        assert!(result.is_ok());
+        let (id, secret) = result.unwrap();
+        assert_eq!(id, "notion-dcr-abc");
+        assert_eq!(
+            secret, None,
+            "must NOT inject platform secret for non-matching client_id"
+        );
+    }
+
+    #[test]
+    fn test_resolve_creds_fallback_to_google_platform() {
+        let mut config = AppConfig::test_default();
+        config.google_oauth_client_id = Some("google-id".to_string());
+        config.google_oauth_client_secret =
+            Some(secrecy::SecretString::from("google-secret".to_string()));
+        let result = resolve_client_credentials(&None, &None, &config);
+        assert!(result.is_ok());
+        let (id, secret) = result.unwrap();
+        assert_eq!(id, "google-id");
+        assert_eq!(secret, Some("google-secret".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_creds_no_request_no_platform() {
+        let config = AppConfig::test_default();
+        let result = resolve_client_credentials(&None, &None, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_creds_empty_client_id_falls_back() {
+        let mut config = AppConfig::test_default();
+        config.google_oauth_client_id = Some("google-id".to_string());
+        config.google_oauth_client_secret =
+            Some(secrecy::SecretString::from("google-secret".to_string()));
+        let result = resolve_client_credentials(&Some("".to_string()), &None, &config);
+        assert!(result.is_ok());
+        let (id, _) = result.unwrap();
+        assert_eq!(id, "google-id");
+    }
+
+    // ── oauth_callback_router integration ───────────────────────────
+
+    /// Build a minimal Router with just the callback route for testing.
+    fn test_oauth_app(domain: Option<&str>) -> Router {
+        let mut config = AppConfig::test_default();
+        config.openclaw_domain = domain.map(String::from);
+
+        let mut compose_files = std::collections::HashMap::new();
+        // ComposeManager requires an "openclaw" key in the compose files map.
+        compose_files.insert("openclaw".to_string(), config.compose_file.clone());
+        let compose = Arc::new(
+            ComposeManager::new(
+                compose_files,
+                std::path::PathBuf::from("/tmp/test-envs"),
+                None,
+            )
+            .unwrap(),
+        );
+        let state = AppState {
+            compose,
+            store: Arc::new(RwLock::new(
+                store::InstanceStore::new(PortRange::from_env()),
+            )),
+            config: Arc::new(config),
+            backup: None,
+            upgrading: Arc::new(Mutex::new(HashSet::new())),
+            oauth_exchange_url: None,
+            http_client: reqwest::Client::new(),
+            allow_private_oauth_token_endpoints: false,
+        };
+        Router::new()
+            .route("/oauth/callback", get(oauth_callback_router))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_callback_routes_ic2_state() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = build_ic2_state("flow123", Some("alice"));
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri(format!("/oauth/callback?code=AUTHCODE&state={}", state))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("https://alice.example.com/oauth/callback?"));
+        assert!(location.contains("code=AUTHCODE"));
+    }
+
+    #[tokio::test]
+    async fn test_callback_routes_legacy_state() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri("/oauth/callback?code=AUTHCODE&state=bob:nonce123")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("https://bob.example.com/oauth/callback?"));
+    }
+
+    #[tokio::test]
+    async fn test_callback_missing_state() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri("/oauth/callback?code=AUTHCODE")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_callback_no_domain_configured() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = test_oauth_app(None);
+        let request = axum::http::Request::builder()
+            .uri("/oauth/callback?code=AUTHCODE&state=alice:nonce")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_callback_unparseable_state() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri("/oauth/callback?code=AUTHCODE&state=justarandomnonce")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_callback_preserves_all_query_params() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = build_ic2_state("flow-xyz", Some("alice"));
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri(format!(
+                "/oauth/callback?code=AUTHCODE&state={}&extra=hello&scope=read",
+                state
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("https://alice.example.com/oauth/callback?"));
+        assert!(location.contains("code=AUTHCODE"));
+        assert!(location.contains("extra=hello"));
+        assert!(location.contains("scope=read"));
+        assert!(location.contains(&format!("state={}", state)));
+    }
+
+    #[tokio::test]
+    async fn test_callback_rejects_invalid_instance_name_chars() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        // Build a state with an instance name containing unsafe chars
+        let state = build_ic2_state("flow-xyz", Some("alice/../etc"));
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri(format!("/oauth/callback?code=X&state={}", state))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_callback_empty_state_param() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri("/oauth/callback?code=X&state=")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_callback_rejects_ic2_checksum_mismatch() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = format!("{}broken", build_ic2_state("flow-xyz", Some("alice")));
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri(format!("/oauth/callback?code=X&state={}", state))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── oauth_exchange E2E tests ────────────────────────────────────
+
+    /// Start a mock token endpoint that captures the received form params
+    /// and returns a configurable JSON response.
+    async fn start_mock_token_server(
+        response_json: serde_json::Value,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<Mutex<Option<HashMap<String, String>>>>,
+    ) {
+        let captured_params: Arc<Mutex<Option<HashMap<String, String>>>> =
+            Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured_params);
+        let response_clone = response_json.clone();
+
+        let mock_app = Router::new().route(
+            "/token",
+            post(move |Form(params): Form<HashMap<String, String>>| {
+                let captured = Arc::clone(&captured_clone);
+                let resp = response_clone.clone();
+                async move {
+                    *captured.lock().await = Some(params);
+                    Json(resp)
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app)
+                .with_graceful_shutdown(async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+
+        (
+            format!("http://127.0.0.1:{}", addr.port()),
+            shutdown_tx,
+            captured_params,
+        )
+    }
+
+    /// Build a full app with oauth exchange routes and an authenticated instance.
+    fn test_exchange_app_with_private_token_urls(
+        domain: Option<&str>,
+        google_client_id: Option<&str>,
+        google_client_secret: Option<&str>,
+        allow_private_oauth_token_endpoints: bool,
+    ) -> (Router, String) {
+        let mut config = AppConfig::test_default();
+        config.openclaw_domain = domain.map(String::from);
+        config.google_oauth_client_id = google_client_id.map(String::from);
+        config.google_oauth_client_secret =
+            google_client_secret.map(|s| secrecy::SecretString::from(s.to_string()));
+
+        let instance_token = "test-instance-token-1234";
+        let instance = Instance {
+            name: "alice".to_string(),
+            token: instance_token.to_string(),
+            gateway_port: 19001,
+            ssh_port: 19002,
+            created_at: chrono::Utc::now(),
+            ssh_pubkey: "ssh-ed25519 AAAA".to_string(),
+            nearai_api_key: "sk-test".to_string(),
+            nearai_api_url: None,
+            active: true,
+            image: None,
+            image_digest: None,
+            service_type: Some("openclaw".to_string()),
+            mem_limit: None,
+            cpus: None,
+            storage_size: None,
+        };
+
+        let mut compose_files = std::collections::HashMap::new();
+        compose_files.insert("openclaw".to_string(), config.compose_file.clone());
+        let compose = Arc::new(
+            ComposeManager::new(
+                compose_files,
+                std::path::PathBuf::from("/tmp/test-envs"),
+                None,
+            )
+            .unwrap(),
+        );
+
+        let mut instance_store = store::InstanceStore::new(PortRange::from_env());
+        instance_store.populate(vec![instance]);
+
+        let state = AppState {
+            compose,
+            store: Arc::new(RwLock::new(instance_store)),
+            config: Arc::new(config),
+            backup: None,
+            upgrading: Arc::new(Mutex::new(HashSet::new())),
+            oauth_exchange_url: None,
+            http_client: reqwest::Client::new(),
+            allow_private_oauth_token_endpoints,
+        };
+
+        let app = Router::new()
+            .route("/oauth/callback", get(oauth_callback_router))
+            .route("/oauth/exchange", post(oauth_exchange))
+            .route("/oauth/refresh", post(oauth_refresh))
+            .with_state(state);
+
+        (app, instance_token.to_string())
+    }
+
+    fn test_exchange_app(
+        domain: Option<&str>,
+        google_client_id: Option<&str>,
+        google_client_secret: Option<&str>,
+    ) -> (Router, String) {
+        test_exchange_app_with_private_token_urls(
+            domain,
+            google_client_id,
+            google_client_secret,
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_exchange_forwards_resource_param_to_token_endpoint() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (mock_url, _shutdown, captured) = start_mock_token_server(serde_json::json!({
+            "access_token": "notion-token-xyz",
+            "token_type": "bearer",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let token_url = format!("{}/token", mock_url);
+        let (app, instance_token) = test_exchange_app(Some("example.com"), None, None);
+
+        // Simulate IronClaw's exchange_via_proxy request for MCP Notion
+        let body = serde_urlencoded::to_string([
+            ("code", "AUTH_CODE_FROM_NOTION"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", &token_url),
+            ("client_id", "dcr-client-id-123"),
+            ("code_verifier", "pkce-verifier-abc"),
+            ("access_token_field", "access_token"),
+            ("resource", "https://mcp.notion.com/mcp"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify the mock token endpoint received the resource param
+        let params = captured.lock().await;
+        let params = params.as_ref().expect("mock should have captured params");
+        assert_eq!(params.get("grant_type").unwrap(), "authorization_code");
+        assert_eq!(params.get("code").unwrap(), "AUTH_CODE_FROM_NOTION");
+        assert_eq!(params.get("client_id").unwrap(), "dcr-client-id-123");
+        assert_eq!(params.get("code_verifier").unwrap(), "pkce-verifier-abc");
+        assert_eq!(
+            params.get("resource").unwrap(),
+            "https://mcp.notion.com/mcp",
+            "RFC 8707 resource param must be forwarded to token endpoint"
+        );
+        assert_eq!(
+            params.get("redirect_uri").unwrap(),
+            "https://auth.example.com/oauth/callback"
+        );
+        // compose-api should NOT forward these internal fields
+        assert!(
+            params.get("token_url").is_none(),
+            "token_url is for compose-api routing, not the token endpoint"
+        );
+        assert!(
+            params.get("access_token_field").is_none(),
+            "access_token_field is for compose-api, not the token endpoint"
+        );
+        assert!(
+            params.get("provider").is_none() || params.get("provider").unwrap() != "google",
+            "provider hint should not be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exchange_google_backward_compat_uses_platform_creds() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (mock_url, _shutdown, captured) = start_mock_token_server(serde_json::json!({
+            "access_token": "google-token",
+            "refresh_token": "google-refresh",
+            "expires_in": 3600
+        }))
+        .await;
+
+        // Point the handler to our mock by providing token_url (since we can't override
+        // the GOOGLE_TOKEN_ENDPOINT const, we still provide token_url but rely on
+        // platform creds being used when no client_id is in the request)
+        let token_url = format!("{}/token", mock_url);
+        let (app, instance_token) = test_exchange_app(
+            Some("example.com"),
+            Some("google-platform-id"),
+            Some("google-platform-secret"),
+        );
+
+        // Google extension: no client_id in request → uses platform creds
+        let body = serde_urlencoded::to_string([
+            ("code", "GOOGLE_AUTH_CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", &token_url),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let params = captured.lock().await;
+        let params = params.as_ref().expect("mock should have captured params");
+        assert_eq!(
+            params.get("client_id").unwrap(),
+            "google-platform-id",
+            "should use platform Google client_id"
+        );
+        assert_eq!(
+            params.get("client_secret").unwrap(),
+            "google-platform-secret",
+            "should use platform Google client_secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exchange_rejects_redirect_uri_mismatch_for_platform_creds() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (app, instance_token) = test_exchange_app(
+            Some("example.com"),
+            Some("google-id"),
+            Some("google-secret"),
+        );
+
+        // No client_id → platform creds → redirect_uri must match auth.example.com
+        let body = serde_urlencoded::to_string([
+            ("code", "CODE"),
+            ("redirect_uri", "https://evil.com/callback"),
+            ("token_url", "https://accounts.google.com/token"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_exchange_skips_redirect_uri_check_for_mcp_creds() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (mock_url, _shutdown, _captured) = start_mock_token_server(serde_json::json!({
+            "access_token": "mcp-token",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let token_url = format!("{}/token", mock_url);
+        let (app, instance_token) = test_exchange_app(Some("example.com"), None, None);
+
+        // MCP: provides client_id → redirect_uri validation is skipped
+        let body = serde_urlencoded::to_string([
+            ("code", "MCP_CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", &token_url),
+            ("client_id", "mcp-dcr-id"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_exchange_missing_code_returns_400() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (app, instance_token) = test_exchange_app(Some("example.com"), None, None);
+
+        let body = serde_urlencoded::to_string([
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", "https://api.notion.com/v1/oauth/token"),
+            ("client_id", "some-id"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_exchange_no_auth_returns_401() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (app, _token) = test_exchange_app(Some("example.com"), None, None);
+
+        let body =
+            serde_urlencoded::to_string([("code", "CODE"), ("redirect_uri", "https://x.com/cb")])
+                .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_exchange_no_token_url_no_platform_creds_returns_400() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (app, instance_token) = test_exchange_app(Some("example.com"), None, None);
+
+        // No token_url + no platform creds + provider defaults to "google" but
+        // we'd hit the Google endpoint (which would fail), but since no client_id
+        // is provided and no platform creds exist, should fail before reaching endpoint
+        let body = serde_urlencoded::to_string([
+            ("code", "CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        // Should fail because no client_id provided and no platform creds configured
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_exchange_unknown_provider_without_token_url_returns_400() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (app, instance_token) = test_exchange_app(Some("example.com"), None, None);
+
+        let body = serde_urlencoded::to_string([
+            ("provider", "notion"),
+            ("code", "CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("client_id", "some-id"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_exchange_token_endpoint_error_returns_502() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        // Start a mock that returns an error
+        let error_app = Router::new().route(
+            "/token",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_grant",
+                        "error_description": "The authorization code has expired"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, error_app).await.ok();
+        });
+
+        let token_url = format!("http://127.0.0.1:{}/token", addr.port());
+        let (app, instance_token) = test_exchange_app(Some("example.com"), None, None);
+
+        let body = serde_urlencoded::to_string([
+            ("code", "EXPIRED_CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", &token_url),
+            ("client_id", "test-id"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_exchange_google_web_app_injects_platform_secret() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (mock_url, _shutdown, captured) = start_mock_token_server(serde_json::json!({
+            "access_token": "google-web-token",
+            "refresh_token": "google-web-refresh",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let token_url = format!("{}/token", mock_url);
+        // Configure platform with web-app Google creds
+        let (app, instance_token) = test_exchange_app(
+            Some("example.com"),
+            Some("web-app-id-123"),
+            Some("web-app-secret-xyz"),
+        );
+
+        // IronClaw sends client_id (web-app, from env) but NO client_secret
+        // (suppressed because built-in desktop secret doesn't match web-app).
+        // compose-api should recognize client_id matches platform and inject secret.
+        let body = serde_urlencoded::to_string([
+            ("code", "GOOGLE_CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", &token_url),
+            ("client_id", "web-app-id-123"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let params = captured.lock().await;
+        let params = params.as_ref().expect("mock should have captured params");
+        assert_eq!(params.get("client_id").unwrap(), "web-app-id-123");
+        assert_eq!(
+            params.get("client_secret").unwrap(),
+            "web-app-secret-xyz",
+            "platform web-app secret must be injected when client_id matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exchange_mcp_dcr_no_secret_injected() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (mock_url, _shutdown, captured) = start_mock_token_server(serde_json::json!({
+            "access_token": "notion-token",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let token_url = format!("{}/token", mock_url);
+        // Platform has Google creds, but MCP uses a different client_id
+        let (app, instance_token) = test_exchange_app(
+            Some("example.com"),
+            Some("web-app-id-123"),
+            Some("web-app-secret-xyz"),
+        );
+
+        // MCP DCR: client_id is from Notion DCR, doesn't match platform Google
+        let body = serde_urlencoded::to_string([
+            ("code", "NOTION_CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", &token_url),
+            ("client_id", "notion-dcr-abc123"),
+            ("code_verifier", "pkce-verifier"),
+            ("resource", "https://mcp.notion.com/mcp"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let params = captured.lock().await;
+        let params = params.as_ref().unwrap();
+        assert_eq!(params.get("client_id").unwrap(), "notion-dcr-abc123");
+        assert!(
+            params.get("client_secret").is_none(),
+            "must NOT inject platform secret for non-matching MCP client_id"
+        );
+        assert_eq!(
+            params.get("resource").unwrap(),
+            "https://mcp.notion.com/mcp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exchange_multiple_extra_params_forwarded() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (mock_url, _shutdown, captured) = start_mock_token_server(serde_json::json!({
+            "access_token": "tok",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let token_url = format!("{}/token", mock_url);
+        let (app, instance_token) = test_exchange_app(Some("example.com"), None, None);
+
+        let body = serde_urlencoded::to_string([
+            ("code", "CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", &token_url),
+            ("client_id", "id"),
+            ("resource", "https://mcp.example.com/v1"),
+            ("audience", "https://api.example.com"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let params = captured.lock().await;
+        let params = params.as_ref().unwrap();
+        assert_eq!(
+            params.get("resource").unwrap(),
+            "https://mcp.example.com/v1"
+        );
+        assert_eq!(params.get("audience").unwrap(), "https://api.example.com");
+    }
+
+    #[tokio::test]
+    async fn test_exchange_rejects_private_token_url_by_default() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (app, instance_token) =
+            test_exchange_app_with_private_token_urls(Some("example.com"), None, None, false);
+
+        let body = serde_urlencoded::to_string([
+            ("code", "CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", "http://127.0.0.1:8080/token"),
+            ("client_id", "mcp-dcr-id"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
