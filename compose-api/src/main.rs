@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Form, FromRequestParts, Path, Query, RawQuery, State},
+    extract::{Form, FromRequestParts, Path, Query, RawForm, RawQuery, State},
     http::{request::Parts, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -13,7 +13,7 @@ use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -463,6 +463,35 @@ fn hosted_state_checksum(payload_bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(&digest[..HOSTED_STATE_CHECKSUM_BYTES])
 }
 
+type ParamsList = Vec<(String, String)>;
+
+fn parse_urlencoded_pairs(input: &[u8]) -> Result<ParamsList, ApiError> {
+    serde_urlencoded::from_bytes(input)
+        .map_err(|_| ApiError::BadRequest("Invalid form or query encoding".into()))
+}
+
+fn extract_required_param(params: &mut ParamsList, key: &str) -> Result<String, ApiError> {
+    extract_optional_param(params, key)?
+        .ok_or_else(|| ApiError::BadRequest(format!("Missing required field: {}", key)))
+}
+
+fn extract_optional_param(params: &mut ParamsList, key: &str) -> Result<Option<String>, ApiError> {
+    let matches = params
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (param_key, _))| (param_key == key).then_some(index))
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(params.remove(*index).1)),
+        _ => Err(ApiError::BadRequest(format!(
+            "Duplicate '{}' parameters are not allowed",
+            key
+        ))),
+    }
+}
+
 /// Extract the instance name from an OAuth state parameter.
 ///
 /// Supports two formats:
@@ -525,15 +554,18 @@ fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
 )]
 async fn oauth_callback_router(
     State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<impl IntoResponse, ApiError> {
-    let state_param = params
-        .get("state")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::BadRequest("OAuth callback missing state parameter".into()))?;
+    let raw_query = raw_query.unwrap_or_default();
+    let mut query_pairs = parse_urlencoded_pairs(raw_query.as_bytes())?;
+    let state_param = extract_required_param(&mut query_pairs, "state")?;
+    if state_param.is_empty() {
+        return Err(ApiError::BadRequest(
+            "OAuth callback missing state parameter".into(),
+        ));
+    }
 
-    let instance_name = extract_instance_from_state(state_param)?;
+    let instance_name = extract_instance_from_state(&state_param)?;
 
     // Validate instance name using the same rules as instance creation
     // (alphanumeric + hyphens, no leading/trailing hyphens, max 32 chars).
@@ -551,7 +583,7 @@ async fn oauth_callback_router(
 
     // Forward the raw query string as-is to preserve original encoding.
     // Omit the `?` when there is no query string to keep redirects canonical.
-    let redirect_url = match raw_query.filter(|q| !q.is_empty()) {
+    let redirect_url = match (!raw_query.is_empty()).then_some(raw_query) {
         Some(qs) => format!("https://{}.{}/oauth/callback?{}", instance_name, domain, qs),
         None => format!("https://{}.{}/oauth/callback", instance_name, domain),
     };
@@ -565,8 +597,8 @@ async fn oauth_callback_router(
 }
 
 /// Schema-only struct for OpenAPI documentation.
-/// The actual handler uses `Form<HashMap<String, String>>` to capture and forward
-/// extra provider-specific params (e.g., RFC 8707 `resource`) to the token endpoint.
+/// The actual handler uses `RawForm` so repeated provider-specific params
+/// (e.g., RFC 8707 `resource`) are preserved and forwarded to the token endpoint.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[allow(dead_code)]
 struct OAuthExchangeRequest {
@@ -638,6 +670,12 @@ fn oauth_exchange_allows_private_token_endpoints(state: &AppState) -> bool {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ValidatedTokenEndpoint {
+    url: String,
+    resolved_addrs: Vec<SocketAddr>,
+}
+
 fn is_disallowed_oauth_endpoint_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -667,7 +705,7 @@ fn is_disallowed_oauth_endpoint_ip(ip: IpAddr) -> bool {
 async fn validate_token_endpoint_url(
     token_url: &str,
     allow_private: bool,
-) -> Result<String, ApiError> {
+) -> Result<ValidatedTokenEndpoint, ApiError> {
     let parsed = reqwest::Url::parse(token_url)
         .map_err(|_| ApiError::BadRequest("token_url must be a valid URL".into()))?;
     match parsed.scheme() {
@@ -696,15 +734,20 @@ async fn validate_token_endpoint_url(
         .ok_or_else(|| ApiError::BadRequest("token_url must include a known port".into()))?;
 
     if allow_private {
-        return Ok(parsed.to_string());
+        return Ok(ValidatedTokenEndpoint {
+            url: parsed.to_string(),
+            resolved_addrs: Vec::new(),
+        });
     }
 
     let mut resolved_any = false;
+    let mut resolved_addrs = Vec::new();
     let resolved = tokio::net::lookup_host((host, port))
         .await
         .map_err(|_| ApiError::BadRequest("token_url host could not be resolved".into()))?;
     for addr in resolved {
         resolved_any = true;
+        resolved_addrs.push(addr);
         if is_disallowed_oauth_endpoint_ip(addr.ip()) {
             return Err(ApiError::BadRequest(
                 "token_url must not resolve to loopback, private, link-local, or multicast addresses"
@@ -718,7 +761,32 @@ async fn validate_token_endpoint_url(
         ));
     }
 
-    Ok(parsed.to_string())
+    Ok(ValidatedTokenEndpoint {
+        url: parsed.to_string(),
+        resolved_addrs,
+    })
+}
+
+fn build_token_http_client(
+    state: &AppState,
+    endpoint: &ValidatedTokenEndpoint,
+) -> Result<reqwest::Client, ApiError> {
+    if endpoint.resolved_addrs.is_empty() {
+        return Ok(state.http_client.clone());
+    }
+
+    let host = reqwest::Url::parse(&endpoint.url)
+        .map_err(|_| ApiError::Internal("Validated token endpoint URL became invalid".into()))?
+        .host_str()
+        .ok_or_else(|| ApiError::Internal("Validated token endpoint URL is missing a host".into()))?
+        .to_string();
+
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&host, &endpoint.resolved_addrs)
+        .build()
+        .map_err(|e| ApiError::Internal(format!("Failed to build pinned HTTP client: {}", e)))
 }
 
 /// Resolve OAuth client credentials from the request or platform config.
@@ -762,30 +830,35 @@ fn resolve_client_credentials(
         // Request provides client_id but no secret — check if it matches the
         // platform's Google client_id and inject the platform secret if so.
         (Some(id), None) if !id.is_empty() => {
-            use secrecy::ExposeSecret;
-            let platform_secret = config
+            if config
                 .google_oauth_client_id
                 .as_deref()
-                .filter(|platform_id| *platform_id == id.as_str())
-                .and_then(|_| {
-                    config
-                        .google_oauth_client_secret
-                        .as_ref()
-                        .map(|s| s.expose_secret().to_string())
-                });
-            Ok(ResolvedClientCredentials {
-                client_id: id.clone(),
-                client_secret: platform_secret,
-                source: if config
-                    .google_oauth_client_id
-                    .as_deref()
-                    .is_some_and(|platform_id| platform_id == id)
-                {
-                    OAuthCredentialSource::Platform
-                } else {
-                    OAuthCredentialSource::Request
-                },
-            })
+                .is_some_and(|platform_id| platform_id == id)
+            {
+                use secrecy::ExposeSecret;
+                let platform_secret = config
+                    .google_oauth_client_secret
+                    .as_ref()
+                    .map(|s| s.expose_secret().to_string())
+                    .ok_or_else(|| {
+                        ApiError::BadRequest(
+                            "Platform Google client_id selected but GOOGLE_OAUTH_CLIENT_SECRET is not configured"
+                                .into(),
+                        )
+                    })?;
+
+                Ok(ResolvedClientCredentials {
+                    client_id: id.clone(),
+                    client_secret: Some(platform_secret),
+                    source: OAuthCredentialSource::Platform,
+                })
+            } else {
+                Ok(ResolvedClientCredentials {
+                    client_id: id.clone(),
+                    client_secret: None,
+                    source: OAuthCredentialSource::Request,
+                })
+            }
         }
         // No client creds in request — fall back to platform Google creds
         _ => {
@@ -853,26 +926,26 @@ fn resolve_token_endpoint_for_credentials(
 async fn oauth_exchange(
     auth: InstanceAuth,
     State(state): State<AppState>,
-    Form(mut form): Form<HashMap<String, String>>,
+    RawForm(form): RawForm,
 ) -> Result<impl IntoResponse, ApiError> {
+    let mut form = parse_urlencoded_pairs(&form)?;
+
     // Extract known fields from the form data.
     // Any remaining fields (e.g., RFC 8707 `resource`) are forwarded to the token endpoint.
-    let provider = form
-        .remove("provider")
-        .unwrap_or_else(default_provider_google);
-    let code = form
-        .remove("code")
-        .ok_or_else(|| ApiError::BadRequest("Missing required field: code".into()))?;
-    let redirect_uri = form
-        .remove("redirect_uri")
-        .ok_or_else(|| ApiError::BadRequest("Missing required field: redirect_uri".into()))?;
-    let code_verifier = normalize_optional_oauth_field(form.remove("code_verifier"));
-    let token_url = normalize_optional_oauth_field(form.remove("token_url"));
-    let req_client_id = normalize_optional_oauth_field(form.remove("client_id"));
-    let req_client_secret = normalize_optional_oauth_field(form.remove("client_secret"));
+    let provider =
+        extract_optional_param(&mut form, "provider")?.unwrap_or_else(default_provider_google);
+    let code = extract_required_param(&mut form, "code")?;
+    let redirect_uri = extract_required_param(&mut form, "redirect_uri")?;
+    let code_verifier =
+        normalize_optional_oauth_field(extract_optional_param(&mut form, "code_verifier")?);
+    let token_url = normalize_optional_oauth_field(extract_optional_param(&mut form, "token_url")?);
+    let req_client_id =
+        normalize_optional_oauth_field(extract_optional_param(&mut form, "client_id")?);
+    let req_client_secret =
+        normalize_optional_oauth_field(extract_optional_param(&mut form, "client_secret")?);
 
     // Remove fields that are only meaningful to compose-api, not the token endpoint.
-    form.remove("access_token_field");
+    let _ = extract_optional_param(&mut form, "access_token_field")?;
 
     let resolved_credentials =
         resolve_client_credentials(&req_client_id, &req_client_secret, &state.config)?;
@@ -883,6 +956,7 @@ async fn oauth_exchange(
         oauth_exchange_allows_private_token_endpoints(&state),
     )
     .await?;
+    let http_client = build_token_http_client(&state, &token_endpoint)?;
 
     // When using platform credentials, validate redirect_uri belongs to the platform domain.
     // This prevents a compromised container from exchanging codes destined for other instances.
@@ -941,16 +1015,15 @@ async fn oauth_exchange(
         }
     }
 
-    let response = state
-        .http_client
-        .post(&token_endpoint)
+    let response = http_client
+        .post(&token_endpoint.url)
         .form(&params)
         .send()
         .await
         .map_err(|e| {
             ApiError::Internal(format!(
                 "Failed to contact token endpoint {}: {}",
-                token_endpoint, e
+                token_endpoint.url, e
             ))
         })?;
 
@@ -1015,6 +1088,7 @@ async fn oauth_refresh(
         oauth_exchange_allows_private_token_endpoints(&state),
     )
     .await?;
+    let http_client = build_token_http_client(&state, &token_endpoint)?;
 
     let mut params: Vec<(&str, String)> = vec![
         ("grant_type", "refresh_token".to_string()),
@@ -1025,16 +1099,15 @@ async fn oauth_refresh(
         params.push(("client_secret", secret.clone()));
     }
 
-    let response = state
-        .http_client
-        .post(&token_endpoint)
+    let response = http_client
+        .post(&token_endpoint.url)
         .form(&params)
         .send()
         .await
         .map_err(|e| {
             ApiError::Internal(format!(
                 "Failed to contact token endpoint {}: {}",
-                token_endpoint, e
+                token_endpoint.url, e
             ))
         })?;
 
@@ -4290,6 +4363,16 @@ mod tests {
         assert_eq!(resolved.source, OAuthCredentialSource::Platform);
     }
 
+    #[test]
+    fn test_resolve_creds_matching_platform_id_requires_secret() {
+        let mut config = AppConfig::test_default();
+        config.google_oauth_client_id = Some("google-id".to_string());
+        let result = resolve_client_credentials(&Some("google-id".to_string()), &None, &config);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err())
+            .contains("GOOGLE_OAUTH_CLIENT_SECRET is not configured"));
+    }
+
     // ── oauth_callback_router integration ───────────────────────────
 
     /// Build a minimal Router with just the callback route for testing.
@@ -4379,6 +4462,25 @@ mod tests {
         let app = test_oauth_app(Some("example.com"));
         let request = axum::http::Request::builder()
             .uri("/oauth/callback?code=AUTHCODE")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_callback_rejects_duplicate_state_params() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = build_ic2_state("flow123", Some("alice"));
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri(format!(
+                "/oauth/callback?code=AUTHCODE&state={}&state=bob:nonce",
+                state
+            ))
             .body(Body::empty())
             .unwrap();
 
@@ -4517,6 +4619,50 @@ mod tests {
                 let resp = response_clone.clone();
                 async move {
                     *captured.lock().await = Some(params);
+                    Json(resp)
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app)
+                .with_graceful_shutdown(async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+
+        (
+            format!("http://127.0.0.1:{}", addr.port()),
+            shutdown_tx,
+            captured_params,
+        )
+    }
+
+    /// Start a mock token endpoint that captures the received form params with
+    /// duplicates preserved.
+    type CapturedFormPairs = Arc<Mutex<Option<Vec<(String, String)>>>>;
+
+    async fn start_mock_token_server_pairs(
+        response_json: serde_json::Value,
+    ) -> (String, tokio::sync::oneshot::Sender<()>, CapturedFormPairs) {
+        let captured_params: CapturedFormPairs = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured_params);
+        let response_clone = response_json.clone();
+
+        let mock_app = Router::new().route(
+            "/token",
+            post(move |RawForm(body): RawForm| {
+                let captured = Arc::clone(&captured_clone);
+                let resp = response_clone.clone();
+                async move {
+                    *captured.lock().await =
+                        Some(parse_urlencoded_pairs(&body).expect("parse mock form body"));
                     Json(resp)
                 }
             }),
@@ -5080,6 +5226,52 @@ mod tests {
             "https://mcp.example.com/v1"
         );
         assert_eq!(params.get("audience").unwrap(), "https://api.example.com");
+    }
+
+    #[tokio::test]
+    async fn test_exchange_preserves_repeated_resource_params() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (mock_url, _shutdown, captured) = start_mock_token_server_pairs(serde_json::json!({
+            "access_token": "tok",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let token_url = format!("{}/token", mock_url);
+        let (app, instance_token) = test_exchange_app(Some("example.com"), None, None);
+        let body = serde_urlencoded::to_string(vec![
+            ("code", "CODE"),
+            ("redirect_uri", "https://auth.example.com/oauth/callback"),
+            ("token_url", token_url.as_str()),
+            ("client_id", "id"),
+            ("resource", "https://mcp.example.com/v1"),
+            ("resource", "https://mcp.example.com/v2"),
+        ])
+        .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", format!("Bearer {}", instance_token))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let params = captured.lock().await;
+        let params = params.as_ref().unwrap();
+        let resources = params
+            .iter()
+            .filter_map(|(key, value)| (key == "resource").then_some(value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resources,
+            vec!["https://mcp.example.com/v1", "https://mcp.example.com/v2"]
+        );
     }
 
     #[tokio::test]
