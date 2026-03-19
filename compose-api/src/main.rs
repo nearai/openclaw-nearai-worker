@@ -545,13 +545,12 @@ async fn oauth_callback_router(
         )
     })?;
 
-    // Forward the raw query string as-is to preserve original encoding
-    let query_string = raw_query.unwrap_or_default();
-
-    let redirect_url = format!(
-        "https://{}.{}/oauth/callback?{}",
-        instance_name, domain, query_string
-    );
+    // Forward the raw query string as-is to preserve original encoding.
+    // Omit the `?` when there is no query string to keep redirects canonical.
+    let redirect_url = match raw_query.filter(|q| !q.is_empty()) {
+        Some(qs) => format!("https://{}.{}/oauth/callback?{}", instance_name, domain, qs),
+        None => format!("https://{}.{}/oauth/callback", instance_name, domain),
+    };
 
     tracing::info!(
         instance = %instance_name,
@@ -875,8 +874,20 @@ async fn oauth_exchange(
         params.push(("code_verifier".into(), cv));
     }
     // Forward any remaining form fields (e.g., RFC 8707 `resource`) to the token endpoint.
+    // Strip reserved OAuth keys that we set internally to prevent a malicious container
+    // from overriding them (e.g., injecting a different `grant_type`).
+    const RESERVED_OAUTH_KEYS: &[&str] = &[
+        "grant_type",
+        "code",
+        "redirect_uri",
+        "client_id",
+        "client_secret",
+        "code_verifier",
+    ];
     for (key, value) in &form {
-        params.push((key.clone(), value.clone()));
+        if !RESERVED_OAUTH_KEYS.contains(&key.as_str()) {
+            params.push((key.clone(), value.clone()));
+        }
     }
 
     let response = state
@@ -1362,6 +1373,10 @@ async fn main() -> anyhow::Result<()> {
         oauth_exchange_url: oauth_exchange_url.clone(),
         http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            // Disable redirect following to prevent SSRF: a malicious token_url
+            // could pass IP validation but 30x-redirect to a private/loopback
+            // address. Token endpoints should not redirect.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build HTTP client"),
         #[cfg(test)]
