@@ -531,11 +531,9 @@ async fn oauth_callback_router(
 
     let instance_name = extract_instance_from_state(state_param)?;
 
-    // Validate instance name is a safe DNS label (alphanumeric + hyphens)
-    if !instance_name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
+    // Validate instance name using the same rules as instance creation
+    // (alphanumeric + hyphens, no leading/trailing hyphens, max 32 chars).
+    if !is_valid_instance_name(&instance_name) {
         return Err(ApiError::BadRequest(
             "Invalid instance name extracted from state parameter".into(),
         ));
@@ -649,6 +647,11 @@ fn is_disallowed_oauth_endpoint_ip(ip: IpAddr) -> bool {
                 || ip.is_multicast()
         }
         IpAddr::V6(ip) => {
+            // Catch IPv4-mapped IPv6 addresses (e.g., ::ffff:127.0.0.1) which the
+            // kernel treats as their IPv4 equivalent but bypass the IPv6 checks above.
+            if let Some(mapped_v4) = ip.to_ipv4_mapped() {
+                return is_disallowed_oauth_endpoint_ip(IpAddr::V4(mapped_v4));
+            }
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
@@ -4028,6 +4031,44 @@ mod tests {
     async fn test_validate_token_endpoint_url_allows_test_loopback_override() {
         let result = validate_token_endpoint_url("http://127.0.0.1:8080/token", true).await;
         assert!(result.is_ok());
+    }
+
+    // ── is_disallowed_oauth_endpoint_ip ─────────────────────────────
+
+    #[test]
+    fn test_disallowed_ip_ipv4_mapped_loopback() {
+        let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(
+            is_disallowed_oauth_endpoint_ip(ip),
+            "::ffff:127.0.0.1 must be blocked (IPv4-mapped loopback)"
+        );
+    }
+
+    #[test]
+    fn test_disallowed_ip_ipv4_mapped_private() {
+        let ip: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(
+            is_disallowed_oauth_endpoint_ip(ip),
+            "::ffff:10.0.0.1 must be blocked (IPv4-mapped private)"
+        );
+    }
+
+    #[test]
+    fn test_disallowed_ip_ipv4_mapped_link_local() {
+        let ip: IpAddr = "::ffff:169.254.1.1".parse().unwrap();
+        assert!(
+            is_disallowed_oauth_endpoint_ip(ip),
+            "::ffff:169.254.1.1 must be blocked (IPv4-mapped link-local)"
+        );
+    }
+
+    #[test]
+    fn test_allowed_ip_ipv4_mapped_public() {
+        let ip: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+        assert!(
+            !is_disallowed_oauth_endpoint_ip(ip),
+            "::ffff:8.8.8.8 must be allowed (IPv4-mapped public)"
+        );
     }
 
     // ── resolve_client_credentials ──────────────────────────────────
