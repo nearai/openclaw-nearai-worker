@@ -4837,6 +4837,7 @@ mod tests {
             mem_limit: None,
             cpus: None,
             storage_size: None,
+            extra_env: None,
         };
 
         let mut compose_files = std::collections::HashMap::new();
