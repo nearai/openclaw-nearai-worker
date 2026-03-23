@@ -164,9 +164,49 @@ impl ComposeManager {
         let _ = std::fs::remove_file(path);
     }
 
+    // ── network helpers ───────────────────────────────────────────────
+
+    /// Return the persistent network name for an instance.
+    fn network_name(instance_name: &str) -> String {
+        format!("openclaw-net-{}", instance_name)
+    }
+
+    /// Ensure a per-instance Docker network exists.
+    /// Pre-creating the network as `external: true` in the compose template
+    /// prevents Docker Compose from tearing it down on container restart,
+    /// avoiding bridge/veth churn that can trigger kernel ZFS/RCU stalls.
+    fn ensure_network(instance_name: &str) -> Result<(), ApiError> {
+        let net = Self::network_name(instance_name);
+        // `docker network create` is idempotent-ish: returns an error if the
+        // network already exists, which we ignore.
+        let output = Command::new("docker")
+            .args(["network", "create", "--driver", "bridge", &net])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("docker network create: {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("already exists") {
+                return Err(ApiError::Internal(format!(
+                    "docker network create failed: {}",
+                    stderr
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove the per-instance Docker network (best-effort, ignore errors).
+    fn remove_network(instance_name: &str) {
+        let net = Self::network_name(instance_name);
+        let _ = Command::new("docker")
+            .args(["network", "rm", &net])
+            .output();
+    }
+
     // ── compose lifecycle ─────────────────────────────────────────────
 
     pub fn up(&self, cfg: &InstanceConfig) -> Result<(), ApiError> {
+        Self::ensure_network(cfg.name)?;
         let mut vars = HashMap::new();
         vars.insert("NEARAI_API_KEY".into(), cfg.nearai_api_key.into());
         vars.insert("NEARAI_API_URL".into(), cfg.nearai_api_url.into());
@@ -179,6 +219,7 @@ impl ComposeManager {
             vars.insert("BASTION_SSH_PUBKEY".into(), bastion_key.into());
         }
         vars.insert("SERVICE_TYPE".into(), cfg.service_type.to_string());
+        vars.insert("WORKER_NETWORK".into(), Self::network_name(cfg.name));
         if let Some(v) = cfg.mem_limit {
             vars.insert("MEM_LIMIT".into(), v.into());
         }
@@ -247,6 +288,7 @@ impl ComposeManager {
         let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["down", "-v"], None, service_type)?;
         self.remove_env_file(name);
+        Self::remove_network(name);
         Ok(())
     }
 
@@ -872,6 +914,7 @@ impl ComposeManager {
             .or_else(|| self.read_service_type_from_env_file(&inst.name))
             .unwrap_or_else(|| "openclaw".to_string());
         vars.insert("SERVICE_TYPE".into(), service_type);
+        vars.insert("WORKER_NETWORK".into(), Self::network_name(&inst.name));
         insert_oauth_env_vars(
             &mut vars,
             &inst.name,
@@ -884,6 +927,9 @@ impl ComposeManager {
                 vars.insert(k.clone(), v.clone());
             }
         }
+        // Ensure the per-instance network exists (may have been cleaned up
+        // if the CVM restarted and Docker pruned networks).
+        Self::ensure_network(&inst.name)?;
         self.write_env_file(&inst.name, &vars)
     }
 

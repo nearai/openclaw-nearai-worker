@@ -37,7 +37,14 @@ services:
       timeout: 5s
       retries: 2
       start_period: 15s
+    networks:
+      - worker
 
 volumes:
   config:
   workspace:
+
+networks:
+  worker:
+    name: ${WORKER_NETWORK}
+    external: true
