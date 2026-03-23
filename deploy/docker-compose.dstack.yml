@@ -157,13 +157,6 @@ configs:
           ''      close;
       }
 
-      # Extract instance name from OAuth state parameter (format: "instance:nonce").
-      # Used by auth.${OPENCLAW_DOMAIN} to route callbacks to the correct instance subdomain.
-      map $$arg_state $$oauth_instance {
-          ~*^([a-z0-9-]+):   $$1;
-          default                  "";
-      }
-
       server {
           listen 80 default_server;
           listen 443 ssl;
@@ -232,9 +225,10 @@ configs:
           }
       }
 
-      # OAuth auth proxy: receives callbacks from OAuth providers (e.g. Google)
-      # and redirects to the correct instance using the `state` query parameter.
-      # State format: "instance:nonce" — the map above extracts the instance name.
+      # OAuth auth proxy: receives callbacks from OAuth providers (e.g. Google, Notion)
+      # and forwards them to compose-api, which decodes the state parameter and
+      # redirects to the correct instance. Supports both the versioned ic2.* format
+      # and the legacy instance:nonce format.
       server {
           listen 443 ssl;
           server_name auth.${OPENCLAW_DOMAIN};
@@ -248,16 +242,11 @@ configs:
           client_body_timeout 5s;
 
           location = /oauth/callback {
-
-              if ($$arg_state = "") {
-                  return 400 '{"error":"missing_state","message":"OAuth callback missing state parameter"}';
-              }
-              if ($$oauth_instance = "") {
-                  return 400 '{"error":"invalid_state","message":"Could not extract instance name from state parameter"}';
-              }
-              # Redirect to the instance subdomain, preserving ALL original query params
-              # (code, state, error, scope, etc. — IronClaw needs state for CSRF check).
-              return 302 https://$$oauth_instance.${OPENCLAW_DOMAIN}/oauth/callback$$is_args$$args;
+              proxy_pass http://127.0.0.1:8080/oauth/callback;
+              proxy_set_header Host $$host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $$scheme;
           }
 
           location / {
