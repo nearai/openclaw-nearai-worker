@@ -11,9 +11,9 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -25,6 +25,9 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
+
+#[cfg(test)]
+use std::collections::HashMap;
 
 mod backup;
 mod compose;
@@ -676,12 +679,22 @@ struct ValidatedTokenEndpoint {
     resolved_addrs: Vec<SocketAddr>,
 }
 
+fn is_shared_ipv4_cgnat(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 100 && (64..=127).contains(&b)
+}
+
+fn is_ipv6_site_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfec0
+}
+
 fn is_disallowed_oauth_endpoint_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
+                || is_shared_ipv4_cgnat(ip)
                 || ip.is_broadcast()
                 || ip.is_documentation()
                 || ip.is_unspecified()
@@ -697,6 +710,7 @@ fn is_disallowed_oauth_endpoint_ip(ip: IpAddr) -> bool {
                 || ip.is_unspecified()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
+                || is_ipv6_site_local(ip)
                 || ip.is_multicast()
         }
     }
@@ -750,8 +764,7 @@ async fn validate_token_endpoint_url(
         resolved_addrs.push(addr);
         if is_disallowed_oauth_endpoint_ip(addr.ip()) {
             return Err(ApiError::BadRequest(
-                "token_url must not resolve to loopback, private, link-local, or multicast addresses"
-                    .into(),
+                "token_url must not resolve to non-public addresses".into(),
             ));
         }
     }
@@ -4255,6 +4268,24 @@ mod tests {
         assert!(
             !is_disallowed_oauth_endpoint_ip(ip),
             "::ffff:8.8.8.8 must be allowed (IPv4-mapped public)"
+        );
+    }
+
+    #[test]
+    fn test_disallowed_ip_ipv4_cgnat_range() {
+        let ip: IpAddr = "100.64.0.1".parse().unwrap();
+        assert!(
+            is_disallowed_oauth_endpoint_ip(ip),
+            "100.64.0.1 must be blocked (shared CGNAT range)"
+        );
+    }
+
+    #[test]
+    fn test_disallowed_ip_ipv6_site_local() {
+        let ip: IpAddr = "fec0::1".parse().unwrap();
+        assert!(
+            is_disallowed_oauth_endpoint_ip(ip),
+            "fec0::1 must be blocked (IPv6 site-local range)"
         );
     }
 

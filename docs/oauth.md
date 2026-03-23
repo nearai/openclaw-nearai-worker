@@ -102,7 +102,7 @@ Generic providers (MCP, etc.) can send their own credentials in the exchange req
       │                          │ 9. Exchange code │        (platform)      │
       │                          │──────────────────────────►┌──────────┐   │
       │                          │ POST http://host.docker   │ /oauth/  │   │
-      │                          │  .internal:8080/oauth/    │ exchange │   │
+      │                          │  .internal:<port>/oauth/  │ exchange │   │
       │                          │  exchange                 │          │   │
       │                          │  Auth: Bearer <gw_token>  │          │   │
       │                          │  {code, redirect_uri,     │ Resolves │   │
@@ -156,7 +156,7 @@ Generic providers (MCP, etc.) can send their own credentials in the exchange req
 │                                                                                │
 │  Injected by compose-api when available:                                       │
 │  GOOGLE_OAUTH_CLIENT_ID      = 637554...      (public, for auth URL)           │
-│  IRONCLAW_OAUTH_EXCHANGE_URL = http://host.docker.internal:8080                │
+│  IRONCLAW_OAUTH_EXCHANGE_URL = http://host.docker.internal:<compose-api-port>  │
 │                                                                                │
 │  NOT in container:                                                             │
 │  GOOGLE_OAUTH_CLIENT_SECRET  — stays on compose-api only                       │
@@ -194,6 +194,7 @@ Generic providers (MCP, etc.) can send their own credentials in the exchange req
 │  EXCHANGE PROXY PROTOCOL                                                       │
 │                                                                                │
 │  IronClaw appends /oauth/exchange to IRONCLAW_OAUTH_EXCHANGE_URL.             │
+│  compose-api injects the actual listen port here (47392 in the default deploy).│
 │  Request: POST, form-encoded.                                                  │
 │  Auth: Bearer <gateway_token>.                                                 │
 │                                                                                │
