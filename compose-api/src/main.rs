@@ -3569,7 +3569,7 @@ async fn debug_active(
         store.list()
     };
     let active_count = instances.iter().filter(|i| i.active).count();
-    let inactive_count = instances.iter().filter(|i| !i.active).count();
+    let inactive_count = instances.len() - active_count;
     let mut entries: Vec<serde_json::Value> = instances
         .iter()
         .map(|i| {
@@ -3593,13 +3593,19 @@ async fn debug_backends(
     _auth: AdminAuth,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let path = &state.config.nginx_map_path;
-    let content = std::fs::read_to_string(path).unwrap_or_else(|e| format!("error reading: {}", e));
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let path = state.config.nginx_map_path.clone();
+    let (content, entries, error) = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => {
+            let count = content.lines().filter(|l| !l.trim().is_empty()).count();
+            (content, count, None::<String>)
+        }
+        Err(e) => (String::new(), 0, Some(e.to_string())),
+    };
     Ok(Json(serde_json::json!({
         "path": path,
-        "entries": lines.len(),
+        "entries": entries,
         "content": content,
+        "error": error,
     })))
 }
 
@@ -3619,7 +3625,12 @@ async fn debug_reactivate(
                 .map(|h| h.state == "running" && h.health == "healthy")
                 .unwrap_or(false);
             if inst.active != should_be_active {
-                let _ = store.set_active(&inst.name, should_be_active);
+                if let Err(e) = store.set_active(&inst.name, should_be_active) {
+                    tracing::warn!(
+                        "debug_reactivate: failed to set active for '{}': {}",
+                        inst.name, e
+                    );
+                }
                 if should_be_active {
                     activated.push(inst.name.clone());
                 } else {
