@@ -1578,7 +1578,11 @@ async fn main() -> anyhow::Result<()> {
             "/admin/restart-service/{service}",
             post(restart_management_service),
         )
-        .route("/admin/services", get(get_services_status));
+        .route("/admin/services", get(get_services_status))
+        .route("/admin/debug/health", get(debug_health))
+        .route("/admin/debug/active", get(debug_active))
+        .route("/admin/debug/backends", get(debug_backends))
+        .route("/admin/debug/reactivate", post(debug_reactivate));
 
     // OAuth routes: callback router is public (no auth), exchange/refresh require instance auth.
     // Always registered — generic providers send their own credentials in the request.
@@ -3521,6 +3525,128 @@ async fn get_services_status(_auth: AdminAuth) -> Result<impl IntoResponse, ApiE
     .map_err(|e| ApiError::Internal(format!("task join: {e}")))??;
 
     Ok(Json(ServicesStatusResponse { services }))
+}
+
+// ── Debug endpoints ──────────────────────────────────────────────────
+
+/// Docker health status for all managed containers (what background sync sees).
+async fn debug_health(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let health_map = state.compose_all_health_statuses().await?;
+    // Count by (state, health) combination
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for h in health_map.values() {
+        let key = format!("{}:{}", h.state, h.health);
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    let mut entries: Vec<serde_json::Value> = health_map
+        .iter()
+        .map(|(name, h)| {
+            serde_json::json!({
+                "name": name,
+                "state": h.state,
+                "health": h.health,
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(Json(serde_json::json!({
+        "total": health_map.len(),
+        "counts": counts,
+        "instances": entries,
+    })))
+}
+
+/// Internal active state for all instances (active = routed via nginx).
+async fn debug_active(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let instances = {
+        let store = state.store.read().await;
+        store.list()
+    };
+    let active_count = instances.iter().filter(|i| i.active).count();
+    let inactive_count = instances.len() - active_count;
+    let mut entries: Vec<serde_json::Value> = instances
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "name": i.name,
+                "active": i.active,
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(Json(serde_json::json!({
+        "total": instances.len(),
+        "active": active_count,
+        "inactive": inactive_count,
+        "instances": entries,
+    })))
+}
+
+/// Current nginx backends.map content.
+async fn debug_backends(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let path = state.config.nginx_map_path.clone();
+    let (content, entries, error) = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => {
+            let count = content.lines().filter(|l| !l.trim().is_empty()).count();
+            (content, count, None::<String>)
+        }
+        Err(e) => (String::new(), 0, Some(e.to_string())),
+    };
+    Ok(Json(serde_json::json!({
+        "path": path,
+        "entries": entries,
+        "content": content,
+        "error": error,
+    })))
+}
+
+/// Force re-evaluate all instances: run background sync logic immediately.
+async fn debug_reactivate(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let health_map = state.compose_all_health_statuses().await?;
+    let mut activated = Vec::new();
+    let mut deactivated = Vec::new();
+    {
+        let mut store = state.store.write().await;
+        for inst in store.list() {
+            let should_be_active = health_map
+                .get(&inst.name)
+                .map(|h| h.state == "running" && h.health == "healthy")
+                .unwrap_or(false);
+            if inst.active != should_be_active {
+                if let Err(e) = store.set_active(&inst.name, should_be_active) {
+                    tracing::warn!(
+                        "debug_reactivate: failed to set active for '{}': {}",
+                        inst.name, e
+                    );
+                }
+                if should_be_active {
+                    activated.push(inst.name.clone());
+                } else {
+                    deactivated.push(inst.name.clone());
+                }
+            }
+        }
+    }
+    // Update nginx
+    update_nginx_now(&state).await;
+    Ok(Json(serde_json::json!({
+        "activated": activated.len(),
+        "deactivated": deactivated.len(),
+        "activated_names": activated,
+        "deactivated_names": deactivated,
+    })))
 }
 
 // ── Utilities ────────────────────────────────────────────────────────
