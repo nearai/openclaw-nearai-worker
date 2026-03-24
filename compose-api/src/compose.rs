@@ -298,11 +298,13 @@ impl ComposeManager {
     }
 
     pub fn start(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        Self::ensure_network(name)?;
         let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["start"], None, service_type)
     }
 
     pub fn restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        Self::ensure_network(name)?;
         let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["restart"], None, service_type)
     }
