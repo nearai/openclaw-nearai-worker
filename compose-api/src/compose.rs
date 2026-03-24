@@ -164,6 +164,28 @@ impl ComposeManager {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Read all key=value pairs from an instance .env file into a HashMap.
+    /// Used by `start()` to pass env vars explicitly to docker compose,
+    /// overriding CVM-level process env (which always has OPENCLAW_IMAGE
+    /// set to the openclaw image, even for ironclaw instances).
+    fn read_env_file_vars(&self, path: &Path) -> HashMap<String, String> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
+        content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let (key, value) = line.split_once('=')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
     // ── network helpers ───────────────────────────────────────────────
 
     /// Return the persistent network name for an instance.
@@ -300,6 +322,10 @@ impl ComposeManager {
     pub fn start(&self, name: &str, force_recreate: bool, service_type: Option<&str>) -> Result<(), ApiError> {
         Self::ensure_network(name)?;
         let env_path = self.env_path(name);
+        // Read OPENCLAW_IMAGE from the instance .env file and pass it
+        // explicitly so it overrides the CVM-level process env (which is
+        // always the openclaw image, even for ironclaw instances).
+        let env_vars = self.read_env_file_vars(&env_path);
         // Use `up -d` instead of `start` so the container is recreated with
         // the current network config. A plain `start` reuses the stopped
         // container's stored network ID, which fails if the network was
@@ -308,7 +334,7 @@ impl ComposeManager {
         if force_recreate {
             args.push("--force-recreate");
         }
-        self.compose_cmd(name, &env_path, &args, None, service_type)
+        self.compose_cmd(name, &env_path, &args, Some(&env_vars), service_type)
     }
 
     pub fn restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
