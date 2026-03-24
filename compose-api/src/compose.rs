@@ -297,20 +297,22 @@ impl ComposeManager {
         self.compose_cmd(name, &env_path, &["stop"], None, service_type)
     }
 
-    pub fn start(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+    pub fn start(&self, name: &str, force_recreate: bool, service_type: Option<&str>) -> Result<(), ApiError> {
         Self::ensure_network(name)?;
         let env_path = self.env_path(name);
         // Use `up -d` instead of `start` so the container is recreated with
         // the current network config. A plain `start` reuses the stopped
         // container's stored network ID, which fails if the network was
         // deleted (e.g. after CVM reboot cleanup).
-        self.compose_cmd(name, &env_path, &["up", "-d", "--pull", "never"], None, service_type)
+        let mut args = vec!["up", "-d", "--pull", "never"];
+        if force_recreate {
+            args.push("--force-recreate");
+        }
+        self.compose_cmd(name, &env_path, &args, None, service_type)
     }
 
     pub fn restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
-        Self::ensure_network(name)?;
-        let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["up", "-d", "--force-recreate", "--pull", "never"], None, service_type)
+        self.start(name, true, service_type)
     }
 
     /// Returns the output of `docker compose ps --format json`.

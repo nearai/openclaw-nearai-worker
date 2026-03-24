@@ -232,11 +232,11 @@ impl AppState {
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_start(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+    async fn compose_start(&self, name: &str, force_recreate: bool, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
         let service_type = service_type.map(|s| s.to_string());
-        tokio::task::spawn_blocking(move || compose.start(&name, service_type.as_deref()))
+        tokio::task::spawn_blocking(move || compose.start(&name, force_recreate, service_type.as_deref()))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
@@ -2051,7 +2051,7 @@ async fn poll_health_to_ready(
                     // Use `start` for exited/dead containers, `restart` for
                     // unhealthy ones that are still running.
                     let result = if health.state == "exited" || health.state == "dead" {
-                        state.compose_start(name, service_type).await
+                        state.compose_start(name, false, service_type).await
                     } else {
                         state.compose_restart(name, service_type).await
                     };
@@ -2847,7 +2847,7 @@ async fn start_instance(
     let stream = async_stream::stream! {
         yield Ok(sse_stage("container_starting", "Starting container..."));
 
-        if let Err(e) = state.compose_start(&name, inst.service_type.as_deref()).await {
+        if let Err(e) = state.compose_start(&name, false, inst.service_type.as_deref()).await {
             yield Ok(sse_error(&format!("Failed to start container: {}", e)));
             return;
         }
