@@ -27,6 +27,8 @@ use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
 #[cfg(test)]
+use base64::engine::general_purpose::URL_SAFE;
+#[cfg(test)]
 use std::collections::HashMap;
 
 mod backup;
@@ -461,11 +463,21 @@ struct HostedOAuthStatePayload {
     instance_name: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct HostedOAuthStateWrapper {
+    #[serde(default)]
+    state: Option<String>,
+}
+
 fn hosted_state_checksum(payload_bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(payload_bytes);
     URL_SAFE_NO_PAD.encode(&digest[..HOSTED_STATE_CHECKSUM_BYTES])
+}
+
+fn decode_urlsafe_base64(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    URL_SAFE_NO_PAD.decode(input.trim_end_matches('='))
 }
 
 type ParamsList = Vec<(String, String)>;
@@ -506,7 +518,7 @@ fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
     // Try new ic2 format: ic2.{base64_payload}.{checksum}
     if let Some(rest) = state.strip_prefix("ic2.") {
         if let Some((payload_b64, checksum)) = rest.rsplit_once('.') {
-            if let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload_b64) {
+            if let Ok(payload_bytes) = decode_urlsafe_base64(payload_b64) {
                 let expected_checksum = hosted_state_checksum(&payload_bytes);
                 if checksum != expected_checksum {
                     return Err(ApiError::BadRequest(
@@ -519,6 +531,18 @@ fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
                     if let Some(instance) = payload.instance_name.filter(|s| !s.is_empty()) {
                         return Ok(instance);
                     }
+                }
+            }
+        }
+    }
+
+    // MCP install flows may wrap the actual hosted state in a base64url-encoded
+    // JSON object that contains a nested `state` field. Unwrap and recurse.
+    if let Ok(wrapper_bytes) = decode_urlsafe_base64(state) {
+        if let Ok(wrapper) = serde_json::from_slice::<HostedOAuthStateWrapper>(&wrapper_bytes) {
+            if let Some(nested_state) = wrapper.state.filter(|nested| !nested.is_empty()) {
+                if nested_state != state {
+                    return extract_instance_from_state(&nested_state);
                 }
             }
         }
@@ -4096,6 +4120,20 @@ mod tests {
         format!("ic2.{}.{}", payload_b64, checksum)
     }
 
+    fn build_wrapped_mcp_state(inner_state: &str) -> String {
+        let payload = serde_json::json!({
+            "responseType": "code",
+            "clientId": "test-client",
+            "redirectUri": "https://auth.example.com/oauth/callback",
+            "scope": [],
+            "state": inner_state,
+            "mcp_state_key": "mcp_test_state",
+            "mcp_state_val": "123e4567-e89b-12d3-a456-426614174000",
+            "mcp_time": 1710000000123u64,
+        });
+        URL_SAFE.encode(serde_json::to_vec(&payload).unwrap())
+    }
+
     #[test]
     fn test_extract_instance_ic2_format() {
         let state = build_ic2_state("test-flow-id", Some("alice"));
@@ -4129,6 +4167,22 @@ mod tests {
     #[test]
     fn test_extract_instance_legacy_with_hyphens() {
         let result = extract_instance_from_state("brave-tiger:abc123");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "brave-tiger");
+    }
+
+    #[test]
+    fn test_extract_instance_mcp_wrapped_ic2_format() {
+        let state = build_wrapped_mcp_state(&build_ic2_state("test-flow-id", Some("alice")));
+        let result = extract_instance_from_state(&state);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "alice");
+    }
+
+    #[test]
+    fn test_extract_instance_mcp_wrapped_legacy_format() {
+        let state = build_wrapped_mcp_state("brave-tiger:abc123");
+        let result = extract_instance_from_state(&state);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "brave-tiger");
     }
@@ -4496,6 +4550,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_callback_routes_mcp_wrapped_ic2_state() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let state = build_wrapped_mcp_state(&build_ic2_state("flow123", Some("kind-fly")));
+        let app = test_oauth_app(Some("example.com"));
+        let request = axum::http::Request::builder()
+            .uri(format!("/oauth/callback?code=AUTHCODE&state={}", state))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location = response
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("https://kind-fly.example.com/oauth/callback?"));
+        assert!(location.contains("code=AUTHCODE"));
+    }
+
+    #[tokio::test]
     async fn test_callback_missing_state() {
         use axum::body::Body;
         use tower::ServiceExt;
@@ -4759,6 +4837,7 @@ mod tests {
             mem_limit: None,
             cpus: None,
             storage_size: None,
+            extra_env: None,
         };
 
         let mut compose_files = std::collections::HashMap::new();

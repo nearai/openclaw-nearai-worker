@@ -241,6 +241,7 @@ mod tests {
             mem_limit: None,
             cpus: None,
             storage_size: None,
+            extra_env: None,
         }
     }
 
