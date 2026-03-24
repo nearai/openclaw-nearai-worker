@@ -935,9 +935,6 @@ impl ComposeManager {
                 vars.insert(k.clone(), v.clone());
             }
         }
-        // Ensure the per-instance network exists (may have been cleaned up
-        // if the CVM restarted and Docker pruned networks).
-        Self::ensure_network(&inst.name)?;
         self.write_env_file(&inst.name, &vars)
     }
 
