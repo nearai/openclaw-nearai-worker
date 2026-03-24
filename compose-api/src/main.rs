@@ -1498,8 +1498,13 @@ async fn main() -> anyhow::Result<()> {
             if !discovered.is_empty() {
                 tracing::info!("discovered {} instances from Docker", discovered.len());
                 for inst in &discovered {
+                    let default_image = match inst.service_type.as_deref() {
+                        Some("ironclaw") => &config.ironclaw_image,
+                        _ => &config.openclaw_image,
+                    };
                     if let Err(e) = compose.ensure_env_file(
                         inst,
+                        default_image,
                         config.openclaw_domain.as_deref(),
                         config.google_oauth_client_id.as_deref(),
                         oauth_exchange_url.as_deref(),
@@ -2338,10 +2343,12 @@ async fn get_instance(
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = generate_ssh_command(&state.config, &inst.name, inst.ssh_port);
-            let image = inst
-                .image
-                .clone()
-                .unwrap_or_else(|| state.config.openclaw_image.clone());
+            let image = inst.image.clone().unwrap_or_else(|| {
+                match inst.service_type.as_deref() {
+                    Some("ironclaw") => state.config.ironclaw_image.clone(),
+                    _ => state.config.openclaw_image.clone(),
+                }
+            });
             Ok(Json(InstanceResponse {
                 name: inst.name.clone(),
                 token: inst.token,
@@ -2395,9 +2402,12 @@ async fn list_instances(
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = generate_ssh_command(&state.config, &inst.name, inst.ssh_port);
-            let image = inst
-                .image
-                .unwrap_or_else(|| state.config.openclaw_image.clone());
+            let image = inst.image.unwrap_or_else(|| {
+                match inst.service_type.as_deref() {
+                    Some("ironclaw") => state.config.ironclaw_image.clone(),
+                    _ => state.config.openclaw_image.clone(),
+                }
+            });
             InstanceResponse {
                 name: inst.name,
                 token: inst.token,

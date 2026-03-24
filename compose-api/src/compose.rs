@@ -887,9 +887,12 @@ impl ComposeManager {
 
     /// Reconstruct the env file for a discovered instance so that
     /// docker compose lifecycle commands (stop/start/restart) continue to work.
+    /// `default_image` should be the correct image for this instance's service type
+    /// (openclaw or ironclaw) — used when `inst.image` is None.
     pub fn ensure_env_file(
         &self,
         inst: &Instance,
+        default_image: &str,
         openclaw_domain: Option<&str>,
         google_oauth_client_id: Option<&str>,
         oauth_exchange_url: Option<&str>,
@@ -910,9 +913,8 @@ impl ComposeManager {
         if let Some(ref bastion_key) = self.bastion_ssh_pubkey {
             vars.insert("BASTION_SSH_PUBKEY".into(), bastion_key.clone());
         }
-        if let Some(ref image) = inst.image {
-            vars.insert("OPENCLAW_IMAGE".into(), image.clone());
-        }
+        let image = inst.image.as_deref().unwrap_or(default_image);
+        vars.insert("OPENCLAW_IMAGE".into(), image.to_string());
         // Prefer in-memory service_type, then existing .env value; only then default to openclaw.
         // Avoids overwriting a correct SERVICE_TYPE=ironclaw in .env when instance was discovered
         // without label/env and .env hadn't been read yet.
