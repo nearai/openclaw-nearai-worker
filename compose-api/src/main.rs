@@ -1584,6 +1584,8 @@ async fn main() -> anyhow::Result<()> {
             post(restart_management_service),
         )
         .route("/admin/services", get(get_services_status))
+        .route("/admin/recover/{name}", post(recover_instance))
+        .route("/admin/debug/orphans", get(debug_orphans))
         .route("/admin/debug/health", get(debug_health))
         .route("/admin/debug/active", get(debug_active))
         .route("/admin/debug/backends", get(debug_backends))
@@ -1840,6 +1842,14 @@ struct BackupListResponse {
 struct BackupDownloadResponse {
     url: String,
     expires_in_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct RecoverInstanceResponse {
+    name: String,
+    status: String,
+    url: String,
+    dashboard_url: String,
 }
 
 pub fn is_valid_instance_name(name: &str) -> bool {
@@ -3537,7 +3547,205 @@ async fn get_services_status(_auth: AdminAuth) -> Result<impl IntoResponse, ApiE
     Ok(Json(ServicesStatusResponse { services }))
 }
 
+// ── Recovery endpoint ────────────────────────────────────────────────
+
+/// Recover a lost instance from its persisted .env file and Docker volumes.
+/// The container is recreated via `docker compose up -d`, mounting the
+/// existing named volumes (config + workspace) so user data is preserved.
+async fn recover_instance(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Validate instance name (prevent path traversal)
+    if !is_valid_instance_name(&name) {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid instance name: '{}'",
+            name
+        )));
+    }
+
+    // Recover instance metadata from the .env file + verify volumes
+    let inst = {
+        let compose = state.compose.clone();
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || compose.recover_from_env(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }?;
+
+    tracing::info!(
+        "Recovering instance '{}': port={}, ssh_port={}, service_type={:?}",
+        inst.name,
+        inst.gateway_port,
+        inst.ssh_port,
+        inst.service_type
+    );
+
+    // Atomic check-and-insert under a single write lock to prevent races
+    let service_type = inst.service_type.clone();
+    let gateway_port = inst.gateway_port;
+    let token = inst.token.clone();
+    {
+        let mut store = state.store.write().await;
+        if store.exists(&name) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' already exists. Use /instances/{}/start instead.",
+                name, name
+            )));
+        }
+        store.add(inst);
+    }
+
+    // Start the container (reads .env, mounts existing volumes)
+    if let Err(e) = state
+        .compose_start(&name, false, service_type.as_deref())
+        .await
+    {
+        // Remove from store if start failed
+        let mut store = state.store.write().await;
+        store.remove(&name);
+        return Err(ApiError::Internal(format!(
+            "Failed to start recovered instance: {}",
+            e
+        )));
+    }
+
+    // Mark active so nginx routes immediately (don't wait for background sync)
+    {
+        let mut store = state.store.write().await;
+        let _ = store.set_active(&name, true);
+    }
+    update_nginx_now(&state).await;
+
+    let (url, dashboard_url) =
+        generate_urls(&state.config, &name, gateway_port, &token);
+
+    Ok(Json(RecoverInstanceResponse {
+        name,
+        status: "recovered".to_string(),
+        url,
+        dashboard_url,
+    }))
+}
+
 // ── Debug endpoints ──────────────────────────────────────────────────
+
+/// List orphaned instances: .env files and/or Docker volumes that exist
+/// but have no matching entry in the instance store.
+async fn debug_orphans(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let compose = state.compose.clone();
+    let store_names: std::collections::HashSet<String> = {
+        let store = state.store.read().await;
+        store.list().into_iter().map(|i| i.name).collect()
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut orphans: Vec<serde_json::Value> = Vec::new();
+
+        // Scan .env files
+        let env_dir = compose.env_dir();
+        let mut env_names = std::collections::HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(env_dir) {
+            for entry in entries.flatten() {
+                let filename = entry.file_name().to_string_lossy().to_string();
+                if let Some(name) = filename.strip_suffix(".env") {
+                    env_names.insert(name.to_string());
+                }
+            }
+        }
+
+        // Scan Docker volumes for openclaw-*_config and openclaw-*_workspace
+        let vol_output = std::process::Command::new("docker")
+            .args(["volume", "ls", "--format", "{{.Name}}"])
+            .output();
+        let mut config_volumes = std::collections::HashSet::new();
+        let mut workspace_volumes = std::collections::HashSet::new();
+        match vol_output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if let Some(name) = line
+                        .strip_prefix("openclaw-")
+                        .and_then(|s| s.strip_suffix("_config"))
+                    {
+                        config_volumes.insert(name.to_string());
+                    }
+                    if let Some(name) = line
+                        .strip_prefix("openclaw-")
+                        .and_then(|s| s.strip_suffix("_workspace"))
+                    {
+                        workspace_volumes.insert(name.to_string());
+                    }
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!("docker volume ls failed: {}", stderr);
+            }
+            Err(e) => {
+                tracing::warn!("failed to run docker volume ls: {}", e);
+            }
+        }
+
+        // Names that have at least one volume
+        let volume_names: std::collections::HashSet<String> =
+            config_volumes.union(&workspace_volumes).cloned().collect();
+
+        // Find orphans: have .env or volumes but not in store
+        let all_names: std::collections::HashSet<&String> =
+            env_names.union(&volume_names).collect();
+        for name in all_names {
+            if store_names.contains(name.as_str()) {
+                continue;
+            }
+            let has_env = env_names.contains(name.as_str());
+            let has_config = config_volumes.contains(name.as_str());
+            let has_workspace = workspace_volumes.contains(name.as_str());
+
+            // Read service_type from .env if available
+            let service_type = if has_env {
+                let env_path = env_dir.join(format!("{}.env", name));
+                std::fs::read_to_string(&env_path)
+                    .ok()
+                    .and_then(|content| {
+                        content.lines().find_map(|line| {
+                            line.strip_prefix("SERVICE_TYPE=")
+                                .map(|v| v.to_string())
+                        })
+                    })
+            } else {
+                None
+            };
+
+            // Recoverable only if .env + both volumes exist
+            let recoverable = has_env && has_config && has_workspace;
+            orphans.push(serde_json::json!({
+                "name": name,
+                "has_env": has_env,
+                "has_config_volume": has_config,
+                "has_workspace_volume": has_workspace,
+                "service_type": service_type,
+                "recoverable": recoverable,
+            }));
+        }
+
+        orphans.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        orphans
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("task join: {e}")))?;
+
+    let recoverable = result.iter().filter(|o| o["recoverable"] == true).count();
+    Ok(Json(serde_json::json!({
+        "total": result.len(),
+        "recoverable": recoverable,
+        "orphans": result,
+    })))
+}
 
 /// Docker health status for all managed containers (what background sync sees).
 async fn debug_health(

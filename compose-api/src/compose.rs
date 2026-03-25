@@ -126,6 +126,10 @@ impl ComposeManager {
             .expect("default compose file must exist")
     }
 
+    pub fn env_dir(&self) -> &Path {
+        &self.env_dir
+    }
+
     fn env_path(&self, name: &str) -> PathBuf {
         self.env_dir.join(format!("{}.env", name))
     }
@@ -184,6 +188,144 @@ impl ComposeManager {
                 Some((key.to_string(), value.to_string()))
             })
             .collect()
+    }
+
+    /// Recover an instance from its persisted .env file.
+    /// Returns the reconstructed Instance if the .env file exists and has
+    /// the required fields. Fails if critical fields (token, API key,
+    /// SSH pubkey, ports) are missing or empty.
+    pub fn recover_from_env(&self, name: &str) -> Result<Instance, ApiError> {
+        if !crate::is_valid_instance_name(name) {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid instance name: '{}'",
+                name
+            )));
+        }
+        let env_path = self.env_path(name);
+        if !env_path.exists() {
+            return Err(ApiError::NotFound(format!(
+                "No .env file found for instance '{}'",
+                name
+            )));
+        }
+        // Verify both Docker volumes exist (user data)
+        for suffix in &["config", "workspace"] {
+            let vol = format!("openclaw-{}_{}", name, suffix);
+            let check = Command::new("docker")
+                .args(["volume", "inspect", &vol])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap_or_else(|_| std::process::ExitStatus::default());
+            if !check.success() {
+                return Err(ApiError::BadRequest(format!(
+                    "Docker volume '{}' not found — cannot recover without user data",
+                    vol
+                )));
+            }
+        }
+        let vars = self.read_env_file_vars(&env_path);
+
+        // Required fields — fail recovery if missing/empty
+        let gateway_port: u16 = vars
+            .get("GATEWAY_PORT")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("GATEWAY_PORT missing or invalid in {}.env", name))
+            })?;
+        let ssh_port: u16 = vars
+            .get("SSH_PORT")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("SSH_PORT missing or invalid in {}.env", name))
+            })?;
+        let token = vars
+            .get("OPENCLAW_GATEWAY_TOKEN")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "OPENCLAW_GATEWAY_TOKEN missing or empty in {}.env",
+                    name
+                ))
+            })?;
+        let nearai_api_key = vars
+            .get("NEARAI_API_KEY")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("NEARAI_API_KEY missing or empty in {}.env", name))
+            })?;
+        let ssh_pubkey = vars
+            .get("SSH_PUBKEY")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("SSH_PUBKEY missing or empty in {}.env", name))
+            })?;
+
+        let nearai_api_url = vars.get("NEARAI_API_URL").cloned();
+        let image = vars.get("OPENCLAW_IMAGE").cloned();
+
+        // Infer service_type from env, falling back to image name
+        let service_type = vars
+            .get("SERVICE_TYPE")
+            .cloned()
+            .or_else(|| {
+                Some(
+                    self.infer_service_type_from_image(image.as_deref())
+                        .to_string(),
+                )
+            });
+
+        // Collect extra env vars: anything not in the core set written by
+        // ensure_env_file / up(). These include user-configured vars like
+        // CHANNEL_RELAY_URL, CHANNEL_RELAY_API_KEY, etc.
+        const CORE_KEYS: &[&str] = &[
+            "NEARAI_API_KEY",
+            "NEARAI_API_URL",
+            "OPENCLAW_GATEWAY_TOKEN",
+            "GATEWAY_PORT",
+            "SSH_PORT",
+            "SSH_PUBKEY",
+            "BASTION_SSH_PUBKEY",
+            "OPENCLAW_IMAGE",
+            "SERVICE_TYPE",
+            "WORKER_NETWORK",
+            "MEM_LIMIT",
+            "CPUS",
+            "STORAGE_SIZE",
+            // OAuth vars written by insert_oauth_env_vars
+            "OPENCLAW_DOMAIN",
+            "OPENCLAW_INSTANCE_NAME",
+            "GOOGLE_OAUTH_CLIENT_ID",
+            "IRONCLAW_OAUTH_EXCHANGE_URL",
+        ];
+        let extra: HashMap<String, String> = vars
+            .iter()
+            .filter(|(k, _)| !CORE_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let extra_env = if extra.is_empty() { None } else { Some(extra) };
+
+        Ok(Instance {
+            name: name.to_string(),
+            token,
+            gateway_port,
+            ssh_port,
+            created_at: chrono::Utc::now(),
+            ssh_pubkey,
+            nearai_api_key,
+            nearai_api_url,
+            active: false,
+            image,
+            image_digest: None,
+            service_type,
+            mem_limit: vars.get("MEM_LIMIT").cloned(),
+            cpus: vars.get("CPUS").cloned(),
+            storage_size: vars.get("STORAGE_SIZE").cloned(),
+            extra_env,
+        })
     }
 
     // ── network helpers ───────────────────────────────────────────────
