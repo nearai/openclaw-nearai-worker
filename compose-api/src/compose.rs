@@ -262,6 +262,36 @@ impl ComposeManager {
                 )
             });
 
+        // Collect extra env vars: anything not in the core set written by
+        // ensure_env_file / up(). These include user-configured vars like
+        // CHANNEL_RELAY_URL, CHANNEL_RELAY_API_KEY, etc.
+        const CORE_KEYS: &[&str] = &[
+            "NEARAI_API_KEY",
+            "NEARAI_API_URL",
+            "OPENCLAW_GATEWAY_TOKEN",
+            "GATEWAY_PORT",
+            "SSH_PORT",
+            "SSH_PUBKEY",
+            "BASTION_SSH_PUBKEY",
+            "OPENCLAW_IMAGE",
+            "SERVICE_TYPE",
+            "WORKER_NETWORK",
+            "MEM_LIMIT",
+            "CPUS",
+            "STORAGE_SIZE",
+            // OAuth vars written by insert_oauth_env_vars
+            "OPENCLAW_DOMAIN",
+            "OPENCLAW_INSTANCE_NAME",
+            "GOOGLE_OAUTH_CLIENT_ID",
+            "IRONCLAW_OAUTH_EXCHANGE_URL",
+        ];
+        let extra: HashMap<String, String> = vars
+            .iter()
+            .filter(|(k, _)| !CORE_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let extra_env = if extra.is_empty() { None } else { Some(extra) };
+
         Ok(Instance {
             name: name.to_string(),
             token,
@@ -278,7 +308,7 @@ impl ComposeManager {
             mem_limit: vars.get("MEM_LIMIT").cloned(),
             cpus: vars.get("CPUS").cloned(),
             storage_size: vars.get("STORAGE_SIZE").cloned(),
-            extra_env: None,
+            extra_env,
         })
     }
 
