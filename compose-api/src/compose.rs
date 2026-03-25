@@ -126,6 +126,10 @@ impl ComposeManager {
             .expect("default compose file must exist")
     }
 
+    pub fn env_dir(&self) -> &Path {
+        &self.env_dir
+    }
+
     fn env_path(&self, name: &str) -> PathBuf {
         self.env_dir.join(format!("{}.env", name))
     }

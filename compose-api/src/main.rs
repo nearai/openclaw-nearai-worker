@@ -1585,6 +1585,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/services", get(get_services_status))
         .route("/admin/recover/{name}", post(recover_instance))
+        .route("/admin/debug/orphans", get(debug_orphans))
         .route("/admin/debug/health", get(debug_health))
         .route("/admin/debug/active", get(debug_active))
         .route("/admin/debug/backends", get(debug_backends))
@@ -3615,6 +3616,99 @@ async fn recover_instance(
 }
 
 // ── Debug endpoints ──────────────────────────────────────────────────
+
+/// List orphaned instances: .env files and/or Docker volumes that exist
+/// but have no matching entry in the instance store.
+async fn debug_orphans(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let compose = state.compose.clone();
+    let store_names: std::collections::HashSet<String> = {
+        let store = state.store.read().await;
+        store.list().into_iter().map(|i| i.name).collect()
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut orphans: Vec<serde_json::Value> = Vec::new();
+
+        // Scan .env files
+        let env_dir = compose.env_dir();
+        let mut env_names = std::collections::HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(env_dir) {
+            for entry in entries.flatten() {
+                let filename = entry.file_name().to_string_lossy().to_string();
+                if let Some(name) = filename.strip_suffix(".env") {
+                    env_names.insert(name.to_string());
+                }
+            }
+        }
+
+        // Scan Docker volumes for openclaw-*_config pattern
+        let vol_output = std::process::Command::new("docker")
+            .args(["volume", "ls", "--format", "{{.Name}}"])
+            .output()
+            .ok();
+        let mut volume_names = std::collections::HashSet::new();
+        if let Some(output) = vol_output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(name) = line
+                    .strip_prefix("openclaw-")
+                    .and_then(|s| s.strip_suffix("_config"))
+                {
+                    volume_names.insert(name.to_string());
+                }
+            }
+        }
+
+        // Find orphans: have .env or volumes but not in store
+        let all_names: std::collections::HashSet<&String> =
+            env_names.union(&volume_names).collect();
+        for name in all_names {
+            if store_names.contains(name.as_str()) {
+                continue;
+            }
+            let has_env = env_names.contains(name.as_str());
+            let has_volumes = volume_names.contains(name.as_str());
+
+            // Read service_type from .env if available
+            let service_type = if has_env {
+                let env_path = env_dir.join(format!("{}.env", name));
+                std::fs::read_to_string(&env_path)
+                    .ok()
+                    .and_then(|content| {
+                        content.lines().find_map(|line| {
+                            line.strip_prefix("SERVICE_TYPE=")
+                                .map(|v| v.to_string())
+                        })
+                    })
+            } else {
+                None
+            };
+
+            orphans.push(serde_json::json!({
+                "name": name,
+                "has_env": has_env,
+                "has_volumes": has_volumes,
+                "service_type": service_type,
+                "recoverable": has_env && has_volumes,
+            }));
+        }
+
+        orphans.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        orphans
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("task join: {e}")))?;
+
+    let recoverable = result.iter().filter(|o| o["recoverable"] == true).count();
+    Ok(Json(serde_json::json!({
+        "total": result.len(),
+        "recoverable": recoverable,
+        "orphans": result,
+    })))
+}
 
 /// Docker health status for all managed containers (what background sync sees).
 async fn debug_health(
