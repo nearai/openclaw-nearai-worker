@@ -214,75 +214,54 @@ impl AppState {
         .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
-    async fn compose_down(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+    /// Run a blocking ComposeManager method on the tokio blocking pool.
+    async fn compose_blocking<F, R>(&self, f: F) -> Result<R, ApiError>
+    where
+        F: FnOnce(&compose::ComposeManager) -> Result<R, ApiError> + Send + 'static,
+        R: Send + 'static,
+    {
         let compose = self.compose.clone();
-        let name = name.to_string();
-        let service_type = service_type.map(|s| s.to_string());
-        tokio::task::spawn_blocking(move || compose.down(&name, service_type.as_deref()))
+        tokio::task::spawn_blocking(move || f(&compose))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_down(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        let (name, st) = (name.to_string(), service_type.map(str::to_string));
+        self.compose_blocking(move |c| c.down(&name, st.as_deref())).await
+    }
+
+    async fn compose_rm(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        let (name, st) = (name.to_string(), service_type.map(str::to_string));
+        self.compose_blocking(move |c| c.rm(&name, st.as_deref())).await
     }
 
     async fn compose_stop(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
-        let compose = self.compose.clone();
-        let name = name.to_string();
-        let service_type = service_type.map(|s| s.to_string());
-        tokio::task::spawn_blocking(move || compose.stop(&name, service_type.as_deref()))
-            .await
-            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+        let (name, st) = (name.to_string(), service_type.map(str::to_string));
+        self.compose_blocking(move |c| c.stop(&name, st.as_deref())).await
     }
 
     async fn compose_start(&self, name: &str, force_recreate: bool, service_type: Option<&str>) -> Result<(), ApiError> {
-        let compose = self.compose.clone();
-        let name = name.to_string();
-        let service_type = service_type.map(|s| s.to_string());
-        tokio::task::spawn_blocking(move || compose.start(&name, force_recreate, service_type.as_deref()))
-            .await
-            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+        let (name, st) = (name.to_string(), service_type.map(str::to_string));
+        self.compose_blocking(move |c| c.start(&name, force_recreate, st.as_deref())).await
     }
 
-    async fn compose_restart(
-        &self,
-        name: &str,
-        service_type: Option<&str>,
-    ) -> Result<(), ApiError> {
-        let compose = self.compose.clone();
-        let name = name.to_string();
-        let service_type = service_type.map(|s| s.to_string());
-        tokio::task::spawn_blocking(move || compose.restart(&name, service_type.as_deref()))
-            .await
-            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    async fn compose_restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        let (name, st) = (name.to_string(), service_type.map(str::to_string));
+        self.compose_blocking(move |c| c.restart(&name, st.as_deref())).await
     }
 
-    async fn compose_status(
-        &self,
-        name: &str,
-        service_type: Option<&str>,
-    ) -> Result<String, ApiError> {
-        let compose = self.compose.clone();
-        let name = name.to_string();
-        let service_type = service_type.map(|s| s.to_string());
-        tokio::task::spawn_blocking(move || compose.status(&name, service_type.as_deref()))
-            .await
-            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    async fn compose_status(&self, name: &str, service_type: Option<&str>) -> Result<String, ApiError> {
+        let (name, st) = (name.to_string(), service_type.map(str::to_string));
+        self.compose_blocking(move |c| c.status(&name, st.as_deref())).await
     }
 
-    async fn compose_all_statuses(
-        &self,
-    ) -> Result<std::collections::HashMap<String, String>, ApiError> {
-        let compose = self.compose.clone();
-        tokio::task::spawn_blocking(move || compose.all_statuses())
-            .await
-            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    async fn compose_all_statuses(&self) -> Result<std::collections::HashMap<String, String>, ApiError> {
+        self.compose_blocking(|c| c.all_statuses()).await
     }
 
-    async fn compose_all_health_statuses(
-        &self,
-    ) -> Result<std::collections::HashMap<String, compose::ContainerHealth>, ApiError> {
-        let compose = self.compose.clone();
-        tokio::task::spawn_blocking(move || compose.all_health_statuses())
-            .await
-            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    async fn compose_all_health_statuses(&self) -> Result<std::collections::HashMap<String, compose::ContainerHealth>, ApiError> {
+        self.compose_blocking(|c| c.all_health_statuses()).await
     }
 
     async fn compose_container_health(
@@ -3595,6 +3574,15 @@ async fn recover_instance(
             )));
         }
         store.add(inst);
+    }
+
+    // Clean up any stale containers from a previous failed compose run.
+    // Docker Compose can leave hash-prefixed containers (e.g.
+    // "1a7ea7e_openclaw-bold-swan-gateway-1") in "Created" state when
+    // a replacement fails mid-way. These block subsequent `up -d` calls.
+    // Use `rm -f` (not `down -v`) to avoid deleting volumes with user data.
+    if let Err(e) = state.compose_rm(&name, service_type.as_deref()).await {
+        tracing::warn!("recover: failed to clean up stale containers for '{}': {}", name, e);
     }
 
     // Start the container (reads .env, mounts existing volumes)

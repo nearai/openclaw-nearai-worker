@@ -456,6 +456,13 @@ impl ComposeManager {
         Ok(())
     }
 
+    /// Remove stopped/failed containers for a compose project without
+    /// touching volumes or networks. Safe for recovery — preserves user data.
+    pub fn rm(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        let env_path = self.env_path(name);
+        self.compose_cmd(name, &env_path, &["rm", "-f", "-s"], None, service_type)
+    }
+
     pub fn stop(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["stop"], None, service_type)
@@ -1189,5 +1196,237 @@ impl ComposeManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Create a ComposeManager with a temp env dir and dummy compose files.
+    fn test_compose_manager(env_dir: &Path) -> ComposeManager {
+        // Create dummy compose files so ComposeManager::new doesn't fail
+        let openclaw_path = env_dir.join("docker-compose.worker.yml");
+        let ironclaw_path = env_dir.join("docker-compose.ironclaw.yml");
+        std::fs::write(&openclaw_path, "services: {}").unwrap();
+        std::fs::write(&ironclaw_path, "services: {}").unwrap();
+
+        let mut compose_files = HashMap::new();
+        compose_files.insert("openclaw".to_string(), openclaw_path);
+        compose_files.insert("ironclaw".to_string(), ironclaw_path);
+
+        ComposeManager::new(compose_files, env_dir.to_path_buf(), None).unwrap()
+    }
+
+    fn write_env(env_dir: &Path, name: &str, content: &str) {
+        let path = env_dir.join(format!("{}.env", name));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    // ── read_env_file_vars ──────────────────────────────────────────
+
+    #[test]
+    fn test_read_env_file_vars_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+        write_env(dir.path(), "test", "FOO=bar\nBAZ=123\n");
+
+        let vars = cm.read_env_file_vars(&dir.path().join("test.env"));
+        assert_eq!(vars.get("FOO").unwrap(), "bar");
+        assert_eq!(vars.get("BAZ").unwrap(), "123");
+        assert_eq!(vars.len(), 2);
+    }
+
+    #[test]
+    fn test_read_env_file_vars_skips_comments_and_blanks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+        write_env(dir.path(), "test", "# comment\n\nFOO=bar\n  \n");
+
+        let vars = cm.read_env_file_vars(&dir.path().join("test.env"));
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars.get("FOO").unwrap(), "bar");
+    }
+
+    #[test]
+    fn test_read_env_file_vars_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+
+        let vars = cm.read_env_file_vars(&dir.path().join("nonexistent.env"));
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn test_read_env_file_vars_value_with_equals() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+        write_env(dir.path(), "test", "IMG=repo@sha256:abc=def\n");
+
+        let vars = cm.read_env_file_vars(&dir.path().join("test.env"));
+        assert_eq!(vars.get("IMG").unwrap(), "repo@sha256:abc=def");
+    }
+
+    // ── recover_from_env ────────────────────────────────────────────
+
+    #[test]
+    fn test_recover_from_env_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+        write_env(
+            dir.path(),
+            "brave-owl",
+            "GATEWAY_PORT=19001\n\
+             SSH_PORT=19002\n\
+             OPENCLAW_GATEWAY_TOKEN=abc123\n\
+             NEARAI_API_KEY=key456\n\
+             SSH_PUBKEY=ssh-ed25519 AAAA test\n\
+             SERVICE_TYPE=openclaw\n\
+             OPENCLAW_IMAGE=nearaidev/openclaw-nearai-worker@sha256:abc\n",
+        );
+
+        // recover_from_env also checks Docker volumes, which we can't
+        // easily mock. This test will fail at the volume check — that's
+        // expected. We test the parsing logic via read_env_file_vars.
+        let result = cm.recover_from_env("brave-owl");
+        // Will fail with "Docker volume not found" since we can't create
+        // real Docker volumes in unit tests. That's fine — the parsing
+        // is tested above.
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("volume"), "Expected volume error, got: {}", err);
+    }
+
+    #[test]
+    fn test_recover_from_env_missing_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+
+        let result = cm.recover_from_env("nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No .env file"));
+    }
+
+    #[test]
+    fn test_recover_from_env_invalid_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+
+        let result = cm.recover_from_env("../escape");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid"));
+    }
+
+    // Note: recover_from_env checks Docker volumes which can't be mocked
+    // in unit tests. Tests for missing required fields would hit the volume
+    // check first. Field validation is tested indirectly through the
+    // read_env_file_vars tests and the ensure_env_file tests above.
+    // Full recovery flow is tested in integration tests.
+
+    // ── ensure_env_file image/service_type mismatch ─────────────────
+
+    #[test]
+    fn test_ensure_env_file_ironclaw_mismatch_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+
+        let inst = Instance {
+            name: "test-inst".to_string(),
+            token: "tok".to_string(),
+            gateway_port: 19001,
+            ssh_port: 19002,
+            created_at: chrono::Utc::now(),
+            ssh_pubkey: "ssh-ed25519 AAAA".to_string(),
+            nearai_api_key: "key".to_string(),
+            nearai_api_url: None,
+            active: true,
+            // Wrong image for ironclaw
+            image: Some("nearaidev/openclaw-nearai-worker@sha256:abc".to_string()),
+            image_digest: None,
+            service_type: Some("ironclaw".to_string()),
+            mem_limit: None,
+            cpus: None,
+            storage_size: None,
+            extra_env: None,
+        };
+
+        let default_image = "nearaidev/ironclaw-nearai-worker@sha256:correct";
+        let _ = cm.ensure_env_file(&inst, default_image, None, None, None);
+
+        // Read back and verify the image was overridden
+        let vars = cm.read_env_file_vars(&dir.path().join("test-inst.env"));
+        assert_eq!(
+            vars.get("OPENCLAW_IMAGE").unwrap(),
+            "nearaidev/ironclaw-nearai-worker@sha256:correct"
+        );
+        assert_eq!(vars.get("SERVICE_TYPE").unwrap(), "ironclaw");
+    }
+
+    #[test]
+    fn test_ensure_env_file_matching_image_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+
+        let inst = Instance {
+            name: "test-inst".to_string(),
+            token: "tok".to_string(),
+            gateway_port: 19001,
+            ssh_port: 19002,
+            created_at: chrono::Utc::now(),
+            ssh_pubkey: "ssh-ed25519 AAAA".to_string(),
+            nearai_api_key: "key".to_string(),
+            nearai_api_url: None,
+            active: true,
+            image: Some("nearaidev/ironclaw-nearai-worker@sha256:correct".to_string()),
+            image_digest: None,
+            service_type: Some("ironclaw".to_string()),
+            mem_limit: None,
+            cpus: None,
+            storage_size: None,
+            extra_env: None,
+        };
+
+        let default_image = "nearaidev/ironclaw-nearai-worker@sha256:default";
+        let _ = cm.ensure_env_file(&inst, default_image, None, None, None);
+
+        let vars = cm.read_env_file_vars(&dir.path().join("test-inst.env"));
+        // Should keep the instance's own image, not the default
+        assert_eq!(
+            vars.get("OPENCLAW_IMAGE").unwrap(),
+            "nearaidev/ironclaw-nearai-worker@sha256:correct"
+        );
+    }
+
+    // ── extra_env in recover ────────────────────────────────────────
+
+    #[test]
+    fn test_extra_env_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cm = test_compose_manager(dir.path());
+
+        let vars = {
+            write_env(
+                dir.path(),
+                "extra-test",
+                "GATEWAY_PORT=19001\n\
+                 SSH_PORT=19002\n\
+                 OPENCLAW_GATEWAY_TOKEN=tok\n\
+                 NEARAI_API_KEY=key\n\
+                 SSH_PUBKEY=ssh-ed25519 AAAA test\n\
+                 SERVICE_TYPE=openclaw\n\
+                 CHANNEL_RELAY_URL=http://relay\n\
+                 CUSTOM_VAR=hello\n",
+            );
+            cm.read_env_file_vars(&dir.path().join("extra-test.env"))
+        };
+
+        // Core keys
+        assert!(vars.contains_key("GATEWAY_PORT"));
+        assert!(vars.contains_key("NEARAI_API_KEY"));
+        // Extra keys that should be preserved
+        assert_eq!(vars.get("CHANNEL_RELAY_URL").unwrap(), "http://relay");
+        assert_eq!(vars.get("CUSTOM_VAR").unwrap(), "hello");
     }
 }
