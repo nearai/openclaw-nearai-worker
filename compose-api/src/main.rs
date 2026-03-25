@@ -3565,18 +3565,7 @@ async fn recover_instance(
         )));
     }
 
-    // Reject if instance already exists in the store
-    {
-        let store = state.store.read().await;
-        if store.exists(&name) {
-            return Err(ApiError::Conflict(format!(
-                "Instance '{}' already exists. Use /instances/{}/start instead.",
-                name, name
-            )));
-        }
-    }
-
-    // Recover instance metadata from the .env file
+    // Recover instance metadata from the .env file + verify volumes
     let inst = {
         let compose = state.compose.clone();
         let name = name.clone();
@@ -3593,12 +3582,18 @@ async fn recover_instance(
         inst.service_type
     );
 
-    // Add to the store
+    // Atomic check-and-insert under a single write lock to prevent races
     let service_type = inst.service_type.clone();
     let gateway_port = inst.gateway_port;
     let token = inst.token.clone();
     {
         let mut store = state.store.write().await;
+        if store.exists(&name) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' already exists. Use /instances/{}/start instead.",
+                name, name
+            )));
+        }
         store.add(inst);
     }
 
@@ -3663,23 +3658,42 @@ async fn debug_orphans(
             }
         }
 
-        // Scan Docker volumes for openclaw-*_config pattern
+        // Scan Docker volumes for openclaw-*_config and openclaw-*_workspace
         let vol_output = std::process::Command::new("docker")
             .args(["volume", "ls", "--format", "{{.Name}}"])
-            .output()
-            .ok();
-        let mut volume_names = std::collections::HashSet::new();
-        if let Some(output) = vol_output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(name) = line
-                    .strip_prefix("openclaw-")
-                    .and_then(|s| s.strip_suffix("_config"))
-                {
-                    volume_names.insert(name.to_string());
+            .output();
+        let mut config_volumes = std::collections::HashSet::new();
+        let mut workspace_volumes = std::collections::HashSet::new();
+        match vol_output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if let Some(name) = line
+                        .strip_prefix("openclaw-")
+                        .and_then(|s| s.strip_suffix("_config"))
+                    {
+                        config_volumes.insert(name.to_string());
+                    }
+                    if let Some(name) = line
+                        .strip_prefix("openclaw-")
+                        .and_then(|s| s.strip_suffix("_workspace"))
+                    {
+                        workspace_volumes.insert(name.to_string());
+                    }
                 }
             }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!("docker volume ls failed: {}", stderr);
+            }
+            Err(e) => {
+                tracing::warn!("failed to run docker volume ls: {}", e);
+            }
         }
+
+        // Names that have at least one volume
+        let volume_names: std::collections::HashSet<String> =
+            config_volumes.union(&workspace_volumes).cloned().collect();
 
         // Find orphans: have .env or volumes but not in store
         let all_names: std::collections::HashSet<&String> =
@@ -3689,7 +3703,8 @@ async fn debug_orphans(
                 continue;
             }
             let has_env = env_names.contains(name.as_str());
-            let has_volumes = volume_names.contains(name.as_str());
+            let has_config = config_volumes.contains(name.as_str());
+            let has_workspace = workspace_volumes.contains(name.as_str());
 
             // Read service_type from .env if available
             let service_type = if has_env {
@@ -3706,12 +3721,15 @@ async fn debug_orphans(
                 None
             };
 
+            // Recoverable only if .env + both volumes exist
+            let recoverable = has_env && has_config && has_workspace;
             orphans.push(serde_json::json!({
                 "name": name,
                 "has_env": has_env,
-                "has_volumes": has_volumes,
+                "has_config_volume": has_config,
+                "has_workspace_volume": has_workspace,
                 "service_type": service_type,
-                "recoverable": has_env && has_volumes,
+                "recoverable": recoverable,
             }));
         }
 

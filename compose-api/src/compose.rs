@@ -172,7 +172,7 @@ impl ComposeManager {
     /// Used by `start()` to pass env vars explicitly to docker compose,
     /// overriding CVM-level process env (which always has OPENCLAW_IMAGE
     /// set to the openclaw image, even for ironclaw instances).
-    pub fn read_env_file_vars(&self, path: &Path) -> HashMap<String, String> {
+    fn read_env_file_vars(&self, path: &Path) -> HashMap<String, String> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return HashMap::new(),
@@ -207,6 +207,22 @@ impl ComposeManager {
                 "No .env file found for instance '{}'",
                 name
             )));
+        }
+        // Verify both Docker volumes exist (user data)
+        for suffix in &["config", "workspace"] {
+            let vol = format!("openclaw-{}_{}", name, suffix);
+            let check = Command::new("docker")
+                .args(["volume", "inspect", &vol])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap_or_else(|_| std::process::ExitStatus::default());
+            if !check.success() {
+                return Err(ApiError::BadRequest(format!(
+                    "Docker volume '{}' not found — cannot recover without user data",
+                    vol
+                )));
+            }
         }
         let vars = self.read_env_file_vars(&env_path);
 
