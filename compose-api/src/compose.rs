@@ -192,8 +192,15 @@ impl ComposeManager {
 
     /// Recover an instance from its persisted .env file.
     /// Returns the reconstructed Instance if the .env file exists and has
-    /// the required fields (GATEWAY_PORT, SSH_PORT, SSH_PUBKEY, etc.).
+    /// the required fields. Fails if critical fields (token, API key,
+    /// SSH pubkey, ports) are missing or empty.
     pub fn recover_from_env(&self, name: &str) -> Result<Instance, ApiError> {
+        if !crate::is_valid_instance_name(name) {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid instance name: '{}'",
+                name
+            )));
+        }
         let env_path = self.env_path(name);
         if !env_path.exists() {
             return Err(ApiError::NotFound(format!(
@@ -203,27 +210,57 @@ impl ComposeManager {
         }
         let vars = self.read_env_file_vars(&env_path);
 
+        // Required fields — fail recovery if missing/empty
         let gateway_port: u16 = vars
             .get("GATEWAY_PORT")
             .and_then(|v| v.parse().ok())
             .ok_or_else(|| {
-                ApiError::Internal(format!("GATEWAY_PORT missing or invalid in {}.env", name))
+                ApiError::BadRequest(format!("GATEWAY_PORT missing or invalid in {}.env", name))
             })?;
         let ssh_port: u16 = vars
             .get("SSH_PORT")
             .and_then(|v| v.parse().ok())
             .ok_or_else(|| {
-                ApiError::Internal(format!("SSH_PORT missing or invalid in {}.env", name))
+                ApiError::BadRequest(format!("SSH_PORT missing or invalid in {}.env", name))
             })?;
-        let ssh_pubkey = vars.get("SSH_PUBKEY").cloned().unwrap_or_default();
         let token = vars
             .get("OPENCLAW_GATEWAY_TOKEN")
+            .filter(|v| !v.is_empty())
             .cloned()
-            .unwrap_or_default();
-        let nearai_api_key = vars.get("NEARAI_API_KEY").cloned().unwrap_or_default();
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "OPENCLAW_GATEWAY_TOKEN missing or empty in {}.env",
+                    name
+                ))
+            })?;
+        let nearai_api_key = vars
+            .get("NEARAI_API_KEY")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("NEARAI_API_KEY missing or empty in {}.env", name))
+            })?;
+        let ssh_pubkey = vars
+            .get("SSH_PUBKEY")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("SSH_PUBKEY missing or empty in {}.env", name))
+            })?;
+
         let nearai_api_url = vars.get("NEARAI_API_URL").cloned();
         let image = vars.get("OPENCLAW_IMAGE").cloned();
-        let service_type = vars.get("SERVICE_TYPE").cloned();
+
+        // Infer service_type from env, falling back to image name
+        let service_type = vars
+            .get("SERVICE_TYPE")
+            .cloned()
+            .or_else(|| {
+                Some(
+                    self.infer_service_type_from_image(image.as_deref())
+                        .to_string(),
+                )
+            });
 
         Ok(Instance {
             name: name.to_string(),

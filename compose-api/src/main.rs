@@ -3549,6 +3549,14 @@ async fn recover_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Validate instance name (prevent path traversal)
+    if !is_valid_instance_name(&name) {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid instance name: '{}'",
+            name
+        )));
+    }
+
     // Reject if instance already exists in the store
     {
         let store = state.store.read().await;
@@ -3579,6 +3587,8 @@ async fn recover_instance(
 
     // Add to the store
     let service_type = inst.service_type.clone();
+    let gateway_port = inst.gateway_port;
+    let token = inst.token.clone();
     {
         let mut store = state.store.write().await;
         store.add(inst);
@@ -3598,14 +3608,15 @@ async fn recover_instance(
         )));
     }
 
-    // Update nginx routing
+    // Mark active so nginx routes immediately (don't wait for background sync)
+    {
+        let mut store = state.store.write().await;
+        let _ = store.set_active(&name, true);
+    }
     update_nginx_now(&state).await;
 
-    let (url, dashboard_url) = {
-        let store = state.store.read().await;
-        let inst = store.get(&name).unwrap();
-        generate_urls(&state.config, &name, inst.gateway_port, &inst.token)
-    };
+    let (url, dashboard_url) =
+        generate_urls(&state.config, &name, gateway_port, &token);
 
     Ok(Json(serde_json::json!({
         "name": name,
