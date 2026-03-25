@@ -939,16 +939,35 @@ impl ComposeManager {
         if let Some(ref bastion_key) = self.bastion_ssh_pubkey {
             vars.insert("BASTION_SSH_PUBKEY".into(), bastion_key.clone());
         }
-        let image = inst.image.as_deref().unwrap_or(default_image);
-        vars.insert("OPENCLAW_IMAGE".into(), image.to_string());
+        // Resolve service_type first — needed to validate the image.
         // Prefer in-memory service_type, then existing .env value; only then default to openclaw.
-        // Avoids overwriting a correct SERVICE_TYPE=ironclaw in .env when instance was discovered
-        // without label/env and .env hadn't been read yet.
         let service_type = inst
             .service_type
             .clone()
             .or_else(|| self.read_service_type_from_env_file(&inst.name))
             .unwrap_or_else(|| "openclaw".to_string());
+        // Use the instance's stored image, but if it doesn't match the
+        // service_type (e.g. openclaw image on an ironclaw instance after
+        // a botched restart), fall back to the correct default.
+        let image = match inst.image.as_deref() {
+            Some(img) if service_type == "ironclaw" && !img.contains("ironclaw") => {
+                tracing::warn!(
+                    "Instance '{}': stored image '{}' doesn't match service_type 'ironclaw', using default",
+                    inst.name, img
+                );
+                default_image
+            }
+            Some(img) if service_type != "ironclaw" && img.contains("ironclaw") => {
+                tracing::warn!(
+                    "Instance '{}': stored image '{}' doesn't match service_type '{}', using default",
+                    inst.name, img, service_type
+                );
+                default_image
+            }
+            Some(img) => img,
+            None => default_image,
+        };
+        vars.insert("OPENCLAW_IMAGE".into(), image.to_string());
         vars.insert("SERVICE_TYPE".into(), service_type);
         vars.insert("WORKER_NETWORK".into(), Self::network_name(&inst.name));
         insert_oauth_env_vars(
