@@ -1844,6 +1844,14 @@ struct BackupDownloadResponse {
     expires_in_seconds: u64,
 }
 
+#[derive(Serialize)]
+struct RecoverInstanceResponse {
+    name: String,
+    status: String,
+    url: String,
+    dashboard_url: String,
+}
+
 pub fn is_valid_instance_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 32
@@ -3618,12 +3626,12 @@ async fn recover_instance(
     let (url, dashboard_url) =
         generate_urls(&state.config, &name, gateway_port, &token);
 
-    Ok(Json(serde_json::json!({
-        "name": name,
-        "status": "recovered",
-        "url": url,
-        "dashboard_url": dashboard_url,
-    })))
+    Ok(Json(RecoverInstanceResponse {
+        name,
+        status: "recovered".to_string(),
+        url,
+        dashboard_url,
+    }))
 }
 
 // ── Debug endpoints ──────────────────────────────────────────────────
