@@ -1584,6 +1584,7 @@ async fn main() -> anyhow::Result<()> {
             post(restart_management_service),
         )
         .route("/admin/services", get(get_services_status))
+        .route("/admin/recover/{name}", post(recover_instance))
         .route("/admin/debug/health", get(debug_health))
         .route("/admin/debug/active", get(debug_active))
         .route("/admin/debug/backends", get(debug_backends))
@@ -3535,6 +3536,82 @@ async fn get_services_status(_auth: AdminAuth) -> Result<impl IntoResponse, ApiE
     .map_err(|e| ApiError::Internal(format!("task join: {e}")))??;
 
     Ok(Json(ServicesStatusResponse { services }))
+}
+
+// ── Recovery endpoint ────────────────────────────────────────────────
+
+/// Recover a lost instance from its persisted .env file and Docker volumes.
+/// The container is recreated via `docker compose up -d`, mounting the
+/// existing named volumes (config + workspace) so user data is preserved.
+async fn recover_instance(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Reject if instance already exists in the store
+    {
+        let store = state.store.read().await;
+        if store.exists(&name) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' already exists. Use /instances/{}/start instead.",
+                name, name
+            )));
+        }
+    }
+
+    // Recover instance metadata from the .env file
+    let inst = {
+        let compose = state.compose.clone();
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || compose.recover_from_env(&name))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }?;
+
+    tracing::info!(
+        "Recovering instance '{}': port={}, ssh_port={}, service_type={:?}",
+        inst.name,
+        inst.gateway_port,
+        inst.ssh_port,
+        inst.service_type
+    );
+
+    // Add to the store
+    let service_type = inst.service_type.clone();
+    {
+        let mut store = state.store.write().await;
+        store.add(inst);
+    }
+
+    // Start the container (reads .env, mounts existing volumes)
+    if let Err(e) = state
+        .compose_start(&name, false, service_type.as_deref())
+        .await
+    {
+        // Remove from store if start failed
+        let mut store = state.store.write().await;
+        store.remove(&name);
+        return Err(ApiError::Internal(format!(
+            "Failed to start recovered instance: {}",
+            e
+        )));
+    }
+
+    // Update nginx routing
+    update_nginx_now(&state).await;
+
+    let (url, dashboard_url) = {
+        let store = state.store.read().await;
+        let inst = store.get(&name).unwrap();
+        generate_urls(&state.config, &name, inst.gateway_port, &inst.token)
+    };
+
+    Ok(Json(serde_json::json!({
+        "name": name,
+        "status": "recovered",
+        "url": url,
+        "dashboard_url": dashboard_url,
+    })))
 }
 
 // ── Debug endpoints ──────────────────────────────────────────────────

@@ -168,7 +168,7 @@ impl ComposeManager {
     /// Used by `start()` to pass env vars explicitly to docker compose,
     /// overriding CVM-level process env (which always has OPENCLAW_IMAGE
     /// set to the openclaw image, even for ironclaw instances).
-    fn read_env_file_vars(&self, path: &Path) -> HashMap<String, String> {
+    pub fn read_env_file_vars(&self, path: &Path) -> HashMap<String, String> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return HashMap::new(),
@@ -184,6 +184,61 @@ impl ComposeManager {
                 Some((key.to_string(), value.to_string()))
             })
             .collect()
+    }
+
+    /// Recover an instance from its persisted .env file.
+    /// Returns the reconstructed Instance if the .env file exists and has
+    /// the required fields (GATEWAY_PORT, SSH_PORT, SSH_PUBKEY, etc.).
+    pub fn recover_from_env(&self, name: &str) -> Result<Instance, ApiError> {
+        let env_path = self.env_path(name);
+        if !env_path.exists() {
+            return Err(ApiError::NotFound(format!(
+                "No .env file found for instance '{}'",
+                name
+            )));
+        }
+        let vars = self.read_env_file_vars(&env_path);
+
+        let gateway_port: u16 = vars
+            .get("GATEWAY_PORT")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                ApiError::Internal(format!("GATEWAY_PORT missing or invalid in {}.env", name))
+            })?;
+        let ssh_port: u16 = vars
+            .get("SSH_PORT")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                ApiError::Internal(format!("SSH_PORT missing or invalid in {}.env", name))
+            })?;
+        let ssh_pubkey = vars.get("SSH_PUBKEY").cloned().unwrap_or_default();
+        let token = vars
+            .get("OPENCLAW_GATEWAY_TOKEN")
+            .cloned()
+            .unwrap_or_default();
+        let nearai_api_key = vars.get("NEARAI_API_KEY").cloned().unwrap_or_default();
+        let nearai_api_url = vars.get("NEARAI_API_URL").cloned();
+        let image = vars.get("OPENCLAW_IMAGE").cloned();
+        let service_type = vars.get("SERVICE_TYPE").cloned();
+
+        Ok(Instance {
+            name: name.to_string(),
+            token,
+            gateway_port,
+            ssh_port,
+            created_at: chrono::Utc::now(),
+            ssh_pubkey,
+            nearai_api_key,
+            nearai_api_url,
+            active: false,
+            image,
+            image_digest: None,
+            service_type,
+            mem_limit: vars.get("MEM_LIMIT").cloned(),
+            cpus: vars.get("CPUS").cloned(),
+            storage_size: vars.get("STORAGE_SIZE").cloned(),
+            extra_env: None,
+        })
     }
 
     // ── network helpers ───────────────────────────────────────────────
