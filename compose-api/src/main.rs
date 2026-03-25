@@ -3611,9 +3611,9 @@ async fn recover_instance(
     // "1a7ea7e_openclaw-bold-swan-gateway-1") in "Created" state when
     // a replacement fails mid-way. These block subsequent `up -d` calls.
     // Use `rm -f` (not `down -v`) to avoid deleting volumes with user data.
-    let _ = state
-        .compose_rm(&name, service_type.as_deref())
-        .await;
+    if let Err(e) = state.compose_rm(&name, service_type.as_deref()).await {
+        tracing::warn!("recover: failed to clean up stale containers for '{}': {}", name, e);
+    }
 
     // Start the container (reads .env, mounts existing volumes)
     if let Err(e) = state
