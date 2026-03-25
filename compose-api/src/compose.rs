@@ -456,6 +456,13 @@ impl ComposeManager {
         Ok(())
     }
 
+    /// Remove stopped/failed containers for a compose project without
+    /// touching volumes or networks. Safe for recovery — preserves user data.
+    pub fn rm(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        let env_path = self.env_path(name);
+        self.compose_cmd(name, &env_path, &["rm", "-f", "-s"], None, service_type)
+    }
+
     pub fn stop(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["stop"], None, service_type)

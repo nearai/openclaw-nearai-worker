@@ -223,6 +223,15 @@ impl AppState {
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
+    async fn compose_rm(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        let service_type = service_type.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || compose.rm(&name, service_type.as_deref()))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
     async fn compose_stop(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
@@ -3596,6 +3605,15 @@ async fn recover_instance(
         }
         store.add(inst);
     }
+
+    // Clean up any stale containers from a previous failed compose run.
+    // Docker Compose can leave hash-prefixed containers (e.g.
+    // "1a7ea7e_openclaw-bold-swan-gateway-1") in "Created" state when
+    // a replacement fails mid-way. These block subsequent `up -d` calls.
+    // Use `rm -f` (not `down -v`) to avoid deleting volumes with user data.
+    let _ = state
+        .compose_rm(&name, service_type.as_deref())
+        .await;
 
     // Start the container (reads .env, mounts existing volumes)
     if let Err(e) = state
