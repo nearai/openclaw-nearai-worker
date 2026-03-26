@@ -1585,6 +1585,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/services", get(get_services_status))
         .route("/admin/recover/{name}", post(recover_instance))
+        .route("/admin/orphans", delete(delete_all_orphans))
+        .route("/admin/orphans/{name}", delete(delete_orphan))
         .route("/admin/debug/orphans", get(debug_orphans))
         .route("/admin/debug/health", get(debug_health))
         .route("/admin/debug/active", get(debug_active))
@@ -3627,6 +3629,155 @@ async fn recover_instance(
         url,
         dashboard_url,
     }))
+}
+
+// ── Orphan cleanup endpoints ─────────────────────────────────────────
+
+/// Delete a single orphaned instance: removes the Docker container, volumes,
+/// .env file, and network. Rejects if the instance is still tracked in the
+/// store (use `DELETE /instances/{name}` for those).
+async fn delete_orphan(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !is_valid_instance_name(&name) {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid instance name: '{}'",
+            name
+        )));
+    }
+
+    // Guard: refuse to delete tracked instances via this endpoint
+    {
+        let store = state.store.read().await;
+        if store.exists(&name) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' is tracked in the store. Use DELETE /instances/{} instead.",
+                name, name
+            )));
+        }
+    }
+
+    let compose = state.compose.clone();
+    let name_clone = name.clone();
+    tokio::task::spawn_blocking(move || {
+        let service_type = compose.read_service_type_from_env_file(&name_clone);
+        compose.down(&name_clone, service_type.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    .map_err(|e| {
+        tracing::warn!("Failed to clean up orphan '{}': {}", name, e);
+        e
+    })?;
+
+    tracing::info!("Deleted orphan '{}'", name);
+
+    Ok(Json(serde_json::json!({
+        "deleted": name,
+        "status": "ok"
+    })))
+}
+
+/// Delete all orphaned instances at once. Scans for .env files and Docker
+/// volumes not tracked in the store, then runs `docker compose down -v` for
+/// each.
+async fn delete_all_orphans(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let compose = state.compose.clone();
+    let store_names: std::collections::HashSet<String> = {
+        let store = state.store.read().await;
+        store.list().into_iter().map(|i| i.name).collect()
+    };
+
+    // Discover orphan names (same scan logic as debug_orphans)
+    let orphan_names: Vec<String> = {
+        let compose = compose.clone();
+        let store_names = store_names.clone();
+        tokio::task::spawn_blocking(move || {
+            let env_dir = compose.env_dir();
+            let mut names = std::collections::HashSet::new();
+
+            // Scan .env files
+            if let Ok(entries) = std::fs::read_dir(env_dir) {
+                for entry in entries.flatten() {
+                    let filename = entry.file_name().to_string_lossy().to_string();
+                    if let Some(name) = filename.strip_suffix(".env") {
+                        if !store_names.contains(name) {
+                            names.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Scan Docker volumes
+            if let Ok(output) = std::process::Command::new("docker")
+                .args(["volume", "ls", "--format", "{{.Name}}"])
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        let vol_name = line
+                            .strip_prefix("openclaw-")
+                            .and_then(|s| {
+                                s.strip_suffix("_config")
+                                    .or_else(|| s.strip_suffix("_workspace"))
+                            });
+                        if let Some(name) = vol_name {
+                            if !store_names.contains(name) {
+                                names.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut sorted: Vec<String> = names.into_iter().collect();
+            sorted.sort();
+            sorted
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    };
+
+    let total = orphan_names.len();
+    let mut deleted = Vec::new();
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+
+    for name in orphan_names {
+        let compose = compose.clone();
+        let name_clone = name.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let service_type = compose.read_service_type_from_env_file(&name_clone);
+            compose.down(&name_clone, service_type.as_deref())
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?;
+
+        match result {
+            Ok(()) => {
+                tracing::info!("Deleted orphan '{}'", name);
+                deleted.push(name);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to clean up orphan '{}': {}", name, e);
+                errors.push(serde_json::json!({
+                    "name": name,
+                    "error": e.to_string()
+                }));
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "total": total,
+        "deleted": deleted,
+        "errors": errors
+    })))
 }
 
 // ── Debug endpoints ──────────────────────────────────────────────────
@@ -5801,5 +5952,116 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── delete_orphan ───────────────────────────────────────────────
+
+    fn test_admin_app() -> (Router, String) {
+        let config = AppConfig::test_default();
+        let admin_token = "a".repeat(32);
+
+        let mut compose_files = std::collections::HashMap::new();
+        compose_files.insert("openclaw".to_string(), config.compose_file.clone());
+        let compose = Arc::new(
+            ComposeManager::new(
+                compose_files,
+                std::path::PathBuf::from("/tmp/test-orphan-envs"),
+                None,
+            )
+            .unwrap(),
+        );
+
+        let instance = Instance {
+            name: "tracked-inst".to_string(),
+            token: "test-token".to_string(),
+            gateway_port: 19001,
+            ssh_port: 19002,
+            created_at: chrono::Utc::now(),
+            ssh_pubkey: "ssh-ed25519 AAAA".to_string(),
+            nearai_api_key: "sk-test".to_string(),
+            nearai_api_url: None,
+            active: true,
+            image: None,
+            image_digest: None,
+            service_type: Some("openclaw".to_string()),
+            mem_limit: None,
+            cpus: None,
+            storage_size: None,
+            extra_env: None,
+        };
+
+        let mut instance_store = store::InstanceStore::new(PortRange::from_env());
+        instance_store.populate(vec![instance]);
+
+        let state = AppState {
+            compose,
+            store: Arc::new(RwLock::new(instance_store)),
+            config: Arc::new(config),
+            backup: None,
+            upgrading: Arc::new(Mutex::new(HashSet::new())),
+            oauth_exchange_url: None,
+            http_client: reqwest::Client::new(),
+            #[cfg(test)]
+            allow_private_oauth_token_endpoints: false,
+        };
+
+        let app = Router::new()
+            .route("/admin/orphans/{name}", delete(delete_orphan))
+            .with_state(state);
+
+        (app, admin_token)
+    }
+
+    #[tokio::test]
+    async fn test_delete_orphan_rejects_invalid_name() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (app, token) = test_admin_app();
+
+        let request = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/admin/orphans/bad_name!")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_orphan_rejects_tracked_instance() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (app, token) = test_admin_app();
+
+        let request = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/admin/orphans/tracked-inst")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_orphan_requires_auth() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (app, _token) = test_admin_app();
+
+        let request = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/admin/orphans/some-orphan")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

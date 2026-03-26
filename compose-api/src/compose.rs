@@ -1134,7 +1134,7 @@ impl ComposeManager {
     /// Read SERVICE_TYPE from the persisted .env file for an instance.
     /// Fallback for containers created before SERVICE_TYPE was added to the
     /// compose template environment block.
-    fn read_service_type_from_env_file(&self, name: &str) -> Option<String> {
+    pub fn read_service_type_from_env_file(&self, name: &str) -> Option<String> {
         let path = self.env_path(name);
         let content = std::fs::read_to_string(&path).ok()?;
         for line in content.lines() {
