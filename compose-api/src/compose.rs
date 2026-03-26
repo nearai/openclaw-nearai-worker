@@ -268,15 +268,12 @@ impl ComposeManager {
         let image = vars.get("OPENCLAW_IMAGE").cloned();
 
         // Infer service_type from env, falling back to image name
-        let service_type = vars
-            .get("SERVICE_TYPE")
-            .cloned()
-            .or_else(|| {
-                Some(
-                    self.infer_service_type_from_image(image.as_deref())
-                        .to_string(),
-                )
-            });
+        let service_type = vars.get("SERVICE_TYPE").cloned().or_else(|| {
+            Some(
+                self.infer_service_type_from_image(image.as_deref())
+                    .to_string(),
+            )
+        });
 
         // Collect extra env vars: anything not in the core set written by
         // ensure_env_file / up(). These include user-configured vars like
@@ -362,9 +359,7 @@ impl ComposeManager {
     /// Remove the per-instance Docker network (best-effort, ignore errors).
     fn remove_network(instance_name: &str) {
         let net = Self::network_name(instance_name);
-        let _ = Command::new("docker")
-            .args(["network", "rm", &net])
-            .output();
+        let _ = docker_command().args(["network", "rm", &net]).output();
     }
 
     // ── compose lifecycle ─────────────────────────────────────────────
@@ -461,7 +456,12 @@ impl ComposeManager {
         self.compose_cmd(name, &env_path, &["stop"], None, service_type)
     }
 
-    pub fn start(&self, name: &str, force_recreate: bool, service_type: Option<&str>) -> Result<(), ApiError> {
+    pub fn start(
+        &self,
+        name: &str,
+        force_recreate: bool,
+        service_type: Option<&str>,
+    ) -> Result<(), ApiError> {
         Self::ensure_network(name)?;
         let env_path = self.env_path(name);
         // Read OPENCLAW_IMAGE from the instance .env file and pass it
@@ -481,6 +481,46 @@ impl ComposeManager {
 
     pub fn restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         self.start(name, true, service_type)
+    }
+
+    /// Delete an orphaned instance even if its `.env` file is missing.
+    /// When the env file exists we try the normal compose-managed teardown first;
+    /// otherwise we fall back to removing known container/volumes/network by name.
+    pub fn cleanup_orphan(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        let env_path = self.env_path(name);
+        if env_path.exists() {
+            match self.down(name, service_type) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        "compose down failed for orphan '{}', falling back to direct cleanup: {}",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+
+        self.remove_named_artifact(
+            "container",
+            &["rm", "-f", &format!("openclaw-{}-gateway-1", name)],
+        )?;
+        self.remove_named_artifact(
+            "volume",
+            &["volume", "rm", "-f", &format!("openclaw-{}_config", name)],
+        )?;
+        self.remove_named_artifact(
+            "volume",
+            &[
+                "volume",
+                "rm",
+                "-f",
+                &format!("openclaw-{}_workspace", name),
+            ],
+        )?;
+        self.remove_env_file(name);
+        Self::remove_network(name);
+        Ok(())
     }
 
     /// Returns the output of `docker compose ps --format json`.
@@ -673,9 +713,7 @@ impl ComposeManager {
                 }
                 // Parse health from status text: "Up 5 min (healthy)" → "healthy"
                 let health = if let Some(start) = status_text.rfind('(') {
-                    status_text[start + 1..]
-                        .trim_end_matches(')')
-                        .to_string()
+                    status_text[start + 1..].trim_end_matches(')').to_string()
                 } else {
                     "none".to_string()
                 };
@@ -1134,7 +1172,7 @@ impl ComposeManager {
     /// Read SERVICE_TYPE from the persisted .env file for an instance.
     /// Fallback for containers created before SERVICE_TYPE was added to the
     /// compose template environment block.
-    fn read_service_type_from_env_file(&self, name: &str) -> Option<String> {
+    pub fn read_service_type_from_env_file(&self, name: &str) -> Option<String> {
         let path = self.env_path(name);
         let content = std::fs::read_to_string(&path).ok()?;
         for line in content.lines() {
@@ -1161,7 +1199,7 @@ impl ComposeManager {
         let project = format!("openclaw-{}", name);
         let compose_file = self.compose_file_for(service_type);
 
-        let mut cmd = Command::new("docker");
+        let mut cmd = docker_command();
         cmd.args([
             "compose",
             "-p",
@@ -1189,5 +1227,45 @@ impl ComposeManager {
         }
 
         Ok(())
+    }
+
+    fn remove_named_artifact(&self, artifact: &str, args: &[&str]) -> Result<(), ApiError> {
+        let output = docker_command().args(args).output().map_err(|e| {
+            ApiError::Internal(format!("failed to run docker {} command: {}", artifact, e))
+        })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_lower = stderr.to_lowercase();
+        let missing = stderr_lower.contains("no such")
+            || stderr_lower.contains("not found")
+            || stderr_lower.contains("no such container")
+            || stderr_lower.contains("no such volume");
+        if missing {
+            return Ok(());
+        }
+
+        Err(ApiError::Internal(format!(
+            "failed to remove {}: {}",
+            artifact,
+            stderr.trim()
+        )))
+    }
+}
+
+#[cfg(not(test))]
+fn docker_command() -> Command {
+    Command::new("docker")
+}
+
+#[cfg(test)]
+fn docker_command() -> Command {
+    if let Ok(path) = std::env::var("OPENCLAW_TEST_DOCKER_BIN") {
+        Command::new(path)
+    } else {
+        Command::new("docker")
     }
 }
