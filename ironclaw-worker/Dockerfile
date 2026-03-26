@@ -43,7 +43,7 @@ RUN --mount=type=bind,source=.,target=/ctx \
       cp /ctx/ironclaw /usr/local/bin/ironclaw; \
     else \
       echo "Downloading ironclaw v${IRONCLAW_VERSION} from GitHub releases"; \
-      curl -fsSL "https://github.com/nearai/ironclaw/releases/download/v${IRONCLAW_VERSION}/ironclaw-x86_64-unknown-linux-gnu.tar.gz" \
+      curl -fsSL "https://github.com/nearai/ironclaw/releases/download/ironclaw-v${IRONCLAW_VERSION}/ironclaw-x86_64-unknown-linux-gnu.tar.gz" \
         -o /tmp/ironclaw.tar.gz && \
       tar xzf /tmp/ironclaw.tar.gz -C /tmp && \
       mv /tmp/ironclaw-*/ironclaw /usr/local/bin/ironclaw && \
