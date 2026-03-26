@@ -6111,10 +6111,10 @@ mod tests {
 
     // ── orphan cleanup ──────────────────────────────────────────────
 
-    static ORPHAN_TEST_ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    static ORPHAN_TEST_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
-    fn orphan_test_env_lock() -> &'static std::sync::Mutex<()> {
-        ORPHAN_TEST_ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn orphan_test_env_lock() -> &'static tokio::sync::Mutex<()> {
+        ORPHAN_TEST_ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     struct EnvVarGuard {
@@ -6402,7 +6402,7 @@ exit 1
         use axum::body::{to_bytes, Body};
         use tower::ServiceExt;
 
-        let _lock = orphan_test_env_lock().lock().unwrap();
+        let _lock = orphan_test_env_lock().lock().await;
         let test_app = test_admin_app();
         std::fs::write(
             test_app.env_dir.path().join("orphan-alpha.env"),
@@ -6484,7 +6484,7 @@ exit 1
         use axum::body::{to_bytes, Body};
         use tower::ServiceExt;
 
-        let _lock = orphan_test_env_lock().lock().unwrap();
+        let _lock = orphan_test_env_lock().lock().await;
         let test_app = test_admin_app();
 
         let (docker_dir, docker_log) = write_fake_docker(&[
@@ -6536,7 +6536,7 @@ exit 1
         use axum::body::{to_bytes, Body};
         use tower::ServiceExt;
 
-        let _lock = orphan_test_env_lock().lock().unwrap();
+        let _lock = orphan_test_env_lock().lock().await;
         let test_app = test_admin_app();
         std::fs::remove_dir_all(test_app.env_dir.path()).unwrap();
 
@@ -6576,7 +6576,7 @@ exit 1
         use axum::body::{to_bytes, Body};
         use tower::ServiceExt;
 
-        let _lock = orphan_test_env_lock().lock().unwrap();
+        let _lock = orphan_test_env_lock().lock().await;
         let test_app = test_admin_app();
         std::fs::write(
             test_app.env_dir.path().join("bad_name!.env"),
@@ -6623,7 +6623,7 @@ exit 1
         use axum::body::{to_bytes, Body};
         use tower::ServiceExt;
 
-        let _lock = orphan_test_env_lock().lock().unwrap();
+        let _lock = orphan_test_env_lock().lock().await;
         let test_app = test_admin_app();
 
         let (docker_dir, docker_log) = write_fake_docker_missing_artifacts(&[
