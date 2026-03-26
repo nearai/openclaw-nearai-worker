@@ -139,6 +139,8 @@ struct AppState {
     backup: Option<Arc<BackupManager>>,
     /// Per-instance lock to prevent concurrent upgrades.
     upgrading: Arc<Mutex<HashSet<String>>>,
+    /// Per-instance lock set to prevent a name from becoming tracked while orphan cleanup is in progress.
+    orphan_cleaning: Arc<Mutex<HashSet<String>>>,
     /// URL exposed to ironclaw containers for them to proxy OAuth token exchanges through this service
     /// (e.g. "http://host.docker.internal:8080"). Always set when the service is running — generic
     /// OAuth providers send their own credentials, so this is not gated on Google creds.
@@ -347,6 +349,31 @@ impl AppState {
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
+}
+
+async fn try_reserve_orphan_cleanup(state: &AppState, name: &str) -> Result<(), ApiError> {
+    let mut orphan_cleaning = state.orphan_cleaning.lock().await;
+    if !orphan_cleaning.insert(name.to_string()) {
+        return Err(ApiError::Conflict(format!(
+            "Instance '{}' is currently being cleaned up as an orphan",
+            name
+        )));
+    }
+
+    let store = state.store.read().await;
+    if store.exists(name) {
+        orphan_cleaning.remove(name);
+        return Err(ApiError::Conflict(format!(
+            "Instance '{}' is tracked in the store. Use DELETE /instances/{} instead.",
+            name, name
+        )));
+    }
+
+    Ok(())
+}
+
+async fn release_orphan_cleanup(state: &AppState, name: &str) {
+    state.orphan_cleaning.lock().await.remove(name);
 }
 
 /// Extractor that validates the admin token from the Authorization header
@@ -1558,6 +1585,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         backup,
         upgrading: Arc::new(Mutex::new(HashSet::new())),
+        orphan_cleaning: Arc::new(Mutex::new(HashSet::new())),
         oauth_exchange_url: oauth_exchange_url.clone(),
         http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -2229,24 +2257,56 @@ async fn create_instance(
                 sanitized
             )));
         }
-        let store = state.store.read().await;
-        if store.exists(&sanitized) {
-            return Err(ApiError::Conflict(format!(
-                "Instance '{}' already exists",
-                sanitized
-            )));
-        }
         sanitized
     } else {
-        let store = state.store.read().await;
-        names::generate_name(|n| store.exists(n))
-            .ok_or_else(|| ApiError::Internal("Failed to generate unique name".into()))?
+        String::new()
     };
 
     let token = generate_token();
-    let (gateway_port, ssh_port) = {
-        let store = state.store.read().await;
-        store.next_available_ports()?
+    let (name, gateway_port, ssh_port) = {
+        let orphan_cleaning = state.orphan_cleaning.lock().await;
+        let mut store = state.store.write().await;
+
+        let name = if let Some(_provided) = &req.name {
+            if orphan_cleaning.contains(&name) {
+                return Err(ApiError::Conflict(format!(
+                    "Instance '{}' is currently being cleaned up as an orphan",
+                    name
+                )));
+            }
+            if store.exists(&name) {
+                return Err(ApiError::Conflict(format!(
+                    "Instance '{}' already exists",
+                    name
+                )));
+            }
+            name
+        } else {
+            names::generate_name(|n| store.exists(n) || orphan_cleaning.contains(n))
+                .ok_or_else(|| ApiError::Internal("Failed to generate unique name".into()))?
+        };
+
+        let (gateway_port, ssh_port) = store.next_available_ports()?;
+        store.add(Instance {
+            name: name.clone(),
+            token: token.clone(),
+            gateway_port,
+            ssh_port,
+            created_at: chrono::Utc::now(),
+            ssh_pubkey: req.ssh_pubkey.clone(),
+            nearai_api_key: req.nearai_api_key.clone(),
+            nearai_api_url: Some(nearai_api_url.clone()),
+            active: true,
+            image: Some(image.clone()),
+            image_digest: None,
+            service_type: Some(service_type.clone()),
+            mem_limit: req.mem_limit.clone(),
+            cpus: req.cpus.clone(),
+            storage_size: req.storage_size.clone(),
+            extra_env: req.extra_env.clone(),
+        });
+
+        (name, gateway_port, ssh_port)
     };
 
     let (url, dashboard_url) = generate_urls(&state.config, &name, gateway_port, &token);
@@ -2263,31 +2323,6 @@ async fn create_instance(
         image: image.clone(),
         image_digest: None,
     };
-
-    let instance = Instance {
-        name: name.clone(),
-        token: token.clone(),
-        gateway_port,
-        ssh_port,
-        created_at: chrono::Utc::now(),
-        ssh_pubkey: req.ssh_pubkey.clone(),
-        nearai_api_key: req.nearai_api_key.clone(),
-        nearai_api_url: Some(nearai_api_url.clone()),
-        active: true,
-        image: Some(image.clone()),
-        image_digest: None,
-        service_type: Some(service_type.clone()),
-        mem_limit: req.mem_limit.clone(),
-        cpus: req.cpus.clone(),
-        storage_size: req.storage_size.clone(),
-        extra_env: req.extra_env.clone(),
-    };
-
-    // Save to store before streaming so it's persisted immediately
-    {
-        let mut store = state.store.write().await;
-        store.add(instance);
-    }
 
     let nearai_api_key = req.nearai_api_key.clone();
     let ssh_pubkey = req.ssh_pubkey.clone();
@@ -3603,6 +3638,16 @@ async fn recover_instance(
         )));
     }
 
+    {
+        let orphan_cleaning = state.orphan_cleaning.lock().await;
+        if orphan_cleaning.contains(&name) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' is currently being cleaned up as an orphan",
+                name
+            )));
+        }
+    }
+
     // Recover instance metadata from the .env file + verify volumes
     let inst = {
         let compose = state.compose.clone();
@@ -3625,6 +3670,14 @@ async fn recover_instance(
     let gateway_port = inst.gateway_port;
     let token = inst.token.clone();
     {
+        let orphan_cleaning = state.orphan_cleaning.lock().await;
+        if orphan_cleaning.contains(&name) {
+            return Err(ApiError::Conflict(format!(
+                "Instance '{}' is currently being cleaned up as an orphan",
+                name
+            )));
+        }
+
         let mut store = state.store.write().await;
         if store.exists(&name) {
             return Err(ApiError::Conflict(format!(
@@ -3694,29 +3747,25 @@ async fn delete_orphan(
         )));
     }
 
-    // Guard: refuse to delete tracked instances via this endpoint
-    {
-        let store = state.store.read().await;
-        if store.exists(&name) {
-            return Err(ApiError::Conflict(format!(
-                "Instance '{}' is tracked in the store. Use DELETE /instances/{} instead.",
-                name, name
-            )));
-        }
-    }
+    try_reserve_orphan_cleanup(&state, &name).await?;
 
     let compose = state.compose.clone();
     let name_clone = name.clone();
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let service_type = compose.read_service_type_from_env_file(&name_clone);
         compose.cleanup_orphan(&name_clone, service_type.as_deref())
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
-    .map_err(|e| {
-        tracing::warn!("Failed to clean up orphan '{}': {}", name, e);
-        e
-    })?;
+    .map_err(|e| ApiError::Internal(format!("task join: {e}")))
+    .and_then(|r| {
+        r.map_err(|e| {
+            tracing::warn!("Failed to clean up orphan '{}': {}", name, e);
+            e
+        })
+    });
+
+    release_orphan_cleanup(&state, &name).await;
+    result?;
 
     tracing::info!("Deleted orphan '{}'", name);
 
@@ -3828,20 +3877,14 @@ async fn delete_all_orphans(
     }
 
     for name in orphan_names {
-        {
-            let store = state.store.read().await;
-            if store.exists(&name) {
-                let error = OrphanCleanupError {
-                    name: Some(name.clone()),
-                    error: format!(
-                        "Instance '{}' became tracked during cleanup; skipped deletion",
-                        name
-                    ),
-                };
-                tracing::warn!("{}", error.error);
-                errors.push(error);
-                continue;
-            }
+        if let Err(e) = try_reserve_orphan_cleanup(&state, &name).await {
+            let error = OrphanCleanupError {
+                name: Some(name.clone()),
+                error: e.to_string(),
+            };
+            tracing::warn!("{}", error.error);
+            errors.push(error);
+            continue;
         }
 
         let compose = compose.clone();
@@ -3851,20 +3894,23 @@ async fn delete_all_orphans(
             compose.cleanup_orphan(&name_clone, service_type.as_deref())
         })
         .await
-        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("task join: {e}")));
+
+        release_orphan_cleanup(&state, &name).await;
 
         match result {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 tracing::info!("Deleted orphan '{}'", name);
                 deleted.push(name);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!("Failed to clean up orphan '{}': {}", name, e);
                 errors.push(OrphanCleanupError {
                     name: Some(name),
                     error: e.to_string(),
                 });
             }
+            Err(e) => return Err(e),
         }
     }
 
@@ -5096,6 +5142,7 @@ mod tests {
             config: Arc::new(config),
             backup: None,
             upgrading: Arc::new(Mutex::new(HashSet::new())),
+            orphan_cleaning: Arc::new(Mutex::new(HashSet::new())),
             oauth_exchange_url: None,
             http_client: reqwest::Client::new(),
             allow_private_oauth_token_endpoints: false,
@@ -5462,6 +5509,7 @@ mod tests {
             config: Arc::new(config),
             backup: None,
             upgrading: Arc::new(Mutex::new(HashSet::new())),
+            orphan_cleaning: Arc::new(Mutex::new(HashSet::new())),
             oauth_exchange_url: None,
             http_client: reqwest::Client::new(),
             allow_private_oauth_token_endpoints,
@@ -6096,6 +6144,7 @@ mod tests {
         app: Router,
         token: String,
         env_dir: tempfile::TempDir,
+        orphan_cleaning: Arc<Mutex<HashSet<String>>>,
     }
 
     fn write_fake_docker(volume_names: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -6245,12 +6294,14 @@ exit 1
         let mut instance_store = store::InstanceStore::new(PortRange::from_env());
         instance_store.populate(vec![instance]);
 
+        let orphan_cleaning = Arc::new(Mutex::new(HashSet::new()));
         let state = AppState {
             compose,
             store: Arc::new(RwLock::new(instance_store)),
             config: Arc::new(config),
             backup: None,
             upgrading: Arc::new(Mutex::new(HashSet::new())),
+            orphan_cleaning: orphan_cleaning.clone(),
             oauth_exchange_url: None,
             http_client: reqwest::Client::new(),
             #[cfg(test)]
@@ -6266,6 +6317,7 @@ exit 1
             app,
             token: admin_token,
             env_dir,
+            orphan_cleaning,
         }
     }
 
@@ -6297,6 +6349,29 @@ exit 1
         let request = axum::http::Request::builder()
             .method("DELETE")
             .uri("/admin/orphans/tracked-inst")
+            .header("Authorization", format!("Bearer {}", test_app.token))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = test_app.app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_orphan_rejects_name_already_being_cleaned() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let test_app = test_admin_app();
+        test_app
+            .orphan_cleaning
+            .lock()
+            .await
+            .insert("some-orphan".to_string());
+
+        let request = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/admin/orphans/some-orphan")
             .header("Authorization", format!("Bearer {}", test_app.token))
             .body(Body::empty())
             .unwrap();
