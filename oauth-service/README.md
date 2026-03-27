@@ -77,3 +77,20 @@ This service is compatible with the current hosted IronClaw contract:
 cargo test
 docker build -t openclaw-oauth-service:local .
 ```
+
+## Publish Image
+
+This repo's GitHub Actions build workflow publishes `oauth-service` to Docker Hub
+as `docker.io/<DOCKER_REGISTRY_USER>/openclaw-oauth-service:<tag>`.
+
+Tag behavior matches the other repo images:
+
+- `main` branch builds publish `:dev`
+- `v*` tags publish the version number without the leading `v`
+- manual workflow runs can override the tag with the `tag` input
+
+Example pull:
+
+```bash
+docker pull docker.io/<your-dockerhub-user>/openclaw-oauth-service:dev
+```
