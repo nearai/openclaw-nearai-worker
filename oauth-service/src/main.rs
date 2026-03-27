@@ -19,6 +19,7 @@ mod error;
 use crate::error::ApiError;
 
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+const MAX_UPSTREAM_BODY_SIZE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -413,12 +414,14 @@ fn build_token_http_client(
         resolved_addrs: endpoint.resolved_addrs.clone(),
     };
 
-    let mut pinned_http_clients = state
-        .pinned_http_clients
-        .lock()
-        .map_err(|_| ApiError::Internal("Pinned HTTP client cache lock was poisoned".into()))?;
-    if let Some(client) = pinned_http_clients.get(&cache_key).cloned() {
-        return Ok(client);
+    {
+        let pinned_http_clients = state
+            .pinned_http_clients
+            .lock()
+            .map_err(|_| ApiError::Internal("Pinned HTTP client cache lock was poisoned".into()))?;
+        if let Some(client) = pinned_http_clients.get(&cache_key).cloned() {
+            return Ok(client);
+        }
     }
 
     let client = reqwest::Client::builder()
@@ -430,6 +433,13 @@ fn build_token_http_client(
             ApiError::Internal(format!("Failed to build pinned HTTP client: {}", err))
         })?;
 
+    let mut pinned_http_clients = state
+        .pinned_http_clients
+        .lock()
+        .map_err(|_| ApiError::Internal("Pinned HTTP client cache lock was poisoned".into()))?;
+    if let Some(existing_client) = pinned_http_clients.get(&cache_key).cloned() {
+        return Ok(existing_client);
+    }
     pinned_http_clients.insert(cache_key, client.clone());
     Ok(client)
 }
@@ -453,14 +463,25 @@ fn response_with_body(
 }
 
 async fn forward_provider_response(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     context: &str,
 ) -> Result<Response<Body>, ApiError> {
     let status = response.status();
     let content_type = response.headers().get(CONTENT_TYPE).cloned();
-    let body = response.bytes().await.map_err(|err| {
+    let mut body = bytes::BytesMut::new();
+
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
         ApiError::Internal(format!("Failed to read {} response body: {}", context, err))
-    })?;
+    })? {
+        if body.len().saturating_add(chunk.len()) > MAX_UPSTREAM_BODY_SIZE_BYTES {
+            return Err(ApiError::Internal(format!(
+                "{} response body exceeded maximum size of {} bytes",
+                context, MAX_UPSTREAM_BODY_SIZE_BYTES
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = body.freeze();
 
     if !status.is_success() {
         tracing::warn!(status = %status, "{} failed", context);
@@ -700,6 +721,41 @@ mod tests {
         format!("http://{}/token", addr)
     }
 
+    async fn spawn_dynamic_token_server(
+        status: StatusCode,
+        body: String,
+        captured_body: Arc<Mutex<Option<String>>>,
+    ) -> String {
+        let body = Arc::new(body);
+        let app = Router::new().route(
+            "/token",
+            post({
+                let captured_body = captured_body.clone();
+                let body = body.clone();
+                move |request_body: String| {
+                    let captured_body = captured_body.clone();
+                    let body = body.clone();
+                    async move {
+                        *captured_body.lock().unwrap() = Some(request_body);
+                        (
+                            status,
+                            [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+                            (*body).clone(),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{}/token", addr)
+    }
+
     #[test]
     fn proxy_auth_token_falls_back_to_gateway_token() {
         assert_eq!(
@@ -857,6 +913,32 @@ mod tests {
             std::str::from_utf8(&body).unwrap(),
             r#"{"error":"invalid_grant","error_description":"bad code"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn exchange_rejects_oversized_provider_response_body() {
+        let captured_body = Arc::new(Mutex::new(None));
+        let token_url = spawn_dynamic_token_server(
+            StatusCode::OK,
+            "a".repeat(MAX_UPSTREAM_BODY_SIZE_BYTES + 1),
+            captured_body,
+        )
+        .await;
+
+        let app = build_app(test_state().await);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", "Bearer shared-secret")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "code=abc&redirect_uri=https%3A%2F%2Finstance.example.com%2Foauth%2Fcallback&token_url={}&client_id=test-client&client_secret=test-secret&access_token_field=access_token",
+                urlencoding::encode(&token_url)
+            )))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
