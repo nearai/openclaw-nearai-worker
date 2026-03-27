@@ -1,0 +1,26 @@
+[package]
+name = "ironclaw-oauth-service"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone OAuth token exchange service for hosted IronClaw instances"
+
+[workspace]
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1.44", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace"] }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
+thiserror = "2"
+anyhow = "1.0.95"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_urlencoded = "0.7"
+secrecy = "0.10"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+bytes = "1.11"
+urlencoding = "2.1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

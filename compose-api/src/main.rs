@@ -35,6 +35,9 @@ use std::ffi::OsString;
 #[cfg(test)]
 use std::sync::OnceLock;
 
+const MAX_WRAPPED_OAUTH_STATE_LEN: usize = 8 * 1024;
+const MAX_WRAPPED_OAUTH_STATE_DEPTH: usize = 5;
+
 mod backup;
 mod compose;
 mod error;
@@ -557,8 +560,7 @@ fn extract_optional_param(params: &mut ParamsList, key: &str) -> Result<Option<S
 /// Supports two formats:
 /// - **New (ic2):** `ic2.{base64_payload}.{checksum}` where payload is JSON containing `instance_name`
 /// - **Legacy:** `instance:nonce` where instance is a DNS label before the first colon
-fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
-    // Try new ic2 format: ic2.{base64_payload}.{checksum}
+fn extract_instance_from_ic2_state(state: &str) -> Result<Option<String>, ApiError> {
     if let Some(rest) = state.strip_prefix("ic2.") {
         if let Some((payload_b64, checksum)) = rest.rsplit_once('.') {
             if let Ok(payload_bytes) = decode_urlsafe_base64(payload_b64) {
@@ -572,27 +574,50 @@ fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
                     serde_json::from_slice::<HostedOAuthStatePayload>(&payload_bytes)
                 {
                     if let Some(instance) = payload.instance_name.filter(|s| !s.is_empty()) {
-                        return Ok(instance);
+                        return Ok(Some(instance));
                     }
                 }
             }
         }
     }
 
-    // MCP install flows may wrap the actual hosted state in a base64url-encoded
-    // JSON object that contains a nested `state` field. Unwrap and recurse.
-    if let Ok(wrapper_bytes) = decode_urlsafe_base64(state) {
-        if let Ok(wrapper) = serde_json::from_slice::<HostedOAuthStateWrapper>(&wrapper_bytes) {
-            if let Some(nested_state) = wrapper.state.filter(|nested| !nested.is_empty()) {
-                if nested_state != state {
-                    return extract_instance_from_state(&nested_state);
-                }
-            }
+    Ok(None)
+}
+
+fn unwrap_mcp_state(state: &str) -> Option<String> {
+    if state.len() > MAX_WRAPPED_OAUTH_STATE_LEN {
+        return None;
+    }
+
+    let wrapper_bytes = decode_urlsafe_base64(state).ok()?;
+    let wrapper = serde_json::from_slice::<HostedOAuthStateWrapper>(&wrapper_bytes).ok()?;
+    let nested_state = wrapper.state?;
+    (nested_state != state && !nested_state.is_empty()).then_some(nested_state)
+}
+
+fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
+    let mut current_state = state.to_string();
+
+    for depth in 0..=MAX_WRAPPED_OAUTH_STATE_DEPTH {
+        if let Some(instance) = extract_instance_from_ic2_state(&current_state)? {
+            return Ok(instance);
         }
+
+        if let Some(nested_state) = unwrap_mcp_state(&current_state) {
+            if depth == MAX_WRAPPED_OAUTH_STATE_DEPTH {
+                return Err(ApiError::BadRequest(
+                    "Exceeded max nested OAuth state depth".into(),
+                ));
+            }
+            current_state = nested_state;
+            continue;
+        }
+
+        break;
     }
 
     // Legacy: instance:nonce
-    if let Some((instance, nonce)) = state.split_once(':') {
+    if let Some((instance, nonce)) = current_state.split_once(':') {
         if !instance.is_empty() && !nonce.is_empty() {
             return Ok(instance.to_string());
         }
@@ -4833,6 +4858,21 @@ mod tests {
         let result = extract_instance_from_state(&state);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "brave-tiger");
+    }
+
+    #[test]
+    fn test_extract_instance_rejects_excessive_wrapped_state_depth() {
+        let mut state = "alice:nonce123".to_string();
+        for _ in 0..=MAX_WRAPPED_OAUTH_STATE_DEPTH {
+            state = build_wrapped_mcp_state(&state);
+        }
+
+        let result = extract_instance_from_state(&state);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Exceeded max nested OAuth state depth"));
     }
 
     #[test]
