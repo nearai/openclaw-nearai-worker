@@ -8,8 +8,9 @@ use axum::{
 };
 use secrecy::ExposeSecret;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -23,6 +24,7 @@ const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 struct AppState {
     config: Arc<AppConfig>,
     http_client: reqwest::Client,
+    pinned_http_clients: Arc<Mutex<HashMap<PinnedClientCacheKey, reqwest::Client>>>,
     allow_private_oauth_token_endpoints: bool,
 }
 
@@ -54,6 +56,13 @@ impl ResolvedClientCredentials {
 #[derive(Debug, Clone)]
 struct ValidatedTokenEndpoint {
     url: String,
+    host: String,
+    resolved_addrs: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PinnedClientCacheKey {
+    host: String,
     resolved_addrs: Vec<SocketAddr>,
 }
 
@@ -351,6 +360,7 @@ async fn validate_token_endpoint_url(
     if allow_private {
         return Ok(ValidatedTokenEndpoint {
             url: parsed.to_string(),
+            host: host.to_string(),
             resolved_addrs: Vec::new(),
         });
     }
@@ -378,8 +388,16 @@ async fn validate_token_endpoint_url(
 
     Ok(ValidatedTokenEndpoint {
         url: parsed.to_string(),
+        host: host.to_string(),
         resolved_addrs,
     })
+}
+
+fn build_base_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 fn build_token_http_client(
@@ -390,18 +408,30 @@ fn build_token_http_client(
         return Ok(state.http_client.clone());
     }
 
-    let host = reqwest::Url::parse(&endpoint.url)
-        .map_err(|_| ApiError::Internal("Validated token endpoint URL became invalid".into()))?
-        .host_str()
-        .ok_or_else(|| ApiError::Internal("Validated token endpoint URL is missing a host".into()))?
-        .to_string();
+    let cache_key = PinnedClientCacheKey {
+        host: endpoint.host.clone(),
+        resolved_addrs: endpoint.resolved_addrs.clone(),
+    };
 
-    reqwest::Client::builder()
+    let mut pinned_http_clients = state
+        .pinned_http_clients
+        .lock()
+        .map_err(|_| ApiError::Internal("Pinned HTTP client cache lock was poisoned".into()))?;
+    if let Some(client) = pinned_http_clients.get(&cache_key).cloned() {
+        return Ok(client);
+    }
+
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(&host, &endpoint.resolved_addrs)
+        .resolve_to_addrs(&endpoint.host, &endpoint.resolved_addrs)
         .build()
-        .map_err(|err| ApiError::Internal(format!("Failed to build pinned HTTP client: {}", err)))
+        .map_err(|err| {
+            ApiError::Internal(format!("Failed to build pinned HTTP client: {}", err))
+        })?;
+
+    pinned_http_clients.insert(cache_key, client.clone());
+    Ok(client)
 }
 
 async fn health_check() -> &'static str {
@@ -598,11 +628,8 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         config,
-        http_client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("failed to build HTTP client"),
+        http_client: build_base_http_client().expect("failed to build HTTP client"),
+        pinned_http_clients: Arc::new(Mutex::new(HashMap::new())),
         allow_private_oauth_token_endpoints: env_flag("OAUTH_ALLOW_PRIVATE_TOKEN_URLS"),
     };
 
@@ -635,10 +662,8 @@ mod tests {
                 google_oauth_client_secret: Some(secrecy::SecretString::from("platform-secret")),
                 proxy_auth_token: secrecy::SecretString::from("shared-secret"),
             }),
-            http_client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
+            http_client: build_base_http_client().unwrap(),
+            pinned_http_clients: Arc::new(Mutex::new(HashMap::new())),
             allow_private_oauth_token_endpoints: true,
         }
     }
@@ -741,6 +766,26 @@ mod tests {
             resolve_client_credentials(&None, &Some("secret-only".into()), &config).unwrap_err();
 
         assert!(err.to_string().contains("client_secret requires client_id"));
+    }
+
+    #[tokio::test]
+    async fn pinned_http_clients_are_cached_by_host_and_resolved_addrs() {
+        let state = test_state().await;
+        let endpoint = ValidatedTokenEndpoint {
+            url: "https://example.com/token".into(),
+            host: "example.com".into(),
+            resolved_addrs: vec!["203.0.113.10:443".parse().unwrap()],
+        };
+
+        build_token_http_client(&state, &endpoint).unwrap();
+        build_token_http_client(&state, &endpoint).unwrap();
+
+        let cache = state.pinned_http_clients.lock().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&PinnedClientCacheKey {
+            host: "example.com".into(),
+            resolved_addrs: vec!["203.0.113.10:443".parse().unwrap()],
+        }));
     }
 
     #[tokio::test]
