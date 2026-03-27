@@ -126,6 +126,10 @@ impl ComposeManager {
             .expect("default compose file must exist")
     }
 
+    pub fn env_dir(&self) -> &Path {
+        &self.env_dir
+    }
+
     fn env_path(&self, name: &str) -> PathBuf {
         self.env_dir.join(format!("{}.env", name))
     }
@@ -164,9 +168,204 @@ impl ComposeManager {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Read all key=value pairs from an instance .env file into a HashMap.
+    /// Used by `start()` to pass env vars explicitly to docker compose,
+    /// overriding CVM-level process env (which always has OPENCLAW_IMAGE
+    /// set to the openclaw image, even for ironclaw instances).
+    fn read_env_file_vars(&self, path: &Path) -> HashMap<String, String> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
+        content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let (key, value) = line.split_once('=')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    /// Recover an instance from its persisted .env file.
+    /// Returns the reconstructed Instance if the .env file exists and has
+    /// the required fields. Fails if critical fields (token, API key,
+    /// SSH pubkey, ports) are missing or empty.
+    pub fn recover_from_env(&self, name: &str) -> Result<Instance, ApiError> {
+        if !crate::is_valid_instance_name(name) {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid instance name: '{}'",
+                name
+            )));
+        }
+        let env_path = self.env_path(name);
+        if !env_path.exists() {
+            return Err(ApiError::NotFound(format!(
+                "No .env file found for instance '{}'",
+                name
+            )));
+        }
+        // Verify both Docker volumes exist (user data)
+        for suffix in &["config", "workspace"] {
+            let vol = format!("openclaw-{}_{}", name, suffix);
+            let check = Command::new("docker")
+                .args(["volume", "inspect", &vol])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap_or_else(|_| std::process::ExitStatus::default());
+            if !check.success() {
+                return Err(ApiError::BadRequest(format!(
+                    "Docker volume '{}' not found — cannot recover without user data",
+                    vol
+                )));
+            }
+        }
+        let vars = self.read_env_file_vars(&env_path);
+
+        // Required fields — fail recovery if missing/empty
+        let gateway_port: u16 = vars
+            .get("GATEWAY_PORT")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("GATEWAY_PORT missing or invalid in {}.env", name))
+            })?;
+        let ssh_port: u16 = vars
+            .get("SSH_PORT")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("SSH_PORT missing or invalid in {}.env", name))
+            })?;
+        let token = vars
+            .get("OPENCLAW_GATEWAY_TOKEN")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "OPENCLAW_GATEWAY_TOKEN missing or empty in {}.env",
+                    name
+                ))
+            })?;
+        let nearai_api_key = vars
+            .get("NEARAI_API_KEY")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("NEARAI_API_KEY missing or empty in {}.env", name))
+            })?;
+        let ssh_pubkey = vars
+            .get("SSH_PUBKEY")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("SSH_PUBKEY missing or empty in {}.env", name))
+            })?;
+
+        let nearai_api_url = vars.get("NEARAI_API_URL").cloned();
+        let image = vars.get("OPENCLAW_IMAGE").cloned();
+
+        // Infer service_type from env, falling back to image name
+        let service_type = vars.get("SERVICE_TYPE").cloned().or_else(|| {
+            Some(
+                self.infer_service_type_from_image(image.as_deref())
+                    .to_string(),
+            )
+        });
+
+        // Collect extra env vars: anything not in the core set written by
+        // ensure_env_file / up(). These include user-configured vars like
+        // CHANNEL_RELAY_URL, CHANNEL_RELAY_API_KEY, etc.
+        const CORE_KEYS: &[&str] = &[
+            "NEARAI_API_KEY",
+            "NEARAI_API_URL",
+            "OPENCLAW_GATEWAY_TOKEN",
+            "GATEWAY_PORT",
+            "SSH_PORT",
+            "SSH_PUBKEY",
+            "BASTION_SSH_PUBKEY",
+            "OPENCLAW_IMAGE",
+            "SERVICE_TYPE",
+            "WORKER_NETWORK",
+            "MEM_LIMIT",
+            "CPUS",
+            "STORAGE_SIZE",
+            // OAuth vars written by insert_oauth_env_vars
+            "OPENCLAW_DOMAIN",
+            "OPENCLAW_INSTANCE_NAME",
+            "GOOGLE_OAUTH_CLIENT_ID",
+            "IRONCLAW_OAUTH_EXCHANGE_URL",
+        ];
+        let extra: HashMap<String, String> = vars
+            .iter()
+            .filter(|(k, _)| !CORE_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let extra_env = if extra.is_empty() { None } else { Some(extra) };
+
+        Ok(Instance {
+            name: name.to_string(),
+            token,
+            gateway_port,
+            ssh_port,
+            created_at: chrono::Utc::now(),
+            ssh_pubkey,
+            nearai_api_key,
+            nearai_api_url,
+            active: false,
+            image,
+            image_digest: None,
+            service_type,
+            mem_limit: vars.get("MEM_LIMIT").cloned(),
+            cpus: vars.get("CPUS").cloned(),
+            storage_size: vars.get("STORAGE_SIZE").cloned(),
+            extra_env,
+        })
+    }
+
+    // ── network helpers ───────────────────────────────────────────────
+
+    /// Return the persistent network name for an instance.
+    fn network_name(instance_name: &str) -> String {
+        format!("openclaw-net-{}", instance_name)
+    }
+
+    /// Ensure a per-instance Docker network exists.
+    /// Pre-creating the network as `external: true` in the compose template
+    /// prevents Docker Compose from tearing it down on container restart,
+    /// avoiding bridge/veth churn that can trigger kernel ZFS/RCU stalls.
+    fn ensure_network(instance_name: &str) -> Result<(), ApiError> {
+        let net = Self::network_name(instance_name);
+        // `docker network create` is idempotent-ish: returns an error if the
+        // network already exists, which we ignore.
+        let output = Command::new("docker")
+            .args(["network", "create", "--driver", "bridge", &net])
+            .output()
+            .map_err(|e| ApiError::Internal(format!("docker network create: {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("already exists") {
+                return Err(ApiError::Internal(format!(
+                    "docker network create failed: {}",
+                    stderr
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove the per-instance Docker network (best-effort, ignore errors).
+    fn remove_network(instance_name: &str) {
+        let net = Self::network_name(instance_name);
+        let _ = docker_command().args(["network", "rm", &net]).output();
+    }
+
     // ── compose lifecycle ─────────────────────────────────────────────
 
     pub fn up(&self, cfg: &InstanceConfig) -> Result<(), ApiError> {
+        Self::ensure_network(cfg.name)?;
         let mut vars = HashMap::new();
         vars.insert("NEARAI_API_KEY".into(), cfg.nearai_api_key.into());
         vars.insert("NEARAI_API_URL".into(), cfg.nearai_api_url.into());
@@ -179,6 +378,7 @@ impl ComposeManager {
             vars.insert("BASTION_SSH_PUBKEY".into(), bastion_key.into());
         }
         vars.insert("SERVICE_TYPE".into(), cfg.service_type.to_string());
+        vars.insert("WORKER_NETWORK".into(), Self::network_name(cfg.name));
         if let Some(v) = cfg.mem_limit {
             vars.insert("MEM_LIMIT".into(), v.into());
         }
@@ -247,6 +447,7 @@ impl ComposeManager {
         let env_path = self.env_path(name);
         self.compose_cmd(name, &env_path, &["down", "-v"], None, service_type)?;
         self.remove_env_file(name);
+        Self::remove_network(name);
         Ok(())
     }
 
@@ -255,14 +456,71 @@ impl ComposeManager {
         self.compose_cmd(name, &env_path, &["stop"], None, service_type)
     }
 
-    pub fn start(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+    pub fn start(
+        &self,
+        name: &str,
+        force_recreate: bool,
+        service_type: Option<&str>,
+    ) -> Result<(), ApiError> {
+        Self::ensure_network(name)?;
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["start"], None, service_type)
+        // Read OPENCLAW_IMAGE from the instance .env file and pass it
+        // explicitly so it overrides the CVM-level process env (which is
+        // always the openclaw image, even for ironclaw instances).
+        let env_vars = self.read_env_file_vars(&env_path);
+        // Use `up -d` instead of `start` so the container is recreated with
+        // the current network config. A plain `start` reuses the stopped
+        // container's stored network ID, which fails if the network was
+        // deleted (e.g. after CVM reboot cleanup).
+        let mut args = vec!["up", "-d", "--pull", "never"];
+        if force_recreate {
+            args.push("--force-recreate");
+        }
+        self.compose_cmd(name, &env_path, &args, Some(&env_vars), service_type)
     }
 
     pub fn restart(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
+        self.start(name, true, service_type)
+    }
+
+    /// Delete an orphaned instance even if its `.env` file is missing.
+    /// When the env file exists we try the normal compose-managed teardown first;
+    /// otherwise we fall back to removing known container/volumes/network by name.
+    pub fn cleanup_orphan(&self, name: &str, service_type: Option<&str>) -> Result<(), ApiError> {
         let env_path = self.env_path(name);
-        self.compose_cmd(name, &env_path, &["restart"], None, service_type)
+        if env_path.exists() {
+            match self.down(name, service_type) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        "compose down failed for orphan '{}', falling back to direct cleanup: {}",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+
+        self.remove_named_artifact(
+            "container",
+            &["rm", "-f", &format!("openclaw-{}-gateway-1", name)],
+        )?;
+        self.remove_named_artifact(
+            "volume",
+            &["volume", "rm", "-f", &format!("openclaw-{}_config", name)],
+        )?;
+        self.remove_named_artifact(
+            "volume",
+            &[
+                "volume",
+                "rm",
+                "-f",
+                &format!("openclaw-{}_workspace", name),
+            ],
+        )?;
+        self.remove_env_file(name);
+        Self::remove_network(name);
+        Ok(())
     }
 
     /// Returns the output of `docker compose ps --format json`.
@@ -415,8 +673,9 @@ impl ComposeManager {
     /// Like `all_statuses()` but returns `(state, health)` per instance,
     /// so callers can distinguish "running but unhealthy" from "running and healthy".
     pub fn all_health_statuses(&self) -> Result<HashMap<String, ContainerHealth>, ApiError> {
-        // Use {{.Health}} which directly returns "starting", "healthy", "unhealthy",
-        // or "" — avoids brittle parsing of human-readable {{.Status}} text.
+        // Use {{.State}} and {{.Status}} — the latter contains health in
+        // parentheses, e.g. "Up 5 minutes (healthy)". {{.Health}} is NOT a
+        // valid Go template field in older Docker versions (causes error).
         let output = Command::new("docker")
             .args([
                 "ps",
@@ -424,7 +683,7 @@ impl ComposeManager {
                 "--filter",
                 "label=openclaw.managed=true",
                 "--format",
-                "{{.Names}}\t{{.State}}\t{{.Health}}",
+                "{{.Names}}\t{{.State}}\t{{.Status}}",
             ])
             .output()
             .map_err(|e| ApiError::Internal(format!("failed to run docker ps: {e}")))?;
@@ -445,23 +704,24 @@ impl ComposeManager {
                 let mut parts = line.splitn(3, '\t');
                 let container_name = parts.next()?;
                 let state = parts.next()?;
-                let health_text = parts.next().unwrap_or("");
+                let status_text = parts.next().unwrap_or("");
                 let name = container_name
                     .strip_prefix("openclaw-")
                     .and_then(|s| s.strip_suffix("-gateway-1"))?;
                 if !crate::is_valid_instance_name(name) {
                     return None;
                 }
-                let health = if health_text.is_empty() {
-                    "none"
+                // Parse health from status text: "Up 5 min (healthy)" → "healthy"
+                let health = if let Some(start) = status_text.rfind('(') {
+                    status_text[start + 1..].trim_end_matches(')').to_string()
                 } else {
-                    health_text
+                    "none".to_string()
                 };
                 Some((
                     name.to_string(),
                     ContainerHealth {
                         state: state.to_string(),
-                        health: health.to_string(),
+                        health,
                     },
                 ))
             })
@@ -837,9 +1097,12 @@ impl ComposeManager {
 
     /// Reconstruct the env file for a discovered instance so that
     /// docker compose lifecycle commands (stop/start/restart) continue to work.
+    /// `default_image` should be the correct image for this instance's service type
+    /// (openclaw or ironclaw) — used when `inst.image` is None.
     pub fn ensure_env_file(
         &self,
         inst: &Instance,
+        default_image: &str,
         openclaw_domain: Option<&str>,
         google_oauth_client_id: Option<&str>,
         oauth_exchange_url: Option<&str>,
@@ -860,18 +1123,37 @@ impl ComposeManager {
         if let Some(ref bastion_key) = self.bastion_ssh_pubkey {
             vars.insert("BASTION_SSH_PUBKEY".into(), bastion_key.clone());
         }
-        if let Some(ref image) = inst.image {
-            vars.insert("OPENCLAW_IMAGE".into(), image.clone());
-        }
+        // Resolve service_type first — needed to validate the image.
         // Prefer in-memory service_type, then existing .env value; only then default to openclaw.
-        // Avoids overwriting a correct SERVICE_TYPE=ironclaw in .env when instance was discovered
-        // without label/env and .env hadn't been read yet.
         let service_type = inst
             .service_type
             .clone()
             .or_else(|| self.read_service_type_from_env_file(&inst.name))
             .unwrap_or_else(|| "openclaw".to_string());
+        // Use the instance's stored image, but if it doesn't match the
+        // service_type (e.g. openclaw image on an ironclaw instance after
+        // a botched restart), fall back to the correct default.
+        let image = match inst.image.as_deref() {
+            Some(img) if service_type == "ironclaw" && !img.contains("ironclaw") => {
+                tracing::warn!(
+                    "Instance '{}': stored image '{}' doesn't match service_type 'ironclaw', using default",
+                    inst.name, img
+                );
+                default_image
+            }
+            Some(img) if service_type != "ironclaw" && img.contains("ironclaw") => {
+                tracing::warn!(
+                    "Instance '{}': stored image '{}' doesn't match service_type '{}', using default",
+                    inst.name, img, service_type
+                );
+                default_image
+            }
+            Some(img) => img,
+            None => default_image,
+        };
+        vars.insert("OPENCLAW_IMAGE".into(), image.to_string());
         vars.insert("SERVICE_TYPE".into(), service_type);
+        vars.insert("WORKER_NETWORK".into(), Self::network_name(&inst.name));
         insert_oauth_env_vars(
             &mut vars,
             &inst.name,
@@ -890,7 +1172,7 @@ impl ComposeManager {
     /// Read SERVICE_TYPE from the persisted .env file for an instance.
     /// Fallback for containers created before SERVICE_TYPE was added to the
     /// compose template environment block.
-    fn read_service_type_from_env_file(&self, name: &str) -> Option<String> {
+    pub fn read_service_type_from_env_file(&self, name: &str) -> Option<String> {
         let path = self.env_path(name);
         let content = std::fs::read_to_string(&path).ok()?;
         for line in content.lines() {
@@ -917,7 +1199,7 @@ impl ComposeManager {
         let project = format!("openclaw-{}", name);
         let compose_file = self.compose_file_for(service_type);
 
-        let mut cmd = Command::new("docker");
+        let mut cmd = docker_command();
         cmd.args([
             "compose",
             "-p",
@@ -945,5 +1227,45 @@ impl ComposeManager {
         }
 
         Ok(())
+    }
+
+    fn remove_named_artifact(&self, artifact: &str, args: &[&str]) -> Result<(), ApiError> {
+        let output = docker_command().args(args).output().map_err(|e| {
+            ApiError::Internal(format!("failed to run docker {} command: {}", artifact, e))
+        })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_lower = stderr.to_lowercase();
+        let missing = stderr_lower.contains("no such")
+            || stderr_lower.contains("not found")
+            || stderr_lower.contains("no such container")
+            || stderr_lower.contains("no such volume");
+        if missing {
+            return Ok(());
+        }
+
+        Err(ApiError::Internal(format!(
+            "failed to remove {}: {}",
+            artifact,
+            stderr.trim()
+        )))
+    }
+}
+
+#[cfg(not(test))]
+fn docker_command() -> Command {
+    Command::new("docker")
+}
+
+#[cfg(test)]
+fn docker_command() -> Command {
+    if let Ok(path) = std::env::var("OPENCLAW_TEST_DOCKER_BIN") {
+        Command::new(path)
+    } else {
+        Command::new("docker")
     }
 }

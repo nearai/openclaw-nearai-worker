@@ -234,6 +234,9 @@ fn resolve_client_credentials(
                 })
             }
         }
+        (None, Some(_)) => Err(ApiError::BadRequest(
+            "client_secret requires client_id".into(),
+        )),
         _ => {
             let client_id = config
                 .google_oauth_client_id
@@ -724,6 +727,20 @@ mod tests {
             Some("platform-secret")
         );
         assert!(credentials.uses_platform_credentials());
+    }
+
+    #[test]
+    fn client_secret_without_client_id_is_rejected() {
+        let config = AppConfig {
+            google_oauth_client_id: Some("platform-id".into()),
+            google_oauth_client_secret: Some(secrecy::SecretString::from("platform-secret")),
+            proxy_auth_token: secrecy::SecretString::from("shared-secret"),
+        };
+
+        let err =
+            resolve_client_credentials(&None, &Some("secret-only".into()), &config).unwrap_err();
+
+        assert!(err.to_string().contains("client_secret requires client_id"));
     }
 
     #[tokio::test]

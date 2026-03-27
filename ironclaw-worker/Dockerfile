@@ -36,14 +36,14 @@ RUN apt-get update && \
 # Otherwise, download the pinned release from GitHub.
 # Uses BuildKit bind mount to probe the build context without a COPY that
 # would fail when the file is absent.
-ARG IRONCLAW_VERSION=0.21.0
+ARG IRONCLAW_VERSION=0.23.0
 RUN --mount=type=bind,source=.,target=/ctx \
     if [ -f /ctx/ironclaw ]; then \
       echo "Using locally built ironclaw binary"; \
       cp /ctx/ironclaw /usr/local/bin/ironclaw; \
     else \
       echo "Downloading ironclaw v${IRONCLAW_VERSION} from GitHub releases"; \
-      curl -fsSL "https://github.com/nearai/ironclaw/releases/download/v${IRONCLAW_VERSION}/ironclaw-x86_64-unknown-linux-gnu.tar.gz" \
+      curl -fsSL "https://github.com/nearai/ironclaw/releases/download/ironclaw-v${IRONCLAW_VERSION}/ironclaw-x86_64-unknown-linux-gnu.tar.gz" \
         -o /tmp/ironclaw.tar.gz && \
       tar xzf /tmp/ironclaw.tar.gz -C /tmp && \
       mv /tmp/ironclaw-*/ironclaw /usr/local/bin/ironclaw && \
