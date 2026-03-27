@@ -1,5 +1,5 @@
 [package]
-name = "openclaw-oauth-service"
+name = "ironclaw-oauth-service"
 version = "0.1.0"
 edition = "2021"
 description = "Standalone OAuth token exchange service for hosted IronClaw instances"

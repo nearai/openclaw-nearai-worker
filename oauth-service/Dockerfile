@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/openclaw-oauth-service /app/openclaw-oauth-service
+COPY --from=builder /app/target/release/ironclaw-oauth-service /app/ironclaw-oauth-service
 
 RUN mkdir -p /app/data
 
@@ -31,4 +31,4 @@ EXPOSE 47393
 
 ENV RUST_LOG=info
 
-CMD ["/app/openclaw-oauth-service"]
+CMD ["/app/ironclaw-oauth-service"]

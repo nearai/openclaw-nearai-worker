@@ -53,7 +53,7 @@ jobs:
             context: .
             dockerfile: updater/Dockerfile
             build_script: false
-          - name: openclaw-oauth-service
+          - name: ironclaw-oauth-service
             context: oauth-service
             dockerfile: oauth-service/Dockerfile
             build_script: false

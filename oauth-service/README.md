@@ -75,13 +75,13 @@ This service is compatible with the current hosted IronClaw contract:
 
 ```bash
 cargo test
-docker build -t openclaw-oauth-service:local .
+docker build -t ironclaw-oauth-service:local .
 ```
 
 ## Publish Image
 
 This repo's GitHub Actions build workflow publishes `oauth-service` to Docker Hub
-as `docker.io/<DOCKER_REGISTRY_USER>/openclaw-oauth-service:<tag>`.
+as `docker.io/<DOCKER_REGISTRY_USER>/ironclaw-oauth-service:<tag>`.
 
 Tag behavior matches the other repo images:
 
@@ -92,5 +92,5 @@ Tag behavior matches the other repo images:
 Example pull:
 
 ```bash
-docker pull docker.io/<your-dockerhub-user>/openclaw-oauth-service:dev
+docker pull docker.io/<your-dockerhub-user>/ironclaw-oauth-service:dev
 ```
