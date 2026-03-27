@@ -1,41 +1,35 @@
 use axum::{
-    extract::{Form, FromRequestParts, Path, RawForm, RawQuery, State},
-    http::{request::Parts, StatusCode},
-    response::{IntoResponse, Redirect},
-    routing::{get, post, put},
-    Json, Router,
+    body::Body,
+    extract::{Form, FromRequestParts, RawForm, State},
+    http::{header::CONTENT_TYPE, request::Parts, HeaderValue, Response},
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use secrecy::ExposeSecret;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod error;
-mod registry;
 
 use crate::error::ApiError;
-use crate::registry::{authenticate_gateway_token, constant_time_token_eq, InstanceTokenRegistry};
 
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
-const HOSTED_STATE_CHECKSUM_BYTES: usize = 12;
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<AppConfig>,
-    registry: Arc<InstanceTokenRegistry>,
     http_client: reqwest::Client,
-    #[cfg(test)]
     allow_private_oauth_token_endpoints: bool,
 }
 
 struct AppConfig {
-    openclaw_domain: Option<String>,
     google_oauth_client_id: Option<String>,
     google_oauth_client_secret: Option<secrecy::SecretString>,
-    sync_token: secrecy::SecretString,
+    proxy_auth_token: secrecy::SecretString,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,18 +58,6 @@ struct ValidatedTokenEndpoint {
 }
 
 #[derive(Deserialize)]
-struct HostedOAuthStatePayload {
-    #[serde(default)]
-    instance_name: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct HostedOAuthStateWrapper {
-    #[serde(default)]
-    state: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct OAuthRefreshRequest {
     #[serde(default = "default_provider_google")]
     provider: String,
@@ -88,47 +70,11 @@ struct OAuthRefreshRequest {
     client_secret: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct SyncInstanceRequest {
-    gateway_token: String,
-}
-
-#[derive(Deserialize)]
-struct ReconcileInstancesRequest {
-    instances: Vec<ReconcileInstance>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ReconcileInstance {
-    instance_name: String,
-    gateway_token: String,
-}
-
 type ParamsList = Vec<(String, String)>;
 
-struct InstanceAuth {
-    instance_name: String,
-}
+struct ProxyAuth;
 
-impl FromRequestParts<AppState> for InstanceAuth {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let gateway_token = bearer_token_from_headers(parts)?;
-        let instance_name = authenticate_gateway_token(&state.registry, gateway_token)
-            .await
-            .ok_or_else(|| ApiError::Unauthorized("Invalid instance token".into()))?;
-
-        Ok(Self { instance_name })
-    }
-}
-
-struct SyncAuth;
-
-impl FromRequestParts<AppState> for SyncAuth {
+impl FromRequestParts<AppState> for ProxyAuth {
     type Rejection = ApiError;
 
     async fn from_request_parts(
@@ -136,8 +82,10 @@ impl FromRequestParts<AppState> for SyncAuth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let token = bearer_token_from_headers(parts)?;
-        if !constant_time_token_eq(token, state.config.sync_token.expose_secret()) {
-            return Err(ApiError::Unauthorized("Invalid OAuth sync token".into()));
+        if !constant_time_eq(token, state.config.proxy_auth_token.expose_secret()) {
+            return Err(ApiError::Unauthorized(
+                "Invalid OAuth proxy auth token".into(),
+            ));
         }
         Ok(Self)
     }
@@ -154,6 +102,7 @@ fn bearer_token_from_headers(parts: &Parts) -> Result<&str, ApiError> {
         .strip_prefix("Bearer ")
         .or_else(|| auth_header.strip_prefix("bearer "))
         .map(str::trim)
+        .filter(|token| !token.is_empty())
         .ok_or_else(|| {
             ApiError::Unauthorized(
                 "Invalid Authorization header format. Expected: Bearer <token>".into(),
@@ -161,23 +110,47 @@ fn bearer_token_from_headers(parts: &Parts) -> Result<&str, ApiError> {
         })
 }
 
-fn default_provider_google() -> String {
-    "google".into()
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let max_len = ab.len().max(bb.len());
+    let mut diff: u8 = 0;
+    for i in 0..max_len {
+        let x = ab.get(i).copied().unwrap_or(0);
+        let y = bb.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0 && ab.len() == bb.len()
+}
+
+fn trim_nonempty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn normalize_optional_oauth_field(value: Option<String>) -> Option<String> {
-    value.filter(|value| !value.is_empty())
+    value.as_deref().and_then(trim_nonempty)
 }
 
-fn hosted_state_checksum(payload_bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(payload_bytes);
-    URL_SAFE_NO_PAD.encode(&digest[..HOSTED_STATE_CHECKSUM_BYTES])
+fn resolve_proxy_auth_token(
+    proxy_auth_token: Option<&str>,
+    gateway_auth_token: Option<&str>,
+) -> Option<String> {
+    proxy_auth_token
+        .and_then(trim_nonempty)
+        .or_else(|| gateway_auth_token.and_then(trim_nonempty))
 }
 
-fn decode_urlsafe_base64(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    URL_SAFE_NO_PAD.decode(input.trim_end_matches('='))
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .and_then(trim_nonempty)
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn default_provider_google() -> String {
+    "google".into()
 }
 
 fn parse_urlencoded_pairs(input: &[u8]) -> Result<ParamsList, ApiError> {
@@ -207,61 +180,9 @@ fn extract_optional_param(params: &mut ParamsList, key: &str) -> Result<Option<S
     }
 }
 
-fn extract_instance_from_state(state: &str) -> Result<String, ApiError> {
-    if let Some(rest) = state.strip_prefix("ic2.") {
-        if let Some((payload_b64, checksum)) = rest.rsplit_once('.') {
-            if let Ok(payload_bytes) = decode_urlsafe_base64(payload_b64) {
-                let expected_checksum = hosted_state_checksum(&payload_bytes);
-                if checksum != expected_checksum {
-                    return Err(ApiError::BadRequest(
-                        "Hosted OAuth state checksum mismatch".into(),
-                    ));
-                }
-                if let Ok(payload) =
-                    serde_json::from_slice::<HostedOAuthStatePayload>(&payload_bytes)
-                {
-                    if let Some(instance) = payload.instance_name.filter(|s| !s.is_empty()) {
-                        return Ok(instance);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Ok(wrapper_bytes) = decode_urlsafe_base64(state) {
-        if let Ok(wrapper) = serde_json::from_slice::<HostedOAuthStateWrapper>(&wrapper_bytes) {
-            if let Some(nested_state) = wrapper.state.filter(|nested| !nested.is_empty()) {
-                if nested_state != state {
-                    return extract_instance_from_state(&nested_state);
-                }
-            }
-        }
-    }
-
-    if let Some((instance, nonce)) = state.split_once(':') {
-        if !instance.is_empty() && !nonce.is_empty() {
-            return Ok(instance.to_string());
-        }
-    }
-
-    Err(ApiError::BadRequest(
-        "Could not extract instance name from state parameter".into(),
-    ))
-}
-
-fn is_valid_instance_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 32
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-}
-
 fn resolve_token_endpoint(token_url: &Option<String>, provider: &str) -> Result<String, ApiError> {
     if let Some(url) = token_url {
-        if !url.is_empty() {
-            return Ok(url.clone());
-        }
+        return Ok(url.clone());
     }
     if provider == "google" {
         return Ok(GOOGLE_TOKEN_ENDPOINT.to_string());
@@ -278,12 +199,12 @@ fn resolve_client_credentials(
     config: &AppConfig,
 ) -> Result<ResolvedClientCredentials, ApiError> {
     match (req_client_id, req_client_secret) {
-        (Some(id), Some(secret)) if !id.is_empty() => Ok(ResolvedClientCredentials {
+        (Some(id), Some(secret)) => Ok(ResolvedClientCredentials {
             client_id: id.clone(),
             client_secret: Some(secret.clone()),
             source: OAuthCredentialSource::Request,
         }),
-        (Some(id), None) if !id.is_empty() => {
+        (Some(id), None) => {
             if config
                 .google_oauth_client_id
                 .as_deref()
@@ -355,15 +276,7 @@ fn resolve_token_endpoint_for_credentials(
 }
 
 fn oauth_exchange_allows_private_token_endpoints(state: &AppState) -> bool {
-    #[cfg(test)]
-    {
-        state.allow_private_oauth_token_endpoints
-    }
-    #[cfg(not(test))]
-    {
-        let _ = state;
-        false
-    }
+    state.allow_private_oauth_token_endpoints
 }
 
 fn is_shared_ipv4_cgnat(ip: Ipv4Addr) -> bool {
@@ -492,44 +405,39 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-async fn oauth_callback_router(
-    State(state): State<AppState>,
-    RawQuery(raw_query): RawQuery,
-) -> Result<impl IntoResponse, ApiError> {
-    let raw_query = raw_query.unwrap_or_default();
-    let mut query_pairs = parse_urlencoded_pairs(raw_query.as_bytes())?;
-    let state_param = extract_required_param(&mut query_pairs, "state")?;
-    if state_param.is_empty() {
-        return Err(ApiError::BadRequest(
-            "OAuth callback missing state parameter".into(),
-        ));
+fn response_with_body(
+    status: reqwest::StatusCode,
+    content_type: Option<&HeaderValue>,
+    body: bytes::Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let mut response = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        response = response.header(CONTENT_TYPE, content_type);
     }
+    response
+        .body(Body::from(body))
+        .map_err(|err| ApiError::Internal(format!("Failed to build HTTP response: {}", err)))
+}
 
-    let instance_name = extract_instance_from_state(&state_param)?;
-    if !is_valid_instance_name(&instance_name) {
-        return Err(ApiError::BadRequest(
-            "Invalid instance name extracted from state parameter".into(),
-        ));
-    }
-
-    let domain = state.config.openclaw_domain.as_deref().ok_or_else(|| {
-        ApiError::Internal(
-            "OPENCLAW_DOMAIN not configured; OAuth callback routing unavailable".into(),
-        )
+async fn forward_provider_response(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<Response<Body>, ApiError> {
+    let status = response.status();
+    let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let body = response.bytes().await.map_err(|err| {
+        ApiError::Internal(format!("Failed to read {} response body: {}", context, err))
     })?;
 
-    let redirect_url = match (!raw_query.is_empty()).then_some(raw_query) {
-        Some(qs) => format!("https://{}.{}/oauth/callback?{}", instance_name, domain, qs),
-        None => format!("https://{}.{}/oauth/callback", instance_name, domain),
-    };
+    if !status.is_success() {
+        tracing::warn!(status = %status, "{} failed", context);
+    }
 
-    tracing::info!(instance = %instance_name, "OAuth callback routing to instance");
-
-    Ok(Redirect::temporary(&redirect_url))
+    response_with_body(status, content_type.as_ref(), body)
 }
 
 async fn oauth_exchange(
-    auth: InstanceAuth,
+    _auth: ProxyAuth,
     State(state): State<AppState>,
     RawForm(form): RawForm,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -558,30 +466,6 @@ async fn oauth_exchange(
     )
     .await?;
     let http_client = build_token_http_client(&state, &token_endpoint)?;
-
-    if resolved_credentials.uses_platform_credentials() {
-        match &state.config.openclaw_domain {
-            Some(domain) => {
-                let expected_prefix = format!("https://auth.{}/", domain);
-                if !redirect_uri.starts_with(&expected_prefix) {
-                    tracing::warn!(
-                        instance = %auth.instance_name,
-                        redirect_uri = %redirect_uri,
-                        "OAuth exchange rejected: redirect_uri does not match platform domain"
-                    );
-                    return Err(ApiError::BadRequest(format!(
-                        "redirect_uri must start with https://auth.{}/",
-                        domain
-                    )));
-                }
-            }
-            None => {
-                return Err(ApiError::Internal(
-                    "OPENCLAW_DOMAIN not configured; OAuth exchange with platform credentials is unavailable".into(),
-                ));
-            }
-        }
-    }
 
     let mut params: Vec<(String, String)> = vec![
         ("grant_type".into(), "authorization_code".into()),
@@ -622,37 +506,11 @@ async fn oauth_exchange(
             ))
         })?;
 
-    let status = response.status();
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|err| ApiError::Internal(format!("Failed to parse token response: {}", err)))?;
-
-    if !status.is_success() {
-        tracing::warn!(
-            provider = %provider,
-            status = %status,
-            error = %body.get("error").and_then(|value| value.as_str()).unwrap_or("unknown"),
-            description = %body
-                .get("error_description")
-                .and_then(|value| value.as_str())
-                .unwrap_or(""),
-            "OAuth token exchange failed"
-        );
-        return Err(ApiError::BadGateway(format!(
-            "Token exchange failed: {}",
-            body.get("error_description")
-                .or_else(|| body.get("error"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown error")
-        )));
-    }
-
-    Ok(Json(body))
+    forward_provider_response(response, "OAuth token exchange").await
 }
 
 async fn oauth_refresh(
-    _auth: InstanceAuth,
+    _auth: ProxyAuth,
     State(state): State<AppState>,
     Form(req): Form<OAuthRefreshRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -691,81 +549,14 @@ async fn oauth_refresh(
             ))
         })?;
 
-    let status = response.status();
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|err| ApiError::Internal(format!("Failed to parse token response: {}", err)))?;
-
-    if !status.is_success() {
-        tracing::warn!(
-            provider = %req.provider,
-            status = %status,
-            error = %body.get("error").and_then(|value| value.as_str()).unwrap_or("unknown"),
-            description = %body
-                .get("error_description")
-                .and_then(|value| value.as_str())
-                .unwrap_or(""),
-            "OAuth token refresh failed"
-        );
-        return Err(ApiError::BadGateway(format!(
-            "Token refresh failed: {}",
-            body.get("error_description")
-                .or_else(|| body.get("error"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown error")
-        )));
-    }
-
-    Ok(Json(body))
-}
-
-async fn upsert_instance_auth(
-    _auth: SyncAuth,
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(req): Json<SyncInstanceRequest>,
-) -> Result<StatusCode, ApiError> {
-    state.registry.upsert(&name, &req.gateway_token).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn delete_instance_auth(
-    _auth: SyncAuth,
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    state.registry.remove(&name).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn reconcile_instance_auth(
-    _auth: SyncAuth,
-    State(state): State<AppState>,
-    Json(req): Json<ReconcileInstancesRequest>,
-) -> Result<StatusCode, ApiError> {
-    let desired = req
-        .instances
-        .into_iter()
-        .map(|instance| (instance.instance_name, instance.gateway_token));
-    state.registry.replace_all(desired).await?;
-    Ok(StatusCode::NO_CONTENT)
+    forward_provider_response(response, "OAuth token refresh").await
 }
 
 fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
-        .route("/oauth/callback", get(oauth_callback_router))
         .route("/oauth/exchange", post(oauth_exchange))
         .route("/oauth/refresh", post(oauth_refresh))
-        .route(
-            "/internal/instances/{name}/oauth",
-            put(upsert_instance_auth).delete(delete_instance_auth),
-        )
-        .route(
-            "/internal/instances/oauth/reconcile",
-            put(reconcile_instance_auth),
-        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -779,40 +570,37 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let sync_token = std::env::var("OAUTH_SERVICE_SYNC_TOKEN")
-        .map_err(|_| anyhow::anyhow!("OAUTH_SERVICE_SYNC_TOKEN must be set"))?;
-    if sync_token.trim().is_empty() {
-        anyhow::bail!("OAUTH_SERVICE_SYNC_TOKEN must not be empty");
-    }
-
-    let registry_path = std::env::var("OAUTH_INSTANCE_REGISTRY_PATH")
-        .unwrap_or_else(|_| "/app/data/oauth-instance-auth.json".to_string());
-    let registry = Arc::new(InstanceTokenRegistry::load(registry_path).await?);
+    let proxy_auth_token = resolve_proxy_auth_token(
+        std::env::var("IRONCLAW_OAUTH_PROXY_AUTH_TOKEN")
+            .ok()
+            .as_deref(),
+        std::env::var("GATEWAY_AUTH_TOKEN").ok().as_deref(),
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "IRONCLAW_OAUTH_PROXY_AUTH_TOKEN or GATEWAY_AUTH_TOKEN must be set to a non-empty value"
+        )
+    })?;
 
     let config = Arc::new(AppConfig {
-        openclaw_domain: std::env::var("OPENCLAW_DOMAIN")
-            .ok()
-            .filter(|value| !value.is_empty()),
         google_oauth_client_id: std::env::var("GOOGLE_OAUTH_CLIENT_ID")
             .ok()
-            .filter(|value| !value.is_empty()),
+            .and_then(|value| trim_nonempty(&value)),
         google_oauth_client_secret: std::env::var("GOOGLE_OAUTH_CLIENT_SECRET")
             .ok()
-            .filter(|value| !value.is_empty())
+            .and_then(|value| trim_nonempty(&value))
             .map(secrecy::SecretString::from),
-        sync_token: secrecy::SecretString::from(sync_token),
+        proxy_auth_token: secrecy::SecretString::from(proxy_auth_token),
     });
 
     let state = AppState {
         config,
-        registry,
         http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build HTTP client"),
-        #[cfg(test)]
-        allow_private_oauth_token_endpoints: false,
+        allow_private_oauth_token_endpoints: env_flag("OAUTH_ALLOW_PRIVATE_TOKEN_URLS"),
     };
 
     let app = build_app(state);
@@ -829,25 +617,21 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    use axum::body::Body;
-    use axum::http::Request;
-    use tempfile::tempdir;
+    use axum::{
+        body::to_bytes,
+        http::{Request, StatusCode},
+        routing::post,
+    };
+    use std::sync::Mutex;
     use tower::util::ServiceExt;
 
     async fn test_state() -> AppState {
-        let tempdir = tempdir().unwrap();
         AppState {
             config: Arc::new(AppConfig {
-                openclaw_domain: Some("example.com".into()),
                 google_oauth_client_id: Some("platform-id".into()),
                 google_oauth_client_secret: Some(secrecy::SecretString::from("platform-secret")),
-                sync_token: secrecy::SecretString::from("sync-token"),
+                proxy_auth_token: secrecy::SecretString::from("shared-secret"),
             }),
-            registry: Arc::new(
-                InstanceTokenRegistry::load(tempdir.path().join("oauth.json"))
-                    .await
-                    .unwrap(),
-            ),
             http_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -856,32 +640,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extract_instance_from_new_and_legacy_state() {
-        let payload = serde_json::json!({
-            "instance_name": "pale-crab",
-        });
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
-        let state = format!(
-            "ic2.{}.{}",
-            URL_SAFE_NO_PAD.encode(payload_bytes.as_slice()),
-            hosted_state_checksum(&payload_bytes)
+    async fn spawn_token_server(
+        status: StatusCode,
+        body: &'static str,
+        captured_body: Arc<Mutex<Option<String>>>,
+    ) -> String {
+        let app = Router::new().route(
+            "/token",
+            post({
+                let captured_body = captured_body.clone();
+                move |request_body: String| {
+                    let captured_body = captured_body.clone();
+                    async move {
+                        *captured_body.lock().unwrap() = Some(request_body);
+                        (
+                            status,
+                            [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+                            body,
+                        )
+                    }
+                }
+            }),
         );
 
-        assert_eq!(extract_instance_from_state(&state).unwrap(), "pale-crab");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{}/token", addr)
+    }
+
+    #[test]
+    fn proxy_auth_token_falls_back_to_gateway_token() {
         assert_eq!(
-            extract_instance_from_state("pale-crab:nonce-123").unwrap(),
-            "pale-crab"
+            resolve_proxy_auth_token(Some("   "), Some(" gateway-secret ")).as_deref(),
+            Some("gateway-secret")
         );
+        assert_eq!(
+            resolve_proxy_auth_token(Some(" proxy-secret "), Some("gateway-secret")).as_deref(),
+            Some("proxy-secret")
+        );
+        assert_eq!(resolve_proxy_auth_token(None, Some("   ")), None);
     }
 
     #[test]
     fn platform_credentials_reject_token_override() {
         let config = AppConfig {
-            openclaw_domain: Some("example.com".into()),
             google_oauth_client_id: Some("platform-id".into()),
             google_oauth_client_secret: Some(secrecy::SecretString::from("platform-secret")),
-            sync_token: secrecy::SecretString::from("sync-token"),
+            proxy_auth_token: secrecy::SecretString::from("shared-secret"),
         };
 
         let credentials =
@@ -898,39 +707,110 @@ mod tests {
             .contains("token_url override is not allowed"));
     }
 
+    #[test]
+    fn platform_credentials_inject_google_secret() {
+        let config = AppConfig {
+            google_oauth_client_id: Some("platform-id".into()),
+            google_oauth_client_secret: Some(secrecy::SecretString::from("platform-secret")),
+            proxy_auth_token: secrecy::SecretString::from("shared-secret"),
+        };
+
+        let credentials =
+            resolve_client_credentials(&Some("platform-id".into()), &None, &config).unwrap();
+
+        assert_eq!(credentials.client_id, "platform-id");
+        assert_eq!(
+            credentials.client_secret.as_deref(),
+            Some("platform-secret")
+        );
+        assert!(credentials.uses_platform_credentials());
+    }
+
     #[tokio::test]
-    async fn internal_sync_upserts_and_deletes_registry() {
-        let state = test_state().await;
-        let registry = state.registry.clone();
-        let app = build_app(state);
+    async fn exchange_accepts_direct_callback_url_and_passthrough_params() {
+        let captured_body = Arc::new(Mutex::new(None));
+        let token_url = spawn_token_server(
+            StatusCode::OK,
+            r#"{"access_token":"token","refresh_token":"refresh","expires_in":3600}"#,
+            captured_body.clone(),
+        )
+        .await;
 
-        let upsert = Request::builder()
-            .method("PUT")
-            .uri("/internal/instances/pale-crab/oauth")
-            .header("Authorization", "Bearer sync-token")
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"gateway_token":"gateway-secret"}"#))
+        let app = build_app(test_state().await);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", "Bearer shared-secret")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "code=abc&redirect_uri=https%3A%2F%2Finstance.example.com%2Foauth%2Fcallback&token_url={}&client_id=test-client&client_secret=test-secret&access_token_field=access_token&resource=test-resource",
+                urlencoding::encode(&token_url)
+            )))
             .unwrap();
-        let response = app.clone().oneshot(upsert).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
-            authenticate_gateway_token(registry.as_ref(), "gateway-secret")
-                .await
-                .as_deref(),
-            Some("pale-crab")
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"access_token":"token","refresh_token":"refresh","expires_in":3600}"#
         );
 
-        let delete = Request::builder()
-            .method("DELETE")
-            .uri("/internal/instances/pale-crab/oauth")
-            .header("Authorization", "Bearer sync-token")
-            .body(Body::empty())
+        let upstream_body = captured_body.lock().unwrap().clone().unwrap();
+        assert!(upstream_body.contains("grant_type=authorization_code"));
+        assert!(upstream_body.contains("code=abc"));
+        assert!(upstream_body
+            .contains("redirect_uri=https%3A%2F%2Finstance.example.com%2Foauth%2Fcallback"));
+        assert!(upstream_body.contains("client_id=test-client"));
+        assert!(upstream_body.contains("client_secret=test-secret"));
+        assert!(upstream_body.contains("resource=test-resource"));
+    }
+
+    #[tokio::test]
+    async fn exchange_forwards_provider_error_body_and_status() {
+        let captured_body = Arc::new(Mutex::new(None));
+        let token_url = spawn_token_server(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant","error_description":"bad code"}"#,
+            captured_body,
+        )
+        .await;
+
+        let app = build_app(test_state().await);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/oauth/exchange")
+            .header("Authorization", "Bearer shared-secret")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "code=abc&redirect_uri=https%3A%2F%2Finstance.example.com%2Foauth%2Fcallback&token_url={}&client_id=test-client&access_token_field=access_token",
+                urlencoding::encode(&token_url)
+            )))
             .unwrap();
-        let response = app.clone().oneshot(delete).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
-            authenticate_gateway_token(registry.as_ref(), "gateway-secret").await,
-            None
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"error":"invalid_grant","error_description":"bad code"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_requires_valid_shared_bearer_token() {
+        let app = build_app(test_state().await);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/oauth/refresh")
+            .header("Authorization", "Bearer wrong-secret")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "refresh_token=abc&token_url=http%3A%2F%2F127.0.0.1%2Ftoken&client_id=test-client",
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

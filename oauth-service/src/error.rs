@@ -15,9 +15,6 @@ pub enum ApiError {
 
     #[error("Internal error: {0}")]
     Internal(String),
-
-    #[error("Bad gateway: {0}")]
-    BadGateway(String),
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -38,7 +35,6 @@ impl IntoResponse for ApiError {
                     "Internal server error".to_string(),
                 )
             }
-            Self::BadGateway(message) => (StatusCode::BAD_GATEWAY, message.clone()),
         };
 
         (status, Json(json!({ "error": message }))).into_response()

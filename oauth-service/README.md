@@ -1,69 +1,75 @@
 # OAuth Service
 
-Standalone hosted OAuth service for IronClaw instances.
+Standalone hosted OAuth exchange service for IronClaw instances.
 
-This service is intentionally separate from `compose-api`. Existing hosted environments can
-continue using the current compose-api OAuth endpoints unchanged, while new infra can point
-IronClaw at this service instead.
+This service matches the direct-callback hosted flow:
+
+1. IronClaw sends the browser to the provider.
+2. The provider redirects directly back to the hosted IronClaw instance.
+3. IronClaw finishes `/oauth/callback` locally.
+4. IronClaw calls this service for token exchange or refresh.
+5. IronClaw stores the returned access and refresh tokens locally.
+
+The service is stateless with respect to user OAuth tokens.
 
 ## What It Owns
 
-- `GET /oauth/callback`
-  - Shared callback entrypoint for hosted OAuth flows
-  - Decodes hosted `state` and `307` redirects to `https://{instance}.{domain}/oauth/callback`
 - `POST /oauth/exchange`
-  - Instance-authenticated token exchange proxy
-  - Preserves the current IronClaw form contract
+  - Shared bearer token auth
+  - Accepts IronClaw's form payload
+  - Calls the provider token endpoint with redirects disabled
+  - Returns the provider response body directly
 - `POST /oauth/refresh`
-  - Instance-authenticated refresh proxy
-  - Preserves the current IronClaw form contract
-- `PUT /internal/instances/{name}/oauth`
-- `DELETE /internal/instances/{name}/oauth`
-- `PUT /internal/instances/oauth/reconcile`
-  - Internal registry sync endpoints for provisioning valid instance gateway tokens
+  - Shared bearer token auth
+  - Accepts IronClaw's refresh form payload
+  - Calls the provider token endpoint with redirects disabled
+  - Returns the provider response body directly
+- `GET /health`
+  - Simple health endpoint
 
-The service does not persist user access tokens or refresh tokens. Those remain stored on each
-IronClaw instance.
+No `/oauth/callback` route is required in this direct-callback model.
 
-## Env Vars
+## Runtime Env Vars
 
 - `LISTEN_ADDR`
   - Bind address for the service
   - Default: `0.0.0.0:47393`
-- `OPENCLAW_DOMAIN`
-  - Required when `/oauth/callback` is used for shared callback routing
+- `OAUTH_ALLOW_PRIVATE_TOKEN_URLS`
+  - Optional dev-only override for local testing
+  - When set to `1`, `true`, or `yes`, allows private and loopback `token_url` values
+- `IRONCLAW_OAUTH_PROXY_AUTH_TOKEN`
+  - Shared bearer token expected from hosted IronClaw instances
+  - Whitespace-only values are treated as unset
+  - Falls back to `GATEWAY_AUTH_TOKEN`
+- `GATEWAY_AUTH_TOKEN`
+  - Fallback shared bearer token for existing hosted infra
 - `GOOGLE_OAUTH_CLIENT_ID`
   - Public platform Google client id
 - `GOOGLE_OAUTH_CLIENT_SECRET`
-  - Platform Google client secret
-  - Only needed for platform-credential Google flows
-- `OAUTH_SERVICE_SYNC_TOKEN`
-  - Bearer token used by the provisioning/control plane to sync instance gateway tokens
-  - Required
-- `OAUTH_INSTANCE_REGISTRY_PATH`
-  - Path to the persisted hashed instance-token registry
-  - Default: `/app/data/oauth-instance-auth.json`
+  - Platform Google client secret injected server-side for hosted Google flows
 
 ## IronClaw Contract
 
-This service is compatible with the current IronClaw hosted OAuth contract:
+This service is compatible with the current hosted IronClaw contract:
 
+- `IRONCLAW_OAUTH_CALLBACK_URL`
+  - Set on IronClaw to the direct instance callback URL or base URL
 - `IRONCLAW_OAUTH_EXCHANGE_URL`
-  - Point this to the service base URL
-- `GATEWAY_AUTH_TOKEN`
-  - Sent by IronClaw as `Authorization: Bearer ...` on `/oauth/exchange` and `/oauth/refresh`
+  - Set on IronClaw to this service's base URL
+- `IRONCLAW_OAUTH_PROXY_AUTH_TOKEN`
+  - Sent by IronClaw as `Authorization: Bearer ...`
 - `GOOGLE_OAUTH_CLIENT_ID`
-  - Still set on the IronClaw instance for hosted Google auth URL construction
+  - Still set on IronClaw for hosted Google auth URL construction
 
-## Cloudflare Worker Note
+## Security Behavior
 
-If you want a Cloudflare Worker in front of this, the safest split is:
-
-- Cloudflare Worker or other edge service for `GET /oauth/callback`
-- This Rust service for `/oauth/exchange` and `/oauth/refresh`
-
-That keeps token-endpoint validation and pinned-address outbound requests in the Rust service,
-which is a better fit for the current SSRF protections than a pure Worker-only implementation.
+- Rejects non-HTTPS token URLs in production
+- Rejects token URLs that resolve to loopback or private addresses in production
+- Disables redirect following for outbound provider requests
+- `OAUTH_ALLOW_PRIVATE_TOKEN_URLS` relaxes the token URL checks only for explicit local testing
+- For hosted Google platform flows:
+  - injects the platform `client_secret` server-side
+  - rejects arbitrary `token_url` overrides
 
 ## Local Build
 
