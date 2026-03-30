@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 
 fn default_active() -> bool {
     true
@@ -37,6 +38,34 @@ fn parse_port_env(var_name: &str, default: u16) -> u16 {
             default
         }
     }
+}
+
+/// Try to bind a port on 0.0.0.0. Returns the listener on success so the
+/// caller can hold it while probing the next port in a pair.
+fn try_bind(port: u16) -> Option<TcpListener> {
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    match TcpListener::bind(addr) {
+        Ok(listener) => Some(listener),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None,
+        Err(e) => {
+            tracing::error!(
+                "unexpected error probing port {}: {}; treating as unavailable",
+                port,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Check if a pair of ports is free by binding both. The first port's listener
+/// is held while probing the second to avoid a TOCTOU race between the two.
+fn are_ports_free(p1: u16, p2: u16) -> bool {
+    let _listener1 = match try_bind(p1) {
+        Some(l) => l,
+        None => return false,
+    };
+    try_bind(p2).is_some()
 }
 
 /// Resolved port range, validated once at startup.
@@ -182,7 +211,11 @@ impl InstanceStore {
         self.instances.values()
     }
 
-    /// Returns (gateway_port, ssh_port) - two consecutive ports
+    /// Returns (gateway_port, ssh_port) - two consecutive ports.
+    ///
+    /// Checks both the in-memory store AND the OS (via a bind probe) to avoid
+    /// conflicts with ports held by containers/processes not tracked by the store
+    /// (e.g. after a CVM restart where Docker state drifted from the store).
     pub fn next_available_ports(&self) -> Result<(u16, u16), crate::error::ApiError> {
         let used_ports: std::collections::HashSet<u16> = self
             .instances
@@ -197,7 +230,10 @@ impl InstanceStore {
             if next > end {
                 break;
             }
-            if !used_ports.contains(&port) && !used_ports.contains(&next) {
+            if !used_ports.contains(&port)
+                && !used_ports.contains(&next)
+                && are_ports_free(port, next)
+            {
                 return Ok((port, next));
             }
             port = match port.checked_add(PORTS_PER_INSTANCE) {
@@ -295,6 +331,18 @@ mod tests {
         let (gw, ssh) = store.next_available_ports().unwrap();
         assert_eq!(gw, 40001);
         assert_eq!(ssh, 40002);
+    }
+
+    #[test]
+    fn test_next_available_ports_skips_os_bound_port() {
+        // Bind a port in a high range unlikely to conflict with other tests
+        let held = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 48001)).unwrap();
+        let store = InstanceStore::new(range(48001, 48006));
+        let (gw, ssh) = store.next_available_ports().unwrap();
+        // Should skip 48001/48002 because 48001 is bound at OS level
+        assert_eq!(gw, 48003);
+        assert_eq!(ssh, 48004);
+        drop(held);
     }
 
     #[test]
