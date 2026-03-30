@@ -33,6 +33,11 @@ on:
         required: false
         type: boolean
         default: true
+      build_oauth_service:
+        description: 'Build ironclaw-oauth-service'
+        required: false
+        type: boolean
+        default: true
       build_ironclaw_worker:
         description: 'Build ironclaw-nearai-worker'
         required: false
@@ -58,7 +63,7 @@ env:
   REGISTRY: docker.io
 
 jobs:
-  # Normal build: all 6 images (skipped when building ironclaw from source)
+  # Normal build: all 7 images (skipped when building ironclaw from source)
   build:
     if: ${{ !inputs.ironclaw_commit }}
     name: Build ${{ matrix.name }}
@@ -86,6 +91,11 @@ jobs:
             dockerfile: updater/Dockerfile
             build_script: false
             input_key: build_updater
+          - name: ironclaw-oauth-service
+            context: oauth-service
+            dockerfile: oauth-service/Dockerfile
+            build_script: false
+            input_key: build_oauth_service
           - name: ironclaw-nearai-worker
             context: ironclaw-worker
             dockerfile: ironclaw-worker/Dockerfile
