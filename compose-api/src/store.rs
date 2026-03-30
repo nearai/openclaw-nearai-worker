@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 
 fn default_active() -> bool {
     true
@@ -37,6 +38,12 @@ fn parse_port_env(var_name: &str, default: u16) -> u16 {
             default
         }
     }
+}
+
+/// Check if a port is free by attempting to bind on 0.0.0.0.
+/// Returns true if the port is available, false if already in use.
+fn is_port_free(port: u16) -> bool {
+    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).is_ok()
 }
 
 /// Resolved port range, validated once at startup.
@@ -182,7 +189,11 @@ impl InstanceStore {
         self.instances.values()
     }
 
-    /// Returns (gateway_port, ssh_port) - two consecutive ports
+    /// Returns (gateway_port, ssh_port) - two consecutive ports.
+    ///
+    /// Checks both the in-memory store AND the OS (via a bind probe) to avoid
+    /// conflicts with ports held by containers/processes not tracked by the store
+    /// (e.g. after a CVM restart where Docker state drifted from the store).
     pub fn next_available_ports(&self) -> Result<(u16, u16), crate::error::ApiError> {
         let used_ports: std::collections::HashSet<u16> = self
             .instances
@@ -197,7 +208,11 @@ impl InstanceStore {
             if next > end {
                 break;
             }
-            if !used_ports.contains(&port) && !used_ports.contains(&next) {
+            if !used_ports.contains(&port)
+                && !used_ports.contains(&next)
+                && is_port_free(port)
+                && is_port_free(next)
+            {
                 return Ok((port, next));
             }
             port = match port.checked_add(PORTS_PER_INSTANCE) {
