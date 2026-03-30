@@ -40,10 +40,32 @@ fn parse_port_env(var_name: &str, default: u16) -> u16 {
     }
 }
 
-/// Check if a port is free by attempting to bind on 0.0.0.0.
-/// Returns true if the port is available, false if already in use.
-fn is_port_free(port: u16) -> bool {
-    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).is_ok()
+/// Try to bind a port on 0.0.0.0. Returns the listener on success so the
+/// caller can hold it while probing the next port in a pair.
+fn try_bind(port: u16) -> Option<TcpListener> {
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    match TcpListener::bind(addr) {
+        Ok(listener) => Some(listener),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None,
+        Err(e) => {
+            tracing::error!(
+                "unexpected error probing port {}: {}; treating as unavailable",
+                port,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Check if a pair of ports is free by binding both. The first port's listener
+/// is held while probing the second to avoid a TOCTOU race between the two.
+fn are_ports_free(p1: u16, p2: u16) -> bool {
+    let _listener1 = match try_bind(p1) {
+        Some(l) => l,
+        None => return false,
+    };
+    try_bind(p2).is_some()
 }
 
 /// Resolved port range, validated once at startup.
@@ -210,8 +232,7 @@ impl InstanceStore {
             }
             if !used_ports.contains(&port)
                 && !used_ports.contains(&next)
-                && is_port_free(port)
-                && is_port_free(next)
+                && are_ports_free(port, next)
             {
                 return Ok((port, next));
             }
@@ -310,6 +331,18 @@ mod tests {
         let (gw, ssh) = store.next_available_ports().unwrap();
         assert_eq!(gw, 40001);
         assert_eq!(ssh, 40002);
+    }
+
+    #[test]
+    fn test_next_available_ports_skips_os_bound_port() {
+        // Bind a port in a high range unlikely to conflict with other tests
+        let held = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 48001)).unwrap();
+        let store = InstanceStore::new(range(48001, 48006));
+        let (gw, ssh) = store.next_available_ports().unwrap();
+        // Should skip 48001/48002 because 48001 is bound at OS level
+        assert_eq!(gw, 48003);
+        assert_eq!(ssh, 48004);
+        drop(held);
     }
 
     #[test]
