@@ -36,7 +36,7 @@ RUN apt-get update && \
 # Otherwise, download the pinned release from GitHub.
 # Uses BuildKit bind mount to probe the build context without a COPY that
 # would fail when the file is absent.
-ARG IRONCLAW_VERSION=0.23.0
+ARG IRONCLAW_VERSION=0.24.0
 RUN --mount=type=bind,source=.,target=/ctx \
     if [ -f /ctx/ironclaw ]; then \
       echo "Using locally built ironclaw binary"; \
