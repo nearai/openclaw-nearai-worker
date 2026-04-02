@@ -167,6 +167,11 @@ jobs:
           fi
           echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${IMAGE_REPOSITORY}:${TAG}" >> "$GITHUB_ENV"
 
+          # For release tags (v*), also publish :latest alias
+          if [[ "${GITHUB_REF_TYPE}" == 'tag' && -z "$TAG_INPUT" ]]; then
+            echo "EXTRA_REFERENCE=${{ env.REGISTRY }}/${IMAGE_REPOSITORY}:latest" >> "$GITHUB_ENV"
+          fi
+
       - name: Install build dependencies
         if: steps.should_build.outputs.skip != 'true' && matrix.build_script
         run: |
@@ -180,6 +185,11 @@ jobs:
           ./deploy/build-image.sh --push "${{ env.IMAGE_REFERENCE }}"
         env:
           OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
+
+      - name: Push extra tag (reproducible)
+        if: steps.should_build.outputs.skip != 'true' && matrix.build_script && env.EXTRA_REFERENCE
+        run: |
+          skopeo copy oci-archive:./oci.tar "docker://${{ env.EXTRA_REFERENCE }}"
 
       - name: Get image digest (reproducible)
         if: steps.should_build.outputs.skip != 'true' && matrix.build_script
@@ -200,7 +210,9 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: true
-          tags: ${{ env.IMAGE_REFERENCE }}
+          tags: |
+            ${{ env.IMAGE_REFERENCE }}
+            ${{ env.EXTRA_REFERENCE }}
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             ${{ inputs.ironclaw_version && format('IRONCLAW_VERSION={0}', inputs.ironclaw_version) || '' }}
@@ -233,6 +245,9 @@ jobs:
             echo "## ${{ env.IMAGE_REPOSITORY }} docker image"
             echo ""
             echo "- tag: \`${{ env.IMAGE_REFERENCE }}\`"
+            if [[ -n "${{ env.EXTRA_REFERENCE }}" ]]; then
+              echo "- latest: \`${{ env.EXTRA_REFERENCE }}\`"
+            fi
             echo "- digest: \`${{ env.IMAGE_DIGEST }}\`"
             echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
           } >> "$GITHUB_STEP_SUMMARY"
