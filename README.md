@@ -87,24 +87,26 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
    ./deploy/dev.sh
    ```
 
-3. **Create users via Compose API:**
+3. **Create instances via Compose API:**
    ```bash
    # Set your admin token (from deploy/.env.prod)
    export ADMIN_TOKEN="your-token-here"
    
-   # Create a user (with their NEAR AI API key and optional SSH public key)
-   curl -X POST http://<server>:47392/users \
+   # Create an IronClaw instance (with per-instance NEAR AI API key and optional SSH public key)
+   curl -X POST http://<server>:47392/instances \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer $ADMIN_TOKEN" \
      -d '{
-       "user_id": "alice",
+       "name": "alice",
+       "service_type": "ironclaw",
        "nearai_api_key": "sk-user-nearai-api-key",
-       "ssh_pubkey": "ssh-ed25519 AAAA... user@host"
+       "ssh_pubkey": "ssh-ed25519 AAAA... user@host",
+       "nearai_api_url": "https://cloud-stg-api.near.ai/v1"
      }'
    
    # Response includes gateway port, SSH port, and connection info:
    # {
-   #   "user_id": "alice",
+   #   "name": "alice",
    #   "token": "abc123...",
    #   "gateway_port": 19001,
    #   "ssh_port": 19002,
@@ -115,11 +117,16 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
    # }
    ```
 
+   For `service_type: "ironclaw"` instances, the worker automatically injects
+   `NEARAI_MCP_URL` and `NEARAI_MCP_API_KEY` into the container. They are derived
+   from the user's `nearai_api_url` / `nearai_api_key`, so no separate MCP key is
+   required.
+
 ### Compose API Authentication
 
 All API endpoints (except `/health`) require authentication via Bearer token:
 ```bash
-curl -H "Authorization: Bearer $ADMIN_TOKEN" http://<server>:47392/users
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://<server>:47392/instances
 ```
 
 The `ADMIN_TOKEN` must be a 32-character hex string. Generate one with:
@@ -132,13 +139,13 @@ openssl rand -hex 16
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Health check (no auth required) |
-| `POST` | `/users` | Create user (`{"user_id": "...", "nearai_api_key": "...", "ssh_pubkey": "..."}`) |
-| `GET` | `/users` | List all users |
-| `GET` | `/users/{id}` | Get user details |
-| `DELETE` | `/users/{id}` | Delete user and container |
-| `POST` | `/users/{id}/restart` | Restart user's container |
-| `POST` | `/users/{id}/stop` | Stop user's container |
-| `POST` | `/users/{id}/start` | Start user's container |
+| `POST` | `/instances` | Create instance (`{"name": "...", "service_type": "ironclaw", "nearai_api_key": "...", "ssh_pubkey": "..."}`) |
+| `GET` | `/instances` | List all instances |
+| `GET` | `/instances/{name}` | Get instance details |
+| `DELETE` | `/instances/{name}` | Delete instance and container |
+| `POST` | `/instances/{name}/restart` | Restart instance container |
+| `POST` | `/instances/{name}/stop` | Stop instance container |
+| `POST` | `/instances/{name}/start` | Start instance container |
 
 ### User Access
 
