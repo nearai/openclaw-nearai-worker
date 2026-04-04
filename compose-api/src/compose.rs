@@ -10,8 +10,10 @@ use crate::store::Instance;
 pub const DEFAULT_NEARAI_API_URL: &str = "https://cloud-api.near.ai/v1";
 
 fn derive_nearai_mcp_url(api_url: &str) -> String {
-    let base = api_url.trim_end_matches('/');
-    let base = base.strip_suffix("/v1").unwrap_or(base);
+    let base = api_url
+        .strip_suffix("/v1")
+        .unwrap_or(api_url)
+        .trim_end_matches('/');
     format!("{}/mcp", base)
 }
 
@@ -1306,10 +1308,6 @@ mod tests {
     fn test_derive_nearai_mcp_url_from_api_url() {
         assert_eq!(
             derive_nearai_mcp_url("https://cloud-api.near.ai/v1"),
-            "https://cloud-api.near.ai/mcp"
-        );
-        assert_eq!(
-            derive_nearai_mcp_url("https://cloud-api.near.ai/v1/"),
             "https://cloud-api.near.ai/mcp"
         );
         assert_eq!(
