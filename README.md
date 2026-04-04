@@ -117,11 +117,6 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
    # }
    ```
 
-   For `service_type: "ironclaw"` instances, the worker automatically injects
-   `NEARAI_MCP_URL` and `NEARAI_MCP_API_KEY` into the container. They are derived
-   from the user's `nearai_api_url` / `nearai_api_key`, so no separate MCP key is
-   required.
-
 ### Compose API Authentication
 
 All API endpoints (except `/health`) require authentication via Bearer token:

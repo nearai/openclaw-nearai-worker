@@ -9,14 +9,6 @@ use crate::store::Instance;
 /// Default NEAR AI Cloud API URL used when not specified per-instance.
 pub const DEFAULT_NEARAI_API_URL: &str = "https://cloud-api.near.ai/v1";
 
-fn derive_nearai_mcp_url(api_url: &str) -> String {
-    let base = api_url
-        .strip_suffix("/v1")
-        .unwrap_or(api_url)
-        .trim_end_matches('/');
-    format!("{}/mcp", base)
-}
-
 /// Insert OAuth-related env vars into the given map.
 /// Shared by `up()` and `ensure_env_file()` to avoid duplication.
 fn insert_oauth_env_vars(
@@ -407,13 +399,6 @@ impl ComposeManager {
             for (k, v) in extra {
                 vars.insert(k.clone(), v.clone());
             }
-        }
-        if cfg.service_type == "ironclaw" {
-            vars.insert(
-                "NEARAI_MCP_URL".into(),
-                derive_nearai_mcp_url(cfg.nearai_api_url),
-            );
-            vars.insert("NEARAI_MCP_API_KEY".into(), cfg.nearai_api_key.into());
         }
         let env_path = self.write_env_file(cfg.name, &vars)?;
 
@@ -1167,7 +1152,7 @@ impl ComposeManager {
             None => default_image,
         };
         vars.insert("OPENCLAW_IMAGE".into(), image.to_string());
-        vars.insert("SERVICE_TYPE".into(), service_type.clone());
+        vars.insert("SERVICE_TYPE".into(), service_type);
         vars.insert("WORKER_NETWORK".into(), Self::network_name(&inst.name));
         insert_oauth_env_vars(
             &mut vars,
@@ -1180,17 +1165,6 @@ impl ComposeManager {
             for (k, v) in extra {
                 vars.insert(k.clone(), v.clone());
             }
-        }
-        if service_type == "ironclaw" {
-            let nearai_api_url = inst
-                .nearai_api_url
-                .as_deref()
-                .unwrap_or(DEFAULT_NEARAI_API_URL);
-            vars.insert(
-                "NEARAI_MCP_URL".into(),
-                derive_nearai_mcp_url(nearai_api_url),
-            );
-            vars.insert("NEARAI_MCP_API_KEY".into(), inst.nearai_api_key.clone());
         }
         self.write_env_file(&inst.name, &vars)
     }
@@ -1293,73 +1267,5 @@ fn docker_command() -> Command {
         Command::new(path)
     } else {
         Command::new("docker")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use chrono::Utc;
-
-    use super::*;
-
-    #[test]
-    fn test_derive_nearai_mcp_url_from_api_url() {
-        assert_eq!(
-            derive_nearai_mcp_url("https://cloud-api.near.ai/v1"),
-            "https://cloud-api.near.ai/mcp"
-        );
-        assert_eq!(
-            derive_nearai_mcp_url("https://cloud-stg-api.near.ai"),
-            "https://cloud-stg-api.near.ai/mcp"
-        );
-        assert_eq!(
-            derive_nearai_mcp_url("https://cloud-stg-api.near.ai/"),
-            "https://cloud-stg-api.near.ai/mcp"
-        );
-    }
-
-    #[test]
-    fn test_ensure_env_file_adds_nearai_mcp_env_for_ironclaw() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let openclaw_compose = temp.path().join("docker-compose.worker.yml");
-        let ironclaw_compose = temp.path().join("docker-compose.ironclaw.yml");
-        std::fs::write(&openclaw_compose, "services: {}\n").expect("write compose");
-        std::fs::write(&ironclaw_compose, "services: {}\n").expect("write compose");
-
-        let mut compose_files = HashMap::new();
-        compose_files.insert("openclaw".to_string(), openclaw_compose);
-        compose_files.insert("ironclaw".to_string(), ironclaw_compose);
-
-        let manager = ComposeManager::new(compose_files, temp.path().join("envs"), None)
-            .expect("compose manager");
-
-        let instance = Instance {
-            name: "alice".to_string(),
-            token: "tok".to_string(),
-            gateway_port: 19001,
-            ssh_port: 19002,
-            created_at: Utc::now(),
-            ssh_pubkey: "ssh-ed25519 AAAA test".to_string(),
-            nearai_api_key: "sk-user".to_string(),
-            nearai_api_url: Some("https://cloud-stg-api.near.ai/v1".to_string()),
-            active: true,
-            image: Some("ironclaw-nearai-worker:test".to_string()),
-            image_digest: None,
-            service_type: Some("ironclaw".to_string()),
-            mem_limit: None,
-            cpus: None,
-            storage_size: None,
-            extra_env: None,
-        };
-
-        let env_path = manager
-            .ensure_env_file(&instance, "ironclaw-nearai-worker:test", None, None, None)
-            .expect("ensure env file");
-        let env_content = std::fs::read_to_string(env_path).expect("read env file");
-
-        assert!(env_content.contains("NEARAI_MCP_URL=https://cloud-stg-api.near.ai/mcp"));
-        assert!(env_content.contains("NEARAI_MCP_API_KEY=sk-user"));
     }
 }
