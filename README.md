@@ -87,39 +87,38 @@ For deploying multiple isolated OpenClaw instances (one per user), use the multi
    ./deploy/dev.sh
    ```
 
-3. **Create users via Compose API:**
+3. **Create instances via Compose API:**
    ```bash
    # Set your admin token (from deploy/.env.prod)
    export ADMIN_TOKEN="your-token-here"
    
-   # Create a user (with their NEAR AI API key and optional SSH public key)
-   curl -X POST http://<server>:47392/users \
+   # Create an IronClaw instance (with per-instance NEAR AI API key and required SSH public key)
+   curl -X POST http://<server>:47392/instances \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer $ADMIN_TOKEN" \
      -d '{
-       "user_id": "alice",
+       "name": "alice",
+       "service_type": "ironclaw",
        "nearai_api_key": "sk-user-nearai-api-key",
        "ssh_pubkey": "ssh-ed25519 AAAA... user@host"
      }'
+
+   # Optional: pass "nearai_api_url" to override the default
+   # https://cloud-api.near.ai/v1 endpoint.
    
-   # Response includes gateway port, SSH port, and connection info:
-   # {
-   #   "user_id": "alice",
-   #   "token": "abc123...",
-   #   "gateway_port": 19001,
-   #   "ssh_port": 19002,
-   #   "url": "http://<server>:19001",
-   #   "dashboard_url": "http://<server>:19001/?token=abc123...",
-   #   "ssh_command": "ssh -p 19002 agent@<server>",
-   #   "status": "running"
-   # }
+   # Response is an SSE stream. The first event includes instance connection info:
+   # data: {"stage":"created","message":"Instance 'alice' created, ports 19001-19002 allocated","instance":{"name":"alice","token":"abc123...","gateway_port":19001,"ssh_port":19002,"url":"http://<server>:19001","dashboard_url":"http://<server>:19001/?token=abc123...","ssh_command":"ssh -p 19002 alice@<server>","image":"ghcr.io/nearai/ironclaw@sha256:..."}}
+   #
+   # data: {"stage":"container_starting","message":"Pulling image and starting container..."}
+   # data: {"stage":"healthy","message":"Health check passed"}
+   # data: {"stage":"ready","message":"Instance 'alice' is ready"}
    ```
 
 ### Compose API Authentication
 
-All API endpoints (except `/health`) require authentication via Bearer token:
+Management endpoints require authentication via Bearer token. Public endpoints include `/health`, `/version`, `/instances/{name}/attestation`, and `/attestation/report`:
 ```bash
-curl -H "Authorization: Bearer $ADMIN_TOKEN" http://<server>:47392/users
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://<server>:47392/instances
 ```
 
 The `ADMIN_TOKEN` must be a 32-character hex string. Generate one with:
@@ -132,13 +131,16 @@ openssl rand -hex 16
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Health check (no auth required) |
-| `POST` | `/users` | Create user (`{"user_id": "...", "nearai_api_key": "...", "ssh_pubkey": "..."}`) |
-| `GET` | `/users` | List all users |
-| `GET` | `/users/{id}` | Get user details |
-| `DELETE` | `/users/{id}` | Delete user and container |
-| `POST` | `/users/{id}/restart` | Restart user's container |
-| `POST` | `/users/{id}/stop` | Stop user's container |
-| `POST` | `/users/{id}/start` | Start user's container |
+| `GET` | `/version` | API version and deployed image info (no auth required) |
+| `POST` | `/instances` | Create instance (`{"name": "...", "service_type": "ironclaw", "nearai_api_key": "...", "ssh_pubkey": "..."}`; optional `nearai_api_url` overrides the default API URL) |
+| `GET` | `/instances` | List all instances |
+| `GET` | `/instances/{name}` | Get instance details |
+| `GET` | `/instances/{name}/attestation` | Public attestation info for an instance (no auth required) |
+| `GET` | `/attestation/report` | Public TDX attestation report (no auth required) |
+| `DELETE` | `/instances/{name}` | Delete instance and container |
+| `POST` | `/instances/{name}/restart` | Restart instance container |
+| `POST` | `/instances/{name}/stop` | Stop instance container |
+| `POST` | `/instances/{name}/start` | Start instance container |
 
 ### User Access
 
