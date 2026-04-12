@@ -881,6 +881,106 @@ impl ComposeManager {
         Ok(())
     }
 
+    /// Restore instance data from a plaintext tar (same layout as [`Self::export_instance_data`])
+    /// into Docker named volumes while the gateway container is stopped.
+    ///
+    /// The caller should start the gateway afterward (e.g. [`Self::start`]).
+    pub fn restore_instance_data_from_tar_volumes(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+        image: &str,
+        tar_bytes: &[u8],
+    ) -> Result<(), ApiError> {
+        if !crate::is_valid_instance_name(name) {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid instance name: '{}'",
+                name
+            )));
+        }
+
+        let container = format!("openclaw-{}-gateway-1", name);
+        let _ = Command::new("docker")
+            .args(["stop", &container])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        let vol_config = format!("openclaw-{}_config", name);
+        let vol_workspace = format!("openclaw-{}_workspace", name);
+
+        let (config_mount, workspace_mount) = match service_type {
+            Some("ironclaw") => ("/restore/.ironclaw", "/restore/workspace"),
+            Some("openclaw") => ("/restore/.openclaw", "/restore/openclaw"),
+            None => {
+                return Err(ApiError::Internal(
+                    "restore requires service_type (openclaw or ironclaw)".into(),
+                ));
+            }
+            Some(other) => {
+                return Err(ApiError::BadRequest(format!(
+                    "Unknown service_type for restore: '{}'",
+                    other
+                )));
+            }
+        };
+
+        let v1 = format!("{}:{}", vol_config, config_mount);
+        let v2 = format!("{}:{}", vol_workspace, workspace_mount);
+
+        let mut child = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "-i",
+                "-u",
+                "agent",
+                "--entrypoint",
+                "tar",
+                "-v",
+                &v1,
+                "-v",
+                &v2,
+                image,
+                "xf",
+                "-",
+                "-C",
+                "/restore",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| ApiError::Internal(format!("docker run tar (restore): {}", e)))?;
+
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| ApiError::Internal("restore: no stdin".into()))?;
+            stdin
+                .write_all(tar_bytes)
+                .map_err(|e| ApiError::Internal(format!("restore tar stdin: {}", e)))?;
+            stdin
+                .flush()
+                .map_err(|e| ApiError::Internal(format!("restore tar flush: {}", e)))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| ApiError::Internal(format!("restore tar wait: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!(
+                "docker run tar restore failed: {}",
+                stderr
+            )));
+        }
+
+        Ok(())
+    }
+
     // ── discovery ─────────────────────────────────────────────────────
 
     /// Discover all managed instances from Docker containers.
