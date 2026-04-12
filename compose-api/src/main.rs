@@ -45,7 +45,7 @@ mod names;
 mod nginx_conf;
 mod store;
 
-use backup::BackupManager;
+use backup::{decrypt_backup_to_tar, BackupManager};
 use compose::{ComposeManager, DEFAULT_NEARAI_API_URL};
 use error::ApiError;
 use store::{Instance, InstanceStore, PortRange};
@@ -72,6 +72,7 @@ use store::{Instance, InstanceStore, PortRange};
         create_backup_endpoint,
         list_backups_endpoint,
         download_backup_endpoint,
+        restore_backup_endpoint,
         get_config,
         set_config,
         delete_config_key,
@@ -95,6 +96,7 @@ use store::{Instance, InstanceStore, PortRange};
         BackupInfoResponse,
         BackupListResponse,
         BackupDownloadResponse,
+        RestoreBackupRequest,
         SseEvent,
         ErrorResponse,
         RestartServiceResponse,
@@ -351,6 +353,29 @@ impl AppState {
         tokio::task::spawn_blocking(move || compose.import_instance_data(&name, &tar_bytes))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
+    }
+
+    async fn compose_restore_instance_data_from_tar_volumes(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+        image: &str,
+        tar_bytes: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        let compose = self.compose.clone();
+        let name = name.to_string();
+        let service_type = service_type.map(|s| s.to_string());
+        let image = image.to_string();
+        tokio::task::spawn_blocking(move || {
+            compose.restore_instance_data_from_tar_volumes(
+                &name,
+                service_type.as_deref(),
+                &image,
+                &tar_bytes,
+            )
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 }
 
@@ -1676,6 +1701,10 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/instances/{name}/backups/{id}",
                 get(download_backup_endpoint),
+            )
+            .route(
+                "/instances/{name}/restore/{id}",
+                post(restore_backup_endpoint),
             );
     }
 
@@ -1913,6 +1942,15 @@ struct BackupListResponse {
 struct BackupDownloadResponse {
     url: String,
     expires_in_seconds: u64,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct RestoreBackupRequest {
+    /// OpenSSH or PEM private key matching the instance `ssh_pubkey` used when the backup was created.
+    ssh_private_key: String,
+    /// Passphrase for the private key when it is stored encrypted (OpenSSH `-o` format).
+    #[serde(default)]
+    ssh_key_passphrase: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -3267,6 +3305,235 @@ async fn download_backup_endpoint(
         url,
         expires_in_seconds: 3600,
     }))
+}
+
+#[utoipa::path(post, path = "/instances/{name}/restore/{id}", tag = "Backups",
+    params(
+        ("name" = String, Path, description = "Instance name"),
+        ("id" = String, Path, description = "Backup ID (timestamp)"),
+    ),
+    request_body = RestoreBackupRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "SSE stream of restore progress", content_type = "text/event-stream", body = SseEvent),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance or backup not found", body = ErrorResponse),
+        (status = 409, description = "Concurrent upgrade/restore", body = ErrorResponse),
+        (status = 501, description = "Backups not configured", body = ErrorResponse),
+    )
+)]
+async fn restore_backup_endpoint(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path((name, backup_id)): Path<(String, String)>,
+    Json(req): Json<RestoreBackupRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !is_valid_instance_name(&name) {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid instance name: '{}'",
+            name
+        )));
+    }
+
+    let backup_mgr = state
+        .backup
+        .as_ref()
+        .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?
+        .clone();
+
+    let inst = {
+        let store = state.store.read().await;
+        store.get(&name).cloned()
+    };
+    let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
+
+    if inst.service_type.as_deref().is_none() {
+        return Err(ApiError::BadRequest(
+            "Instance has no service_type; set SERVICE_TYPE in .env before restore".into(),
+        ));
+    }
+
+    let mut upgrading = state.upgrading.lock().await;
+    if !upgrading.insert(name.clone()) {
+        return Err(ApiError::Conflict(format!(
+            "Instance '{}' is already being upgraded or restored",
+            name
+        )));
+    }
+    drop(upgrading);
+
+    {
+        let mut store = state.store.write().await;
+        let _ = store.set_active(&name, false);
+    }
+    update_nginx_now(&state).await;
+
+    let worker_image = inst
+        .image
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if inst.service_type.as_deref() == Some("ironclaw") {
+                state.config.ironclaw_image.clone()
+            } else {
+                state.config.openclaw_image.clone()
+            }
+        });
+
+    let passphrase_owned = req
+        .ssh_key_passphrase
+        .clone()
+        .filter(|s| !s.trim().is_empty());
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(16);
+
+    {
+        let state = state.clone();
+        let name = name.clone();
+        let backup_id = backup_id.clone();
+        let inst = inst.clone();
+        let ssh_private_key = req.ssh_private_key.clone();
+        tokio::spawn(async move {
+            async fn release_upgrading(state: &AppState, name: &str) {
+                state.upgrading.lock().await.remove(name);
+            }
+
+            let _ = tx
+                .send(sse_stage(
+                    "downloading",
+                    "Downloading encrypted backup from storage...",
+                ))
+                .await;
+
+            let ciphertext = match backup_mgr.fetch_backup_ciphertext(&name, &backup_id).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tx.send(sse_error(&e.to_string())).await;
+                    release_upgrading(&state, &name).await;
+                    return;
+                }
+            };
+
+            let _ = tx
+                .send(sse_stage(
+                    "decrypting",
+                    "Decrypting backup with SSH private key...",
+                ))
+                .await;
+
+            let tar_result = tokio::task::spawn_blocking(move || {
+                decrypt_backup_to_tar(&ciphertext, &ssh_private_key, passphrase_owned.as_deref())
+            })
+            .await;
+
+            let tar_bytes = match tar_result {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    let _ = tx.send(sse_error(&e.to_string())).await;
+                    release_upgrading(&state, &name).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(sse_error(&format!("decrypt task failed: {}", e)))
+                        .await;
+                    release_upgrading(&state, &name).await;
+                    return;
+                }
+            };
+
+            let _ = tx
+                .send(sse_stage(
+                    "extracting",
+                    "Extracting data into instance volumes...",
+                ))
+                .await;
+
+            if let Err(e) = state
+                .compose_restore_instance_data_from_tar_volumes(
+                    &name,
+                    inst.service_type.as_deref(),
+                    &worker_image,
+                    tar_bytes,
+                )
+                .await
+            {
+                let _ = tx.send(sse_error(&e.to_string())).await;
+                release_upgrading(&state, &name).await;
+                return;
+            }
+
+            let _ = tx
+                .send(sse_stage(
+                    "container_starting",
+                    "Starting gateway container...",
+                ))
+                .await;
+
+            if let Err(e) = state
+                .compose_start(&name, false, inst.service_type.as_deref())
+                .await
+            {
+                let _ = tx.send(sse_error(&e.to_string())).await;
+                release_upgrading(&state, &name).await;
+                return;
+            }
+
+            let health_ok = Arc::new(AtomicBool::new(false));
+            let (htx, mut hrx) = tokio::sync::mpsc::channel::<Event>(16);
+            let poll_state = state.clone();
+            let poll_name = name.clone();
+            let poll_st = inst.service_type.clone();
+            let hflag = health_ok.clone();
+            tokio::spawn(async move {
+                poll_health_to_ready(
+                    &poll_state,
+                    &poll_name,
+                    poll_st.as_deref(),
+                    &htx,
+                    Some(hflag),
+                )
+                .await;
+            });
+
+            while let Some(ev) = hrx.recv().await {
+                let _ = tx.send(ev).await;
+            }
+
+            if health_ok.load(Ordering::Acquire) {
+                {
+                    let mut store = state.store.write().await;
+                    let _ = store.set_active(&name, true);
+                }
+                let _ = tx
+                    .send(sse_stage("configuring_routing", "Restoring routing..."))
+                    .await;
+                update_nginx_now(&state).await;
+                let _ = tx
+                    .send(
+                        Event::default()
+                            .json_data(serde_json::json!({
+                                "stage": "complete",
+                                "message": format!("Restore complete for backup {}", backup_id),
+                            }))
+                            .expect("SSE JSON serialization"),
+                    )
+                    .await;
+            }
+
+            release_upgrading(&state, &name).await;
+        });
+    }
+
+    let stream = async_stream::stream! {
+        while let Some(event) = rx.recv().await {
+            yield Ok(event);
+        }
+    };
+
+    Ok(unbuffered_sse(stream))
 }
 
 // ── Config (env override) handlers ───────────────────────────────────

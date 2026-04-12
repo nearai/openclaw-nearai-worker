@@ -1,14 +1,44 @@
-use std::io::Write;
+use std::io::{Cursor, Read, Write};
 use std::str::FromStr;
 use std::time::Duration;
 
+use age::ssh::Identity;
+use age::{Callbacks, Decryptor, Identity as AgeIdentity};
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::presigning::PresigningConfig;
 use chrono::{DateTime, Utc};
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use secrecy::SecretString;
 use serde::Serialize;
 
 use crate::error::ApiError;
+
+/// Max plaintext instance data (tar) after decrypt+decompress — keep in sync with `MAX_EXPORT_BYTES` in main.
+const MAX_BACKUP_PLAINTEXT_BYTES: usize = 512 * 1024 * 1024;
+/// Max ciphertext size accepted from S3 (slightly above plaintext cap).
+const MAX_BACKUP_CIPHERTEXT_BYTES: usize = 520 * 1024 * 1024;
+const MAX_SSH_PRIVATE_KEY_BYTES: usize = 256 * 1024;
+
+#[derive(Clone)]
+struct StaticPassphraseCallbacks(SecretString);
+
+impl Callbacks for StaticPassphraseCallbacks {
+    fn display_message(&self, _message: &str) {}
+
+    fn confirm(&self, _message: &str, _yes: &str, _no: Option<&str>) -> Option<bool> {
+        None
+    }
+
+    fn request_public_string(&self, _description: &str) -> Option<String> {
+        None
+    }
+
+    fn request_passphrase(&self, _description: &str) -> Option<SecretString> {
+        Some(self.0.clone())
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupInfo {
@@ -158,6 +188,133 @@ impl BackupManager {
 
         Ok(presigned.uri().to_string())
     }
+
+    /// Download encrypted backup object bytes from S3.
+    pub async fn fetch_backup_ciphertext(
+        &self,
+        instance_name: &str,
+        backup_id: &str,
+    ) -> Result<Vec<u8>, ApiError> {
+        let key = format!("backups/{}/{}.tar.gz.age", instance_name, backup_id);
+        let resp = self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| match &e {
+                SdkError::ServiceError(se) if se.err().is_no_such_key() => {
+                    ApiError::NotFound(format!(
+                        "Backup '{}' not found for instance '{}'",
+                        backup_id, instance_name
+                    ))
+                }
+                _ => ApiError::Internal(format!("S3 download failed: {}", e)),
+            })?;
+
+        let agg = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| ApiError::Internal(format!("S3 body read failed: {}", e)))?;
+        let bytes = agg.into_bytes().to_vec();
+        if bytes.len() > MAX_BACKUP_CIPHERTEXT_BYTES {
+            return Err(ApiError::BadRequest(format!(
+                "Backup object too large (max {} MiB ciphertext)",
+                MAX_BACKUP_CIPHERTEXT_BYTES / (1024 * 1024)
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
+/// Decrypt an age backup (SSH recipient) and decompress gzip to the raw tar archive
+/// produced by `export_instance_data`.
+pub fn decrypt_backup_to_tar(
+    ciphertext: &[u8],
+    ssh_private_key: &str,
+    ssh_key_passphrase: Option<&str>,
+) -> Result<Vec<u8>, ApiError> {
+    if ssh_private_key.is_empty() {
+        return Err(ApiError::BadRequest("ssh_private_key is required".into()));
+    }
+    if ssh_private_key.len() > MAX_SSH_PRIVATE_KEY_BYTES {
+        return Err(ApiError::BadRequest("ssh_private_key is too large".into()));
+    }
+
+    let identity =
+        Identity::from_buffer(Cursor::new(ssh_private_key.as_bytes()), None).map_err(|e| {
+            ApiError::BadRequest(format!(
+                "invalid SSH private key (expected OpenSSH or PEM): {}",
+                e
+            ))
+        })?;
+
+    if matches!(&identity, Identity::Unsupported(_)) {
+        return Err(ApiError::BadRequest(
+            "SSH private key type is not supported for backup decryption (use ed25519 or RSA)"
+                .into(),
+        ));
+    }
+
+    let decryptor = Decryptor::new_buffered(Cursor::new(ciphertext)).map_err(|e| {
+        ApiError::BadRequest(format!("file is not a valid age-encrypted backup: {}", e))
+    })?;
+
+    let mut gz_plain = Vec::new();
+    if matches!(&identity, Identity::Encrypted(_)) {
+        let passphrase = ssh_key_passphrase.ok_or_else(|| {
+            ApiError::BadRequest(
+                "SSH private key is passphrase-protected; provide ssh_key_passphrase".into(),
+            )
+        })?;
+        let cb =
+            StaticPassphraseCallbacks(SecretString::new(passphrase.to_string().into_boxed_str()));
+        let id = identity.with_callbacks(cb);
+        let mut r = decryptor
+            .decrypt(std::iter::once(&id as &dyn AgeIdentity))
+            .map_err(|e| {
+                ApiError::BadRequest(format!(
+                    "decryption failed (wrong key or passphrase): {}",
+                    e
+                ))
+            })?;
+        r.read_to_end(&mut gz_plain)
+            .map_err(|e| ApiError::Internal(format!("read decrypted backup stream: {}", e)))?;
+    } else {
+        let mut r = decryptor
+            .decrypt(std::iter::once(&identity as &dyn AgeIdentity))
+            .map_err(|e| {
+                ApiError::BadRequest(format!(
+                    "decryption failed (SSH private key does not match backup): {}",
+                    e
+                ))
+            })?;
+        r.read_to_end(&mut gz_plain)
+            .map_err(|e| ApiError::Internal(format!("read decrypted backup stream: {}", e)))?;
+    }
+
+    if gz_plain.len() > MAX_BACKUP_CIPHERTEXT_BYTES {
+        return Err(ApiError::BadRequest(
+            "decrypted payload exceeds configured size limit".into(),
+        ));
+    }
+
+    let mut tar = Vec::new();
+    let mut decoder = GzDecoder::new(gz_plain.as_slice());
+    decoder.read_to_end(&mut tar).map_err(|e| {
+        ApiError::BadRequest(format!("backup is not valid gzip after decrypt: {}", e))
+    })?;
+
+    if tar.len() > MAX_BACKUP_PLAINTEXT_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "restored tar exceeds {} MiB limit",
+            MAX_BACKUP_PLAINTEXT_BYTES / (1024 * 1024)
+        )));
+    }
+
+    Ok(tar)
 }
 
 /// Encrypt data using an SSH public key via the `age` crate.
