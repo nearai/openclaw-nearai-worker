@@ -21,6 +21,8 @@ fn insert_oauth_env_vars(
     if let Some(domain) = openclaw_domain {
         vars.insert("OPENCLAW_DOMAIN".into(), domain.into());
         vars.insert("OPENCLAW_INSTANCE_NAME".into(), instance_name.into());
+        vars.insert("IRONCLAW_DOMAIN".into(), domain.into());
+        vars.insert("IRONCLAW_INSTANCE_NAME".into(), instance_name.into());
     }
     if let Some(client_id) = google_oauth_client_id {
         vars.insert("GOOGLE_OAUTH_CLIENT_ID".into(), client_id.into());
@@ -282,6 +284,8 @@ impl ComposeManager {
             "NEARAI_API_KEY",
             "NEARAI_API_URL",
             "OPENCLAW_GATEWAY_TOKEN",
+            "GATEWAY_AUTH_TOKEN",
+            "ENGINE_V2",
             "GATEWAY_PORT",
             "SSH_PORT",
             "SSH_PUBKEY",
@@ -295,6 +299,8 @@ impl ComposeManager {
             // OAuth vars written by insert_oauth_env_vars
             "OPENCLAW_DOMAIN",
             "OPENCLAW_INSTANCE_NAME",
+            "IRONCLAW_DOMAIN",
+            "IRONCLAW_INSTANCE_NAME",
             "GOOGLE_OAUTH_CLIENT_ID",
             "IRONCLAW_OAUTH_EXCHANGE_URL",
         ];
@@ -370,6 +376,8 @@ impl ComposeManager {
         vars.insert("NEARAI_API_KEY".into(), cfg.nearai_api_key.into());
         vars.insert("NEARAI_API_URL".into(), cfg.nearai_api_url.into());
         vars.insert("OPENCLAW_GATEWAY_TOKEN".into(), cfg.token.into());
+        vars.insert("GATEWAY_AUTH_TOKEN".into(), cfg.token.into());
+        vars.insert("ENGINE_V2".into(), "true".into());
         vars.insert("GATEWAY_PORT".into(), cfg.gateway_port.to_string());
         vars.insert("SSH_PORT".into(), cfg.ssh_port.to_string());
         vars.insert("OPENCLAW_IMAGE".into(), cfg.image.to_string());
@@ -1117,6 +1125,8 @@ impl ComposeManager {
                 .to_string(),
         );
         vars.insert("OPENCLAW_GATEWAY_TOKEN".into(), inst.token.clone());
+        vars.insert("GATEWAY_AUTH_TOKEN".into(), inst.token.clone());
+        vars.insert("ENGINE_V2".into(), "true".into());
         vars.insert("GATEWAY_PORT".into(), inst.gateway_port.to_string());
         vars.insert("SSH_PORT".into(), inst.ssh_port.to_string());
         vars.insert("SSH_PUBKEY".into(), inst.ssh_pubkey.clone());
