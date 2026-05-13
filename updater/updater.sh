@@ -46,7 +46,7 @@ if [ "${UPDATER_SKIP_VERIFY:-0}" != "1" ]; then
 fi
 COSIGN_ISSUER="${UPDATER_COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
 HEALTH_URL="${UPDATER_HEALTH_URL:-http://127.0.0.1:8080/health}"
-HEALTH_TIMEOUT="${UPDATER_HEALTH_TIMEOUT:-120}"
+HEALTH_TIMEOUT="${UPDATER_HEALTH_TIMEOUT:-600}"
 STATE_FILE="${UPDATER_STATE_FILE:-/app/data/updater-state.json}"
 SELF_CHECK_INTERVAL="${UPDATER_SELF_CHECK_INTERVAL:-1}"  # every poll cycle
 BUNDLED_COMPOSE="/app/compose/docker-compose.dstack.yml"
@@ -653,7 +653,7 @@ _poll_cycle() {
 
     # Re-read tunable parameters from overrides (runtime config via PUT /config)
     _ht="$(read_env_var UPDATER_HEALTH_TIMEOUT)"
-    HEALTH_TIMEOUT="${_ht:-${UPDATER_HEALTH_TIMEOUT:-120}}"
+    HEALTH_TIMEOUT="${_ht:-${HEALTH_TIMEOUT}}"
 
     # Check backoff
     local backoff_until
