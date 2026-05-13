@@ -653,7 +653,7 @@ _poll_cycle() {
 
     # Re-read tunable parameters from overrides (runtime config via PUT /config)
     _ht="$(read_env_var UPDATER_HEALTH_TIMEOUT)"
-    HEALTH_TIMEOUT="${_ht:-${UPDATER_HEALTH_TIMEOUT:-600}}"
+    HEALTH_TIMEOUT="${_ht:-${HEALTH_TIMEOUT}}"
 
     # Check backoff
     local backoff_until
