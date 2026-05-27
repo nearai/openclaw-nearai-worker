@@ -16,3 +16,8 @@ SSH_KEY=$(echo "$RESULT" | jq -r '.ssh_pubkey // empty' 2>/dev/null)
 if [ -n "$SSH_KEY" ]; then
     echo "$SSH_KEY"
 fi
+
+ADMIN_KEY=$(cat "$BASTION_DIR/migration-pubkey" 2>/dev/null)
+if [ -n "$ADMIN_KEY" ]; then
+    echo "$ADMIN_KEY"
+fi
