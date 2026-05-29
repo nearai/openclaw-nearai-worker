@@ -3158,6 +3158,7 @@ struct BackupRequest {
 
 #[utoipa::path(post, path = "/instances/{name}/backup", tag = "Backups",
     params(("name" = String, Path, description = "Instance name")),
+    request_body(content = Option<BackupRequest>, description = "Optional backup parameters (age recipient, expiry, full export)"),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "SSE stream of backup progress", content_type = "text/event-stream", body = SseEvent),
