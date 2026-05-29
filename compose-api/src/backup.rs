@@ -183,6 +183,8 @@ fn encrypt_with_ssh_pubkey(data: &[u8], ssh_pubkey: &str) -> Result<Vec<u8>, Api
 /// Encrypt data using an age recipient string.
 /// Tries parsing as X25519 ("age1...") first, then falls back to SSH pubkey.
 fn encrypt_with_recipient(data: &[u8], recipient_str: &str) -> Result<Vec<u8>, ApiError> {
+    let recipient_str = recipient_str.trim();
+
     // Try X25519 first (age native keys start with "age1")
     if let Ok(recipient) = recipient_str.parse::<age::x25519::Recipient>() {
         return encrypt_with_boxed_recipient(data, Box::new(recipient));

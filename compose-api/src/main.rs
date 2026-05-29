@@ -3181,6 +3181,13 @@ async fn create_backup_endpoint(
     let req = body.map(|Json(b)| b).unwrap_or_default();
     let age_recipient = req.age_recipient;
     let expiry_secs = req.expiry_secs;
+    if let Some(secs) = expiry_secs {
+        if secs < 1 || secs > 604800 {
+            return Err(ApiError::BadRequest(
+                "expiry_secs must be between 1 and 604800 (S3 presigned URL limit)".into(),
+            ));
+        }
+    }
     let full_export = req.full_export.unwrap_or(false);
 
     let inst = {
@@ -3207,7 +3214,13 @@ async fn create_backup_endpoint(
         match result {
             Ok(info) => {
                 yield Ok(sse_stage("uploading", "Encrypted backup uploaded to S3"));
-                let download_url = backup_mgr.download_url(&name, &info.id, expiry_secs).await.ok();
+                let download_url = match backup_mgr.download_url(&name, &info.id, expiry_secs).await {
+                    Ok(url) => Some(url),
+                    Err(e) => {
+                        tracing::error!("Failed to generate download URL for backup {}: {}", info.id, e);
+                        None
+                    }
+                };
                 yield Ok(Event::default()
                     .json_data(serde_json::json!({
                         "stage": "complete",
