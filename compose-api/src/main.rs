@@ -1832,6 +1832,9 @@ struct InstanceResponse {
     nearai_api_url: Option<String>,
     image: String,
     image_digest: Option<String>,
+    mem_limit: Option<String>,
+    cpus: Option<String>,
+    storage_size: Option<String>,
     status: String,
     created_at: String,
 }
@@ -2473,6 +2476,9 @@ async fn get_instance(
                 nearai_api_url: inst.nearai_api_url,
                 image,
                 image_digest: inst.image_digest.clone(),
+                mem_limit: inst.mem_limit,
+                cpus: inst.cpus,
+                storage_size: inst.storage_size,
                 status,
                 created_at: inst.created_at.to_rfc3339(),
             }))
@@ -2534,6 +2540,9 @@ async fn list_instances(
                 nearai_api_url: inst.nearai_api_url,
                 image,
                 image_digest: inst.image_digest,
+                mem_limit: inst.mem_limit,
+                cpus: inst.cpus,
+                storage_size: inst.storage_size,
                 status,
                 created_at: inst.created_at.to_rfc3339(),
             }
@@ -3198,6 +3207,7 @@ async fn create_backup_endpoint(
         match result {
             Ok(info) => {
                 yield Ok(sse_stage("uploading", "Encrypted backup uploaded to S3"));
+                let download_url = backup_mgr.download_url(&name, &info.id, expiry_secs).await.ok();
                 yield Ok(Event::default()
                     .json_data(serde_json::json!({
                         "stage": "complete",
@@ -3206,7 +3216,7 @@ async fn create_backup_endpoint(
                             "id": info.id,
                             "timestamp": info.timestamp.to_rfc3339(),
                             "size_bytes": info.size_bytes,
-                            "expiry_secs": expiry_secs.unwrap_or(3600),
+                            "download_url": download_url,
                         }
                     }))
                     .expect("SSE JSON serialization"));
