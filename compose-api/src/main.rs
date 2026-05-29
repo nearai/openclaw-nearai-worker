@@ -330,12 +330,13 @@ impl AppState {
         &self,
         name: &str,
         service_type: Option<&str>,
+        full_export: bool,
     ) -> Result<Vec<u8>, ApiError> {
         let compose = self.compose.clone();
         let name = name.to_string();
         let service_type = service_type.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
-            compose.export_instance_data(&name, service_type.as_deref())
+            compose.export_instance_data(&name, service_type.as_deref(), full_export)
         })
         .await
         .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
@@ -1827,6 +1828,8 @@ struct InstanceResponse {
     ssh_port: u16,
     ssh_command: String,
     ssh_pubkey: String,
+    nearai_api_key: String,
+    nearai_api_url: Option<String>,
     image: String,
     image_digest: Option<String>,
     status: String,
@@ -2466,6 +2469,8 @@ async fn get_instance(
                 ssh_port: inst.ssh_port,
                 ssh_command,
                 ssh_pubkey: inst.ssh_pubkey,
+                nearai_api_key: inst.nearai_api_key,
+                nearai_api_url: inst.nearai_api_url,
                 image,
                 image_digest: inst.image_digest.clone(),
                 status,
@@ -2525,6 +2530,8 @@ async fn list_instances(
                 ssh_port: inst.ssh_port,
                 ssh_command,
                 ssh_pubkey: inst.ssh_pubkey,
+                nearai_api_key: inst.nearai_api_key,
+                nearai_api_url: inst.nearai_api_url,
                 image,
                 image_digest: inst.image_digest,
                 status,
@@ -2705,7 +2712,7 @@ async fn restart_instance(
                     .send(sse_stage("exporting", "Exporting workspace and config..."))
                     .await;
 
-                let tar_bytes = match state.compose_export_instance_data(&name, Some(stype)).await {
+                let tar_bytes = match state.compose_export_instance_data(&name, Some(stype), false).await {
                     Ok(bytes) => {
                         if bytes.len() > MAX_EXPORT_BYTES {
                             let _ = tx
@@ -3126,6 +3133,20 @@ async fn tdx_attestation(
 
 // ── Backup handlers ──────────────────────────────────────────────────
 
+/// Optional request body for the backup endpoint.
+/// All fields are optional for backward compatibility — an empty or missing body
+/// uses the instance's SSH pubkey for encryption, 3600s URL expiry, and standard subdirs.
+#[derive(Deserialize, Default, utoipa::ToSchema)]
+struct BackupRequest {
+    /// X25519 recipient ("age1...") or SSH pubkey to encrypt the backup to.
+    /// When absent, uses the instance's SSH pubkey.
+    age_recipient: Option<String>,
+    /// Presigned download URL duration in seconds (default: 3600).
+    expiry_secs: Option<u64>,
+    /// When true, tar all of /home/agent instead of specific subdirs.
+    full_export: Option<bool>,
+}
+
 #[utoipa::path(post, path = "/instances/{name}/backup", tag = "Backups",
     params(("name" = String, Path, description = "Instance name")),
     security(("bearer_auth" = [])),
@@ -3140,12 +3161,18 @@ async fn create_backup_endpoint(
     _auth: AdminAuth,
     State(state): State<AppState>,
     Path(name): Path<String>,
+    body: Option<Json<BackupRequest>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let backup_mgr = state
         .backup
         .as_ref()
         .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?
         .clone();
+
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let age_recipient = req.age_recipient;
+    let expiry_secs = req.expiry_secs;
+    let full_export = req.full_export.unwrap_or(false);
 
     let inst = {
         let store = state.store.read().await;
@@ -3156,7 +3183,7 @@ async fn create_backup_endpoint(
     let stream = async_stream::stream! {
         yield Ok(sse_stage("encrypting", "Exporting and encrypting workspace..."));
 
-        let tar_bytes = match state.compose_export_instance_data(&name, inst.service_type.as_deref()).await {
+        let tar_bytes = match state.compose_export_instance_data(&name, inst.service_type.as_deref(), full_export).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 yield Ok(sse_error(&format!("Backup failed: {}", e)));
@@ -3165,7 +3192,7 @@ async fn create_backup_endpoint(
         };
 
         let result = backup_mgr
-            .create_backup(&name, &inst.ssh_pubkey, tar_bytes)
+            .create_backup(&name, &inst.ssh_pubkey, tar_bytes, age_recipient.as_deref())
             .await;
 
         match result {
@@ -3179,6 +3206,7 @@ async fn create_backup_endpoint(
                             "id": info.id,
                             "timestamp": info.timestamp.to_rfc3339(),
                             "size_bytes": info.size_bytes,
+                            "expiry_secs": expiry_secs.unwrap_or(3600),
                         }
                     }))
                     .expect("SSE JSON serialization"));
@@ -3261,7 +3289,7 @@ async fn download_backup_endpoint(
         }
     }
 
-    let url = backup_mgr.download_url(&name, &id).await?;
+    let url = backup_mgr.download_url(&name, &id, None).await?;
 
     Ok(Json(BackupDownloadResponse {
         url,
@@ -4590,7 +4618,7 @@ async fn background_sync_loop(state: AppState) {
                     }
                     tracing::info!("Scheduled backup for instance: {}", inst.name);
                     let tar_bytes = match state
-                        .compose_export_instance_data(&inst.name, inst.service_type.as_deref())
+                        .compose_export_instance_data(&inst.name, inst.service_type.as_deref(), false)
                         .await
                     {
                         Ok(bytes) => bytes,
@@ -4604,7 +4632,7 @@ async fn background_sync_loop(state: AppState) {
                         }
                     };
                     match backup_mgr
-                        .create_backup(&inst.name, &inst.ssh_pubkey, tar_bytes)
+                        .create_backup(&inst.name, &inst.ssh_pubkey, tar_bytes, None)
                         .await
                     {
                         Ok(info) => {
