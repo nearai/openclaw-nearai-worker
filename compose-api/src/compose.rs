@@ -775,40 +775,45 @@ impl ComposeManager {
     /// Uses `docker exec tar` to capture both directories relative to `/home/agent/`.
     /// `service_type` must match the instance (ironclaw vs openclaw); if it is wrong,
     /// the wrong dirs are archived and restore will create the wrong paths in the new container.
+    ///
+    /// When `full_export` is true, tars ALL of `/home/agent/` instead of specific subdirs.
+    /// This is used for migration to capture the complete home directory.
     pub fn export_instance_data(
         &self,
         name: &str,
         service_type: Option<&str>,
+        full_export: bool,
     ) -> Result<Vec<u8>, ApiError> {
         let container = format!("openclaw-{}-gateway-1", name);
-        let (config_dir, workspace_dir) = match service_type {
-            Some("ironclaw") => (".ironclaw", "workspace"),
-            Some("openclaw") => (".openclaw", "openclaw"),
-            None => {
-                return Err(ApiError::Internal(format!(
-                    "Cannot export instance '{}': service_type is unknown (set SERVICE_TYPE in .env or recreate with correct type)",
-                    name
-                )));
-            }
-            Some(other) => {
-                return Err(ApiError::Internal(format!(
-                    "Unknown service_type for export: '{}' (instance '{}')",
-                    other, name
-                )));
-            }
-        };
+
+        let mut args = vec!["exec", &container, "tar", "cf", "-", "-C", "/home/agent"];
+
+        if full_export {
+            // Export everything in /home/agent
+            args.push(".");
+        } else {
+            let (config_dir, workspace_dir) = match service_type {
+                Some("ironclaw") => (".ironclaw", "workspace"),
+                Some("openclaw") => (".openclaw", "openclaw"),
+                None => {
+                    return Err(ApiError::Internal(format!(
+                        "Cannot export instance '{}': service_type is unknown (set SERVICE_TYPE in .env or recreate with correct type)",
+                        name
+                    )));
+                }
+                Some(other) => {
+                    return Err(ApiError::Internal(format!(
+                        "Unknown service_type for export: '{}' (instance '{}')",
+                        other, name
+                    )));
+                }
+            };
+            args.push(config_dir);
+            args.push(workspace_dir);
+        }
+
         let output = Command::new("docker")
-            .args([
-                "exec",
-                &container,
-                "tar",
-                "cf",
-                "-",
-                "-C",
-                "/home/agent",
-                config_dir,
-                workspace_dir,
-            ])
+            .args(&args)
             .output()
             .map_err(|e| ApiError::Internal(format!("Failed to run docker exec tar: {}", e)))?;
 

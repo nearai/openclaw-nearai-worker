@@ -10,6 +10,8 @@ use serde::Serialize;
 
 use crate::error::ApiError;
 
+const DEFAULT_PRESIGNED_URL_EXPIRY_SECS: u64 = 3600;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupInfo {
     pub id: String,
@@ -45,12 +47,16 @@ impl BackupManager {
     }
 
     /// Create an encrypted backup from pre-exported instance data.
-    /// tar_bytes → gzip → age-encrypt with SSH pubkey → upload to S3.
+    /// tar_bytes → gzip → age-encrypt → upload to S3.
+    ///
+    /// When `age_recipient` is provided, encrypts to that key (X25519 "age1..." or SSH pubkey).
+    /// Otherwise falls back to the instance's SSH pubkey.
     pub async fn create_backup(
         &self,
         instance_name: &str,
         ssh_pubkey: &str,
         tar_bytes: Vec<u8>,
+        age_recipient: Option<&str>,
     ) -> Result<BackupInfo, ApiError> {
         if tar_bytes.is_empty() {
             return Err(ApiError::Internal(
@@ -67,8 +73,11 @@ impl BackupManager {
             .finish()
             .map_err(|e| ApiError::Internal(format!("gzip finish failed: {}", e)))?;
 
-        // Encrypt with age using SSH public key
-        let encrypted = encrypt_with_ssh_pubkey(&gz_bytes, ssh_pubkey)?;
+        // Encrypt with age: prefer explicit age_recipient, fall back to SSH pubkey
+        let encrypted = match age_recipient {
+            Some(recipient_str) => encrypt_with_recipient(&gz_bytes, recipient_str)?,
+            None => encrypt_with_ssh_pubkey(&gz_bytes, ssh_pubkey)?,
+        };
 
         // Upload to S3
         let now = Utc::now();
@@ -134,12 +143,15 @@ impl BackupManager {
         Ok(backups)
     }
 
-    /// Generate a presigned download URL for a backup (~1h expiry).
+    /// Generate a presigned download URL for a backup.
+    /// `expiry_secs` defaults to 3600 (1 hour) when None.
     pub async fn download_url(
         &self,
         instance_name: &str,
         backup_id: &str,
+        expiry_secs: Option<u64>,
     ) -> Result<String, ApiError> {
+        let expiry = expiry_secs.unwrap_or(DEFAULT_PRESIGNED_URL_EXPIRY_SECS);
         let key = format!("backups/{}/{}.tar.gz.age", instance_name, backup_id);
 
         let presigned = self
@@ -149,7 +161,7 @@ impl BackupManager {
             .key(&key)
             .presigned(
                 PresigningConfig::builder()
-                    .expires_in(Duration::from_secs(3600))
+                    .expires_in(Duration::from_secs(expiry))
                     .build()
                     .map_err(|e| ApiError::Internal(format!("presign config error: {}", e)))?,
             )
@@ -165,7 +177,34 @@ fn encrypt_with_ssh_pubkey(data: &[u8], ssh_pubkey: &str) -> Result<Vec<u8>, Api
     let recipient = age::ssh::Recipient::from_str(ssh_pubkey)
         .map_err(|e| ApiError::Internal(format!("invalid SSH public key: {:?}", e)))?;
 
-    let recipient: Box<dyn age::Recipient + Send> = Box::new(recipient);
+    encrypt_with_boxed_recipient(data, Box::new(recipient))
+}
+
+/// Encrypt data using an age recipient string.
+/// Tries parsing as X25519 ("age1...") first, then falls back to SSH pubkey.
+fn encrypt_with_recipient(data: &[u8], recipient_str: &str) -> Result<Vec<u8>, ApiError> {
+    let recipient_str = recipient_str.trim();
+
+    // Try X25519 first (age native keys start with "age1")
+    if let Ok(recipient) = recipient_str.parse::<age::x25519::Recipient>() {
+        return encrypt_with_boxed_recipient(data, Box::new(recipient));
+    }
+
+    // Fall back to SSH pubkey
+    if let Ok(recipient) = age::ssh::Recipient::from_str(recipient_str) {
+        return encrypt_with_boxed_recipient(data, Box::new(recipient));
+    }
+
+    Err(ApiError::BadRequest(format!(
+        "age_recipient is neither a valid X25519 recipient (age1...) nor an SSH public key"
+    )))
+}
+
+/// Encrypt data with a boxed age::Recipient.
+fn encrypt_with_boxed_recipient(
+    data: &[u8],
+    recipient: Box<dyn age::Recipient + Send>,
+) -> Result<Vec<u8>, ApiError> {
     let encryptor =
         age::Encryptor::with_recipients(std::iter::once(&*recipient as &dyn age::Recipient))
             .map_err(|e| ApiError::Internal(format!("encryptor init failed: {:?}", e)))?;
