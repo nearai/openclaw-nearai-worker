@@ -18,6 +18,10 @@ services:
       OPENCLAW_AUTO_APPROVE_DEVICES: ${OPENCLAW_AUTO_APPROVE_DEVICES:-1}
       # Optional: SSH public key for key-based login (enables SSH server on port 2222; required for external SSH).
       SSH_PUBKEY: ${SSH_PUBKEY:-}
+      # Optional: Database backend — "libsql" (default, embedded SQLite) or "postgres".
+      DATABASE_BACKEND: ${DATABASE_BACKEND:-libsql}
+      # Optional: PostgreSQL connection string (required when DATABASE_BACKEND=postgres).
+      DATABASE_URL: ${DATABASE_URL:-}
     command: ["openclaw", "gateway", "run", "--bind", "${OPENCLAW_GATEWAY_BIND:-lan}", "--port", "18789", "--verbose"]
     volumes:
       - openclaw-config:/home/agent/.openclaw
