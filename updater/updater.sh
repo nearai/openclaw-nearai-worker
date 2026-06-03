@@ -251,6 +251,17 @@ fetch_remote_digest() {
     echo "$digest"
 }
 
+valid_digest() {
+    local digest="$1"
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
+# Check if a digest-referenced image exists in the local Docker image store
+image_exists_locally() {
+    local image_repo="$1" digest="$2"
+    docker image inspect "${image_repo}@${digest}" > /dev/null 2>&1
+}
+
 # ── Cosign verification ──────────────────────────────────────────────
 
 verify_attestation() {
@@ -320,19 +331,6 @@ compose_up() {
     fi
 }
 
-# Build compose CLI flags as a string (for passing to helper containers)
-compose_base_args() {
-    local args=""
-    [ -n "$COMPOSE_PROJECT" ] && args="-p $COMPOSE_PROJECT "
-    args="$args-f $COMPOSE_FILE "
-    if [ -n "$BASE_ENV_FILE" ]; then
-        args="$args--env-file $BASE_ENV_FILE --env-file $ENV_FILE"
-    else
-        args="$args--env-file $ENV_FILE"
-    fi
-    echo "$args"
-}
-
 # ── Env file helpers ─────────────────────────────────────────────────
 
 # Read a value: check overrides first, fall back to base env
@@ -352,14 +350,33 @@ read_env_var() {
 
 # Set a value in the overrides env file (add or replace)
 write_env_var() {
-    local key="$1" value="$2"
-    touch "$ENV_FILE"
-    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
-        local tmp="${ENV_FILE}.tmp"
-        sed "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
-    else
-        echo "${key}=${value}" >> "$ENV_FILE"
+    local key="$1" value="$2" tmp
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        log_error "Invalid env key: ${key}"
+        return 1
     fi
+    case "$value" in
+        *$'\n'*|*$'\r'*)
+            log_error "Refusing to write multi-line env value for ${key}"
+            return 1
+            ;;
+    esac
+
+    touch "$ENV_FILE"
+    tmp="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
+    awk -v key="$key" -v value="$value" '
+        index($0, key "=") == 1 {
+            print key "=" value
+            found = 1
+            next
+        }
+        { print }
+        END {
+            if (!found) {
+                print key "=" value
+            }
+        }
+    ' "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
 }
 
 # ── Bootstrap ────────────────────────────────────────────────────────
@@ -420,6 +437,10 @@ update_compose_api() {
         log_error "Failed to fetch remote digest for ${COMPOSE_API_IMAGE}:${CHANNEL}"
         return 1
     fi
+    if ! valid_digest "$remote_digest"; then
+        log_error "Invalid remote digest for ${COMPOSE_API_IMAGE}:${CHANNEL}"
+        return 1
+    fi
 
     # 2. Get currently running digest
     running_digest="$(read_state "compose_api_digest")"
@@ -431,8 +452,11 @@ update_compose_api() {
 
     # 3. Compare
     if [ "$remote_digest" = "$running_digest" ]; then
-        log "compose-api: up to date (${remote_digest:0:16}...)"
-        return 0
+        if image_exists_locally "$COMPOSE_API_IMAGE" "$remote_digest"; then
+            log "compose-api: up to date (${remote_digest:0:16}...)"
+            return 0
+        fi
+        log "compose-api: digest matches but image missing locally, will pull"
     fi
 
     log "New compose-api image detected: ${remote_digest} (current: ${running_digest:-unknown})"
@@ -518,11 +542,18 @@ update_image() {
         log_error "Failed to fetch remote digest for ${image_repo}:${CHANNEL}"
         return 1
     fi
+    if ! valid_digest "$remote_digest"; then
+        log_error "Invalid remote digest for ${image_repo}:${CHANNEL}"
+        return 1
+    fi
 
     current_digest="$(read_state "$state_key")"
     if [ "$remote_digest" = "$current_digest" ]; then
-        log "${label}: up to date (${remote_digest:0:16}...)"
-        return 0
+        if image_exists_locally "$image_repo" "$remote_digest"; then
+            log "${label}: up to date (${remote_digest:0:16}...)"
+            return 0
+        fi
+        log "${label}: digest matches but image missing locally, will pull"
     fi
 
     log "New ${label} image detected: ${remote_digest} (current: ${current_digest:-unknown})"
@@ -572,11 +603,18 @@ update_self() {
         log_error "Failed to fetch remote digest for self (${updater_image}:${CHANNEL})"
         return 1
     fi
+    if ! valid_digest "$remote_digest"; then
+        log_error "Invalid remote digest for self (${updater_image}:${CHANNEL})"
+        return 1
+    fi
 
     current_digest="$(read_state "updater_digest")"
     if [ "$remote_digest" = "$current_digest" ]; then
-        log "Self-update: up to date (${remote_digest:0:16}...)"
-        return 0
+        if image_exists_locally "$updater_image" "$remote_digest"; then
+            log "Self-update: up to date (${remote_digest:0:16}...)"
+            return 0
+        fi
+        log "Self-update: digest matches but image missing locally, will pull"
     fi
 
     log "New updater image detected: ${remote_digest}"
@@ -605,10 +643,13 @@ update_self() {
     # which works with bind mounts (standard server, local dev) and named
     # volumes (dstack CVM bootstrap) without needing host-side paths.
     log "Syncing compose file from new image..."
+    local compose_dir
+    compose_dir="$(dirname "$COMPOSE_FILE")"
     docker run --rm \
         --volumes-from "$self_cid" \
         --entrypoint sh "$image_ref" \
-        -c "cp /app/compose/docker-compose.dstack.yml $(dirname "$COMPOSE_FILE")/"
+        -c 'cp -- /app/compose/docker-compose.dstack.yml "$1"/' \
+        sh "$compose_dir"
 
     write_env_var "UPDATER_IMAGE" "$image_ref"
     write_state "updater_digest" "$remote_digest"
@@ -619,20 +660,27 @@ update_self() {
     # before create+start can execute, leaving the new container in "Created" state.
     docker rm -f openclaw-updater-helper 2>/dev/null || true
 
-    local compose_args
-    compose_args="$(compose_base_args)"
+    local -a compose_args=()
+    [ -n "$COMPOSE_PROJECT" ] && compose_args+=(-p "$COMPOSE_PROJECT")
+    compose_args+=(-f "$COMPOSE_FILE")
+    if [ -n "$BASE_ENV_FILE" ]; then
+        compose_args+=(--env-file "$BASE_ENV_FILE" --env-file "$ENV_FILE")
+    else
+        compose_args+=(--env-file "$ENV_FILE")
+    fi
 
     # Pass DEPLOY_DIR so compose resolves the host-side bind mount correctly
-    local helper_env=""
-    [ -n "$HOST_DEPLOY_DIR" ] && helper_env="-e DEPLOY_DIR=${HOST_DEPLOY_DIR}"
+    local -a helper_env=()
+    [ -n "$HOST_DEPLOY_DIR" ] && helper_env=(-e "DEPLOY_DIR=${HOST_DEPLOY_DIR}")
 
     if ! docker run --rm -d \
         --name openclaw-updater-helper \
         --volumes-from "$self_cid" \
-        $helper_env \
+        "${helper_env[@]}" \
         --entrypoint sh \
         "$image_ref" \
-        -c "sleep 3 && docker compose $compose_args up -d --remove-orphans --no-deps openclaw-updater && sleep 2"; then
+        -c 'sleep 3 && docker compose "$@" up -d --remove-orphans --no-deps openclaw-updater && sleep 2' \
+        sh "${compose_args[@]}"; then
         log_error "Failed to launch self-update helper container"
         return 1
     fi
