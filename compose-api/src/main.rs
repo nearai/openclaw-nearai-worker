@@ -2061,7 +2061,7 @@ fn unbuffered_sse(
     let headers = [("X-Accel-Buffering", "no"), ("Cache-Control", "no-cache")];
     let sse = Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
+            .interval(std::time::Duration::from_secs(5))
             .text("keep-alive"),
     );
     (headers, sse)
