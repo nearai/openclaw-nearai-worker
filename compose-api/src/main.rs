@@ -1644,6 +1644,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/{name}/restart", post(restart_instance))
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
+        .route("/instances/{name}/version", get(get_instance_version))
         .route("/instances/{name}/attestation", get(instance_attestation))
         .route("/attestation/report", get(tdx_attestation))
         .route("/config", get(get_config))
@@ -2488,6 +2489,40 @@ async fn get_instance(
         }
         None => Err(ApiError::NotFound(format!("Instance '{}' not found", name))),
     }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct AppVersionResponse {
+    version: String,
+}
+
+#[utoipa::path(get, path = "/instances/{name}/version", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Application version", body = AppVersionResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+        (status = 500, description = "Failed to query version", body = ErrorResponse),
+    )
+)]
+async fn get_instance_version(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let service_type = {
+        let store = state.store.read().await;
+        store
+            .get(&name)
+            .map(|inst| inst.service_type.clone())
+            .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?
+    };
+
+    let version = state
+        .compose
+        .query_app_version(&name, service_type.as_deref())?;
+
+    Ok(Json(AppVersionResponse { version }))
 }
 
 #[utoipa::path(get, path = "/instances", tag = "Instances",

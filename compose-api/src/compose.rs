@@ -1153,6 +1153,57 @@ impl ComposeManager {
             .ok()
     }
 
+    /// Query the application version from a running container.
+    /// Runs `ironclaw --version` (or `openclaw --version`) and parses the semver.
+    pub fn query_app_version(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+    ) -> Result<String, ApiError> {
+        let container = format!("openclaw-{}-gateway-1", name);
+        let binary = match service_type {
+            Some("ironclaw") => "ironclaw",
+            _ => "openclaw",
+        };
+
+        let output = Command::new("docker")
+            .args(["exec", &container, binary, "--version"])
+            .output()
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "failed to run docker exec {} --version: {}",
+                    binary, e
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!(
+                "{} --version failed: {}",
+                binary,
+                stderr.trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Output is typically "ironclaw 0.29.0" or "openclaw 2026.2.15"
+        let version = stdout
+            .trim()
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .to_string();
+
+        if version.is_empty() {
+            return Err(ApiError::Internal(format!(
+                "{} --version returned empty output",
+                binary
+            )));
+        }
+
+        Ok(version)
+    }
+
     /// Reconstruct the env file for a discovered instance so that
     /// docker compose lifecycle commands (stop/start/restart) continue to work.
     /// `default_image` should be the correct image for this instance's service type
