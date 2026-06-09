@@ -9,6 +9,37 @@ use crate::store::Instance;
 /// Default NEAR AI Cloud API URL used when not specified per-instance.
 pub const DEFAULT_NEARAI_API_URL: &str = "https://cloud-api.near.ai/v1";
 
+/// Env vars managed by compose-api (written by ensure_env_file / up).
+/// Anything NOT in this list is considered user-supplied "extra_env".
+const CORE_ENV_KEYS: &[&str] = &[
+    "NEARAI_API_KEY",
+    "NEARAI_API_URL",
+    "OPENCLAW_GATEWAY_TOKEN",
+    "GATEWAY_AUTH_TOKEN",
+    "ENGINE_V2",
+    "GATEWAY_PORT",
+    "SSH_PORT",
+    "SSH_PUBKEY",
+    "BASTION_SSH_PUBKEY",
+    "OPENCLAW_IMAGE",
+    "SERVICE_TYPE",
+    "WORKER_NETWORK",
+    "MEM_LIMIT",
+    "CPUS",
+    "STORAGE_SIZE",
+    "OPENCLAW_DOMAIN",
+    "OPENCLAW_INSTANCE_NAME",
+    "IRONCLAW_DOMAIN",
+    "IRONCLAW_INSTANCE_NAME",
+    "GOOGLE_OAUTH_CLIENT_ID",
+    "IRONCLAW_OAUTH_EXCHANGE_URL",
+];
+
+/// System/Docker env vars to exclude when collecting extra_env from a container.
+const SYSTEM_ENV_KEYS: &[&str] = &[
+    "PATH", "HOME", "HOSTNAME", "LANG", "LC_ALL", "TERM", "SHLVL", "PWD", "OLDPWD", "USER", "SHELL",
+];
+
 /// Insert OAuth-related env vars into the given map.
 /// Shared by `up()` and `ensure_env_file()` to avoid duplication.
 fn insert_oauth_env_vars(
@@ -277,36 +308,9 @@ impl ComposeManager {
             )
         });
 
-        // Collect extra env vars: anything not in the core set written by
-        // ensure_env_file / up(). These include user-configured vars like
-        // CHANNEL_RELAY_URL, CHANNEL_RELAY_API_KEY, etc.
-        const CORE_KEYS: &[&str] = &[
-            "NEARAI_API_KEY",
-            "NEARAI_API_URL",
-            "OPENCLAW_GATEWAY_TOKEN",
-            "GATEWAY_AUTH_TOKEN",
-            "ENGINE_V2",
-            "GATEWAY_PORT",
-            "SSH_PORT",
-            "SSH_PUBKEY",
-            "BASTION_SSH_PUBKEY",
-            "OPENCLAW_IMAGE",
-            "SERVICE_TYPE",
-            "WORKER_NETWORK",
-            "MEM_LIMIT",
-            "CPUS",
-            "STORAGE_SIZE",
-            // OAuth vars written by insert_oauth_env_vars
-            "OPENCLAW_DOMAIN",
-            "OPENCLAW_INSTANCE_NAME",
-            "IRONCLAW_DOMAIN",
-            "IRONCLAW_INSTANCE_NAME",
-            "GOOGLE_OAUTH_CLIENT_ID",
-            "IRONCLAW_OAUTH_EXCHANGE_URL",
-        ];
         let extra: HashMap<String, String> = vars
             .iter()
-            .filter(|(k, _)| !CORE_KEYS.contains(&k.as_str()))
+            .filter(|(k, _)| !CORE_ENV_KEYS.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let extra_env = if extra.is_empty() { None } else { Some(extra) };
@@ -1073,6 +1077,27 @@ impl ComposeManager {
         // Resolve image digest from .Image → RepoDigests
         let image_digest = self.resolve_image_digest(name);
 
+        let mut extra: HashMap<String, String> = env_map
+            .iter()
+            .filter(|(k, v)| {
+                !v.is_empty()
+                    && !CORE_ENV_KEYS.contains(&k.as_str())
+                    && !SYSTEM_ENV_KEYS.contains(&k.as_str())
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // ironclaw generates SECRETS_MASTER_KEY at runtime (entrypoint.sh writes it to
+        // .master_key on disk). It's not in Config.Env, so read it from the container.
+        if service_type.as_deref() == Some("ironclaw") && !extra.contains_key("SECRETS_MASTER_KEY")
+        {
+            if let Some(key) = self.read_master_key_from_container(container_name) {
+                extra.insert("SECRETS_MASTER_KEY".to_string(), key);
+            }
+        }
+
+        let extra_env = if extra.is_empty() { None } else { Some(extra) };
+
         Ok(Instance {
             name: name.to_string(),
             token,
@@ -1089,7 +1114,7 @@ impl ComposeManager {
             mem_limit: None,
             cpus: None,
             storage_size: None,
-            extra_env: None,
+            extra_env,
         })
     }
 
@@ -1106,6 +1131,84 @@ impl ComposeManager {
             .as_str()?
             .parse()
             .ok()
+    }
+
+    /// Read SECRETS_MASTER_KEY from an ironclaw container's persisted .master_key file.
+    /// Returns None if the file doesn't exist or the value is invalid.
+    fn read_master_key_from_container(&self, container_name: &str) -> Option<String> {
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                container_name,
+                "cat",
+                "/home/agent/.ironclaw/.master_key",
+            ])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Validate: must be 64 hex chars (32 bytes)
+        if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(key)
+        } else {
+            tracing::warn!(
+                "Container {} has .master_key but it's not valid 64-char hex (len={})",
+                container_name,
+                key.len()
+            );
+            None
+        }
+    }
+
+    /// Query the application version from a running container.
+    /// Runs `ironclaw --version` (or `openclaw --version`) and parses the semver.
+    pub fn query_app_version(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+    ) -> Result<String, ApiError> {
+        let container = format!("openclaw-{}-gateway-1", name);
+        let binary = match service_type {
+            Some("ironclaw") => "ironclaw",
+            _ => "openclaw",
+        };
+
+        let output = Command::new("docker")
+            .args(["exec", &container, binary, "--version"])
+            .output()
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "failed to run docker exec {} --version: {}",
+                    binary, e
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!(
+                "{} --version failed: {}",
+                binary,
+                stderr.trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Output is typically "ironclaw 0.29.0" or "openclaw 2026.2.15"
+        let version = stdout.split_whitespace().last().unwrap_or("").to_string();
+
+        if version.is_empty() {
+            return Err(ApiError::Internal(format!(
+                "{} --version returned empty output",
+                binary
+            )));
+        }
+
+        Ok(version)
     }
 
     /// Reconstruct the env file for a discovered instance so that

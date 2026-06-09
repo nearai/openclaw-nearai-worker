@@ -26,10 +26,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
+use std::collections::HashMap;
+
 #[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE;
-#[cfg(test)]
-use std::collections::HashMap;
 #[cfg(test)]
 use std::ffi::OsString;
 #[cfg(test)]
@@ -82,9 +82,11 @@ use store::{Instance, InstanceStore, PortRange};
         oauth_callback_router,
         oauth_exchange,
         oauth_refresh,
+        get_instance_version,
     ),
     components(schemas(
         VersionResponse,
+        AppVersionResponse,
         CreateInstanceRequest,
         RestartInstanceRequest,
         InstanceInfo,
@@ -1644,6 +1646,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/{name}/restart", post(restart_instance))
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
+        .route("/instances/{name}/version", get(get_instance_version))
         .route("/instances/{name}/attestation", get(instance_attestation))
         .route("/attestation/report", get(tdx_attestation))
         .route("/config", get(get_config))
@@ -1835,6 +1838,8 @@ struct InstanceResponse {
     mem_limit: Option<String>,
     cpus: Option<String>,
     storage_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_env: Option<HashMap<String, String>>,
     status: String,
     created_at: String,
 }
@@ -2479,12 +2484,51 @@ async fn get_instance(
                 mem_limit: inst.mem_limit,
                 cpus: inst.cpus,
                 storage_size: inst.storage_size,
+                extra_env: inst.extra_env,
                 status,
                 created_at: inst.created_at.to_rfc3339(),
             }))
         }
         None => Err(ApiError::NotFound(format!("Instance '{}' not found", name))),
     }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct AppVersionResponse {
+    version: String,
+}
+
+#[utoipa::path(get, path = "/instances/{name}/version", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Application version", body = AppVersionResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+        (status = 500, description = "Failed to query version", body = ErrorResponse),
+    )
+)]
+async fn get_instance_version(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let service_type = {
+        let store = state.store.read().await;
+        store
+            .get(&name)
+            .map(|inst| inst.service_type.clone())
+            .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?
+    };
+
+    let compose = state.compose.clone();
+    let name_clone = name.clone();
+    let st = service_type.clone();
+    let version =
+        tokio::task::spawn_blocking(move || compose.query_app_version(&name_clone, st.as_deref()))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))??;
+
+    Ok(Json(AppVersionResponse { version }))
 }
 
 #[utoipa::path(get, path = "/instances", tag = "Instances",
@@ -2543,6 +2587,7 @@ async fn list_instances(
                 mem_limit: inst.mem_limit,
                 cpus: inst.cpus,
                 storage_size: inst.storage_size,
+                extra_env: inst.extra_env,
                 status,
                 created_at: inst.created_at.to_rfc3339(),
             }
@@ -2721,7 +2766,10 @@ async fn restart_instance(
                     .send(sse_stage("exporting", "Exporting workspace and config..."))
                     .await;
 
-                let tar_bytes = match state.compose_export_instance_data(&name, Some(stype), false).await {
+                let tar_bytes = match state
+                    .compose_export_instance_data(&name, Some(stype), false)
+                    .await
+                {
                     Ok(bytes) => {
                         if bytes.len() > MAX_EXPORT_BYTES {
                             let _ = tx
@@ -4642,7 +4690,11 @@ async fn background_sync_loop(state: AppState) {
                     }
                     tracing::info!("Scheduled backup for instance: {}", inst.name);
                     let tar_bytes = match state
-                        .compose_export_instance_data(&inst.name, inst.service_type.as_deref(), false)
+                        .compose_export_instance_data(
+                            &inst.name,
+                            inst.service_type.as_deref(),
+                            false,
+                        )
                         .await
                     {
                         Ok(bytes) => bytes,
