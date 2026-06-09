@@ -1156,7 +1156,6 @@ impl ComposeManager {
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Output is typically "ironclaw 0.29.0" or "openclaw 2026.2.15"
         let version = stdout
-            .trim()
             .split_whitespace()
             .last()
             .unwrap_or("")
