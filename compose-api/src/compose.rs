@@ -9,6 +9,37 @@ use crate::store::Instance;
 /// Default NEAR AI Cloud API URL used when not specified per-instance.
 pub const DEFAULT_NEARAI_API_URL: &str = "https://cloud-api.near.ai/v1";
 
+/// Env vars managed by compose-api (written by ensure_env_file / up).
+/// Anything NOT in this list is considered user-supplied "extra_env".
+const CORE_ENV_KEYS: &[&str] = &[
+    "NEARAI_API_KEY",
+    "NEARAI_API_URL",
+    "OPENCLAW_GATEWAY_TOKEN",
+    "GATEWAY_AUTH_TOKEN",
+    "ENGINE_V2",
+    "GATEWAY_PORT",
+    "SSH_PORT",
+    "SSH_PUBKEY",
+    "BASTION_SSH_PUBKEY",
+    "OPENCLAW_IMAGE",
+    "SERVICE_TYPE",
+    "WORKER_NETWORK",
+    "MEM_LIMIT",
+    "CPUS",
+    "STORAGE_SIZE",
+    "OPENCLAW_DOMAIN",
+    "OPENCLAW_INSTANCE_NAME",
+    "IRONCLAW_DOMAIN",
+    "IRONCLAW_INSTANCE_NAME",
+    "GOOGLE_OAUTH_CLIENT_ID",
+    "IRONCLAW_OAUTH_EXCHANGE_URL",
+];
+
+/// System/Docker env vars to exclude when collecting extra_env from a container.
+const SYSTEM_ENV_KEYS: &[&str] = &[
+    "PATH", "HOME", "HOSTNAME", "LANG", "LC_ALL", "TERM", "SHLVL", "PWD", "OLDPWD", "USER", "SHELL",
+];
+
 /// Insert OAuth-related env vars into the given map.
 /// Shared by `up()` and `ensure_env_file()` to avoid duplication.
 fn insert_oauth_env_vars(
@@ -277,36 +308,9 @@ impl ComposeManager {
             )
         });
 
-        // Collect extra env vars: anything not in the core set written by
-        // ensure_env_file / up(). These include user-configured vars like
-        // CHANNEL_RELAY_URL, CHANNEL_RELAY_API_KEY, etc.
-        const CORE_KEYS: &[&str] = &[
-            "NEARAI_API_KEY",
-            "NEARAI_API_URL",
-            "OPENCLAW_GATEWAY_TOKEN",
-            "GATEWAY_AUTH_TOKEN",
-            "ENGINE_V2",
-            "GATEWAY_PORT",
-            "SSH_PORT",
-            "SSH_PUBKEY",
-            "BASTION_SSH_PUBKEY",
-            "OPENCLAW_IMAGE",
-            "SERVICE_TYPE",
-            "WORKER_NETWORK",
-            "MEM_LIMIT",
-            "CPUS",
-            "STORAGE_SIZE",
-            // OAuth vars written by insert_oauth_env_vars
-            "OPENCLAW_DOMAIN",
-            "OPENCLAW_INSTANCE_NAME",
-            "IRONCLAW_DOMAIN",
-            "IRONCLAW_INSTANCE_NAME",
-            "GOOGLE_OAUTH_CLIENT_ID",
-            "IRONCLAW_OAUTH_EXCHANGE_URL",
-        ];
         let extra: HashMap<String, String> = vars
             .iter()
-            .filter(|(k, _)| !CORE_KEYS.contains(&k.as_str()))
+            .filter(|(k, _)| !CORE_ENV_KEYS.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let extra_env = if extra.is_empty() { None } else { Some(extra) };
@@ -1073,47 +1077,11 @@ impl ComposeManager {
         // Resolve image digest from .Image → RepoDigests
         let image_digest = self.resolve_image_digest(name);
 
-        // Collect extra env vars: anything not in the core or system sets.
-        // Mirrors the CORE_KEYS logic in recover_from_env.
-        const KNOWN_KEYS: &[&str] = &[
-            // Core keys (same as recover_from_env)
-            "NEARAI_API_KEY",
-            "NEARAI_API_URL",
-            "OPENCLAW_GATEWAY_TOKEN",
-            "GATEWAY_AUTH_TOKEN",
-            "ENGINE_V2",
-            "GATEWAY_PORT",
-            "SSH_PORT",
-            "SSH_PUBKEY",
-            "BASTION_SSH_PUBKEY",
-            "OPENCLAW_IMAGE",
-            "SERVICE_TYPE",
-            "WORKER_NETWORK",
-            "MEM_LIMIT",
-            "CPUS",
-            "STORAGE_SIZE",
-            "OPENCLAW_DOMAIN",
-            "OPENCLAW_INSTANCE_NAME",
-            "IRONCLAW_DOMAIN",
-            "IRONCLAW_INSTANCE_NAME",
-            "GOOGLE_OAUTH_CLIENT_ID",
-            "IRONCLAW_OAUTH_EXCHANGE_URL",
-            // System/Docker env vars
-            "PATH",
-            "HOME",
-            "HOSTNAME",
-            "LANG",
-            "LC_ALL",
-            "TERM",
-            "SHLVL",
-            "PWD",
-            "OLDPWD",
-            "USER",
-            "SHELL",
-        ];
         let extra: HashMap<String, String> = env_map
             .iter()
-            .filter(|(k, _)| !KNOWN_KEYS.contains(&k.as_str()))
+            .filter(|(k, _)| {
+                !CORE_ENV_KEYS.contains(&k.as_str()) && !SYSTEM_ENV_KEYS.contains(&k.as_str())
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let extra_env = if extra.is_empty() { None } else { Some(extra) };
