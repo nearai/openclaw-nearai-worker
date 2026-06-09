@@ -1079,8 +1079,10 @@ impl ComposeManager {
 
         let extra: HashMap<String, String> = env_map
             .iter()
-            .filter(|(k, _)| {
-                !CORE_ENV_KEYS.contains(&k.as_str()) && !SYSTEM_ENV_KEYS.contains(&k.as_str())
+            .filter(|(k, v)| {
+                !v.is_empty()
+                    && !CORE_ENV_KEYS.contains(&k.as_str())
+                    && !SYSTEM_ENV_KEYS.contains(&k.as_str())
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -1155,11 +1157,7 @@ impl ComposeManager {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Output is typically "ironclaw 0.29.0" or "openclaw 2026.2.15"
-        let version = stdout
-            .split_whitespace()
-            .last()
-            .unwrap_or("")
-            .to_string();
+        let version = stdout.split_whitespace().last().unwrap_or("").to_string();
 
         if version.is_empty() {
             return Err(ApiError::Internal(format!(

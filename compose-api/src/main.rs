@@ -82,9 +82,11 @@ use store::{Instance, InstanceStore, PortRange};
         oauth_callback_router,
         oauth_exchange,
         oauth_refresh,
+        get_instance_version,
     ),
     components(schemas(
         VersionResponse,
+        AppVersionResponse,
         CreateInstanceRequest,
         RestartInstanceRequest,
         InstanceInfo,
@@ -2518,9 +2520,13 @@ async fn get_instance_version(
             .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?
     };
 
-    let version = state
-        .compose
-        .query_app_version(&name, service_type.as_deref())?;
+    let compose = state.compose.clone();
+    let name_clone = name.clone();
+    let st = service_type.clone();
+    let version =
+        tokio::task::spawn_blocking(move || compose.query_app_version(&name_clone, st.as_deref()))
+            .await
+            .map_err(|e| ApiError::Internal(format!("task join: {e}")))??;
 
     Ok(Json(AppVersionResponse { version }))
 }
