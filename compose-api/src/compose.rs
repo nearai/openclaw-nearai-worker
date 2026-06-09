@@ -1073,6 +1073,51 @@ impl ComposeManager {
         // Resolve image digest from .Image → RepoDigests
         let image_digest = self.resolve_image_digest(name);
 
+        // Collect extra env vars: anything not in the core or system sets.
+        // Mirrors the CORE_KEYS logic in recover_from_env.
+        const KNOWN_KEYS: &[&str] = &[
+            // Core keys (same as recover_from_env)
+            "NEARAI_API_KEY",
+            "NEARAI_API_URL",
+            "OPENCLAW_GATEWAY_TOKEN",
+            "GATEWAY_AUTH_TOKEN",
+            "ENGINE_V2",
+            "GATEWAY_PORT",
+            "SSH_PORT",
+            "SSH_PUBKEY",
+            "BASTION_SSH_PUBKEY",
+            "OPENCLAW_IMAGE",
+            "SERVICE_TYPE",
+            "WORKER_NETWORK",
+            "MEM_LIMIT",
+            "CPUS",
+            "STORAGE_SIZE",
+            "OPENCLAW_DOMAIN",
+            "OPENCLAW_INSTANCE_NAME",
+            "IRONCLAW_DOMAIN",
+            "IRONCLAW_INSTANCE_NAME",
+            "GOOGLE_OAUTH_CLIENT_ID",
+            "IRONCLAW_OAUTH_EXCHANGE_URL",
+            // System/Docker env vars
+            "PATH",
+            "HOME",
+            "HOSTNAME",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "SHLVL",
+            "PWD",
+            "OLDPWD",
+            "USER",
+            "SHELL",
+        ];
+        let extra: HashMap<String, String> = env_map
+            .iter()
+            .filter(|(k, _)| !KNOWN_KEYS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let extra_env = if extra.is_empty() { None } else { Some(extra) };
+
         Ok(Instance {
             name: name.to_string(),
             token,
@@ -1089,7 +1134,7 @@ impl ComposeManager {
             mem_limit: None,
             cpus: None,
             storage_size: None,
-            extra_env: None,
+            extra_env,
         })
     }
 

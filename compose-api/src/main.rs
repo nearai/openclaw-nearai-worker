@@ -26,10 +26,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
+use std::collections::HashMap;
+
 #[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE;
-#[cfg(test)]
-use std::collections::HashMap;
 #[cfg(test)]
 use std::ffi::OsString;
 #[cfg(test)]
@@ -1835,6 +1835,8 @@ struct InstanceResponse {
     mem_limit: Option<String>,
     cpus: Option<String>,
     storage_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_env: Option<HashMap<String, String>>,
     status: String,
     created_at: String,
 }
@@ -2479,6 +2481,7 @@ async fn get_instance(
                 mem_limit: inst.mem_limit,
                 cpus: inst.cpus,
                 storage_size: inst.storage_size,
+                extra_env: inst.extra_env,
                 status,
                 created_at: inst.created_at.to_rfc3339(),
             }))
@@ -2543,6 +2546,7 @@ async fn list_instances(
                 mem_limit: inst.mem_limit,
                 cpus: inst.cpus,
                 storage_size: inst.storage_size,
+                extra_env: inst.extra_env,
                 status,
                 created_at: inst.created_at.to_rfc3339(),
             }
@@ -2721,7 +2725,10 @@ async fn restart_instance(
                     .send(sse_stage("exporting", "Exporting workspace and config..."))
                     .await;
 
-                let tar_bytes = match state.compose_export_instance_data(&name, Some(stype), false).await {
+                let tar_bytes = match state
+                    .compose_export_instance_data(&name, Some(stype), false)
+                    .await
+                {
                     Ok(bytes) => {
                         if bytes.len() > MAX_EXPORT_BYTES {
                             let _ = tx
@@ -4642,7 +4649,11 @@ async fn background_sync_loop(state: AppState) {
                     }
                     tracing::info!("Scheduled backup for instance: {}", inst.name);
                     let tar_bytes = match state
-                        .compose_export_instance_data(&inst.name, inst.service_type.as_deref(), false)
+                        .compose_export_instance_data(
+                            &inst.name,
+                            inst.service_type.as_deref(),
+                            false,
+                        )
                         .await
                     {
                         Ok(bytes) => bytes,
