@@ -1077,7 +1077,7 @@ impl ComposeManager {
         // Resolve image digest from .Image → RepoDigests
         let image_digest = self.resolve_image_digest(name);
 
-        let extra: HashMap<String, String> = env_map
+        let mut extra: HashMap<String, String> = env_map
             .iter()
             .filter(|(k, v)| {
                 !v.is_empty()
@@ -1086,6 +1086,16 @@ impl ComposeManager {
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+
+        // ironclaw generates SECRETS_MASTER_KEY at runtime (entrypoint.sh writes it to
+        // .master_key on disk). It's not in Config.Env, so read it from the container.
+        if service_type.as_deref() == Some("ironclaw") && !extra.contains_key("SECRETS_MASTER_KEY")
+        {
+            if let Some(key) = self.read_master_key_from_container(container_name) {
+                extra.insert("SECRETS_MASTER_KEY".to_string(), key);
+            }
+        }
+
         let extra_env = if extra.is_empty() { None } else { Some(extra) };
 
         Ok(Instance {
@@ -1121,6 +1131,38 @@ impl ComposeManager {
             .as_str()?
             .parse()
             .ok()
+    }
+
+    /// Read SECRETS_MASTER_KEY from an ironclaw container's persisted .master_key file.
+    /// Returns None if the file doesn't exist or the value is invalid.
+    fn read_master_key_from_container(&self, container_name: &str) -> Option<String> {
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                container_name,
+                "cat",
+                "/home/agent/.ironclaw/.master_key",
+            ])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Validate: must be 64 hex chars (32 bytes)
+        if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(key)
+        } else {
+            tracing::warn!(
+                "Container {} has .master_key but it's not valid 64-char hex (len={})",
+                container_name,
+                key.len()
+            );
+            None
+        }
     }
 
     /// Query the application version from a running container.
