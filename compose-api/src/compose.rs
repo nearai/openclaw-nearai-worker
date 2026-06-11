@@ -846,6 +846,159 @@ impl ComposeManager {
         Ok(output.stdout)
     }
 
+    /// Copy the age binary into an instance's gateway container (to /tmp/age).
+    /// Streamed via docker exec stdin because docker cp does not work reliably
+    /// across storage drivers. Written atomically (tmp + mv) so concurrent
+    /// backups of the same instance cannot observe a partially-written binary.
+    pub fn copy_age_to_container(&self, name: &str) -> Result<(), ApiError> {
+        let container = format!("openclaw-{}-gateway-1", name);
+        let age_path =
+            std::env::var("AGE_BINARY_PATH").unwrap_or_else(|_| "/usr/local/bin/age".to_string());
+        let age_bytes = std::fs::read(&age_path)
+            .map_err(|e| ApiError::Internal(format!("read age binary {}: {}", age_path, e)))?;
+
+        let mut child = docker_command()
+            .args([
+                "exec",
+                "-i",
+                &container,
+                "sh",
+                "-c",
+                "cat > /tmp/.age.tmp && chmod 0755 /tmp/.age.tmp && mv /tmp/.age.tmp /tmp/age",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| ApiError::Internal(format!("docker exec spawn (age copy): {}", e)))?;
+
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(&age_bytes)
+            .map_err(|e| ApiError::Internal(format!("write age binary to container: {}", e)))?;
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| ApiError::Internal(format!("docker exec wait (age copy): {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!(
+                "age copy to container failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Run the full backup pipeline inside an instance's gateway container:
+    /// tar+gzip to a temp file, age-encrypt, then curl PUT to a presigned S3 URL.
+    /// No archive bytes ever flow through this process — peak memory here is O(1),
+    /// unlike export_instance_data which buffers the whole tar in a Vec.
+    ///
+    /// `stdin_payload` carries the encryption recipients (first line: X25519
+    /// recipient or empty; remaining lines: SSH pubkeys) so they never appear
+    /// in argv. The presigned URL is passed via the BACKUP_URL env var.
+    pub fn backup_instance_in_container(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+        full_export: bool,
+        backup_id: &str,
+        upload_url: &str,
+        stdin_payload: &str,
+    ) -> Result<(), ApiError> {
+        let container = format!("openclaw-{}-gateway-1", name);
+
+        // --ignore-failed-read: live containers mutate files mid-read and fresh
+        // instances may lack workspace dirs; both downgrade to tar exit 1.
+        let tar_args = if full_export {
+            "--ignore-failed-read -C /home/agent .".to_string()
+        } else {
+            let (config_dir, workspace_dir) = match service_type {
+                Some("ironclaw") => (".ironclaw", "workspace"),
+                Some("openclaw") => (".openclaw", "openclaw"),
+                None => {
+                    return Err(ApiError::Internal(format!(
+                        "Cannot back up instance '{}': service_type is unknown (set SERVICE_TYPE in .env or recreate with correct type)",
+                        name
+                    )));
+                }
+                Some(other) => {
+                    return Err(ApiError::Internal(format!(
+                        "Unknown service_type for backup: '{}' (instance '{}')",
+                        other, name
+                    )));
+                }
+            };
+            format!(
+                "--ignore-failed-read -C /home/agent {} {}",
+                config_dir, workspace_dir
+            )
+        };
+
+        // backup_id comes from a timestamp format — safe to embed in paths.
+        let tarball = format!("/tmp/backup-{}.tar.gz", backup_id);
+        let recipients_file = format!("/tmp/age-r-{}", backup_id);
+        let script = format!(
+            r#"read -r AGE_RCPT
+cat > {rcpt}
+RARG=""
+if [ -n "$AGE_RCPT" ]; then RARG="-r $AGE_RCPT"; fi
+RFLAG=""
+if [ -s {rcpt} ]; then RFLAG="-R {rcpt}"; fi
+if [ -z "$RARG$RFLAG" ]; then echo "no encryption recipients" >&2; exit 3; fi
+trap 'rm -f {tar} {tar}.age {rcpt}' EXIT
+tar czf {tar} {tar_args}
+rc=$?
+if [ $rc -gt 1 ]; then echo "tar failed rc=$rc" >&2; exit $rc; fi
+/tmp/age -e $RARG $RFLAG -o {tar}.age {tar} || exit 4
+curl --fail -sS -T {tar}.age "$BACKUP_URL"
+"#,
+            rcpt = recipients_file,
+            tar = tarball,
+            tar_args = tar_args,
+        );
+
+        let mut child = docker_command()
+            .args([
+                "exec",
+                "-i",
+                "-e",
+                &format!("BACKUP_URL={}", upload_url),
+                &container,
+                "sh",
+                "-c",
+                &script,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| ApiError::Internal(format!("docker exec spawn (backup): {}", e)))?;
+
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(stdin_payload.as_bytes())
+            .map_err(|e| ApiError::Internal(format!("write recipients to container: {}", e)))?;
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| ApiError::Internal(format!("docker exec wait (backup): {}", e)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::Internal(format!(
+                "in-container backup failed (exit {:?}): {}",
+                output.status.code(),
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
     /// Import workspace and config data into an instance's gateway container.
     /// Extracts the given tar archive (same format as export_instance_data) into /home/agent.
     pub fn import_instance_data(&self, name: &str, tar_bytes: &[u8]) -> Result<(), ApiError> {

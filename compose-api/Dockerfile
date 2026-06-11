@@ -43,6 +43,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Static age binary — copied into worker containers at backup time so the
+# tar|age|upload pipeline runs entirely inside the container
+ARG AGE_VERSION=v1.2.1
+RUN curl -fsSL "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-linux-amd64.tar.gz" \
+    | tar xz -C /usr/local/bin --strip-components=1 age/age \
+    && chmod 0755 /usr/local/bin/age
+
 # Copy the binary from builder
 COPY --from=builder /app/target/release/openclaw-compose-api /app/openclaw-compose-api
 
