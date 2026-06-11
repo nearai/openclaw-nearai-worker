@@ -796,22 +796,7 @@ impl ComposeManager {
             // Export everything in /home/agent
             args.push(".");
         } else {
-            let (config_dir, workspace_dir) = match service_type {
-                Some("ironclaw") => (".ironclaw", "workspace"),
-                Some("openclaw") => (".openclaw", "openclaw"),
-                None => {
-                    return Err(ApiError::Internal(format!(
-                        "Cannot export instance '{}': service_type is unknown (set SERVICE_TYPE in .env or recreate with correct type)",
-                        name
-                    )));
-                }
-                Some(other) => {
-                    return Err(ApiError::Internal(format!(
-                        "Unknown service_type for export: '{}' (instance '{}')",
-                        other, name
-                    )));
-                }
-            };
+            let (config_dir, workspace_dir) = instance_data_dirs(name, service_type)?;
             args.push(config_dir);
             args.push(workspace_dir);
         }
@@ -857,39 +842,18 @@ impl ComposeManager {
         let age_bytes = std::fs::read(&age_path)
             .map_err(|e| ApiError::Internal(format!("read age binary {}: {}", age_path, e)))?;
 
-        let mut child = docker_command()
-            .args([
+        run_docker_exec_stdin(
+            &[
                 "exec",
                 "-i",
                 &container,
                 "sh",
                 "-c",
                 "cat > /tmp/.age.tmp && chmod 0755 /tmp/.age.tmp && mv /tmp/.age.tmp /tmp/age",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| ApiError::Internal(format!("docker exec spawn (age copy): {}", e)))?;
-
-        child
-            .stdin
-            .take()
-            .expect("stdin piped")
-            .write_all(&age_bytes)
-            .map_err(|e| ApiError::Internal(format!("write age binary to container: {}", e)))?;
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| ApiError::Internal(format!("docker exec wait (age copy): {}", e)))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ApiError::Internal(format!(
-                "age copy to container failed: {}",
-                stderr.trim()
-            )));
-        }
-        Ok(())
+            ],
+            &age_bytes,
+            "age copy to container",
+        )
     }
 
     /// Run the full backup pipeline inside an instance's gateway container:
@@ -897,9 +861,9 @@ impl ComposeManager {
     /// No archive bytes ever flow through this process — peak memory here is O(1),
     /// unlike export_instance_data which buffers the whole tar in a Vec.
     ///
-    /// `stdin_payload` carries the encryption recipients (first line: X25519
-    /// recipient or empty; remaining lines: SSH pubkeys) so they never appear
-    /// in argv. The presigned URL is passed via the BACKUP_URL env var.
+    /// `stdin_payload` carries the encryption recipients (see build_backup_script
+    /// for the protocol) so they never appear in argv. The presigned URL is
+    /// passed via the BACKUP_URL env var.
     pub fn backup_instance_in_container(
         &self,
         name: &str,
@@ -916,53 +880,16 @@ impl ComposeManager {
         let tar_args = if full_export {
             "--ignore-failed-read -C /home/agent .".to_string()
         } else {
-            let (config_dir, workspace_dir) = match service_type {
-                Some("ironclaw") => (".ironclaw", "workspace"),
-                Some("openclaw") => (".openclaw", "openclaw"),
-                None => {
-                    return Err(ApiError::Internal(format!(
-                        "Cannot back up instance '{}': service_type is unknown (set SERVICE_TYPE in .env or recreate with correct type)",
-                        name
-                    )));
-                }
-                Some(other) => {
-                    return Err(ApiError::Internal(format!(
-                        "Unknown service_type for backup: '{}' (instance '{}')",
-                        other, name
-                    )));
-                }
-            };
+            let (config_dir, workspace_dir) = instance_data_dirs(name, service_type)?;
             format!(
                 "--ignore-failed-read -C /home/agent {} {}",
                 config_dir, workspace_dir
             )
         };
 
-        // backup_id comes from a timestamp format — safe to embed in paths.
-        let tarball = format!("/tmp/backup-{}.tar.gz", backup_id);
-        let recipients_file = format!("/tmp/age-r-{}", backup_id);
-        let script = format!(
-            r#"read -r AGE_RCPT
-cat > {rcpt}
-RARG=""
-if [ -n "$AGE_RCPT" ]; then RARG="-r $AGE_RCPT"; fi
-RFLAG=""
-if [ -s {rcpt} ]; then RFLAG="-R {rcpt}"; fi
-if [ -z "$RARG$RFLAG" ]; then echo "no encryption recipients" >&2; exit 3; fi
-trap 'rm -f {tar} {tar}.age {rcpt}' EXIT
-tar czf {tar} {tar_args}
-rc=$?
-if [ $rc -gt 1 ]; then echo "tar failed rc=$rc" >&2; exit $rc; fi
-/tmp/age -e $RARG $RFLAG -o {tar}.age {tar} || exit 4
-curl --fail -sS -T {tar}.age "$BACKUP_URL"
-"#,
-            rcpt = recipients_file,
-            tar = tarball,
-            tar_args = tar_args,
-        );
-
-        let mut child = docker_command()
-            .args([
+        let script = build_backup_script(backup_id, &tar_args);
+        run_docker_exec_stdin(
+            &[
                 "exec",
                 "-i",
                 "-e",
@@ -971,32 +898,10 @@ curl --fail -sS -T {tar}.age "$BACKUP_URL"
                 "sh",
                 "-c",
                 &script,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| ApiError::Internal(format!("docker exec spawn (backup): {}", e)))?;
-
-        child
-            .stdin
-            .take()
-            .expect("stdin piped")
-            .write_all(stdin_payload.as_bytes())
-            .map_err(|e| ApiError::Internal(format!("write recipients to container: {}", e)))?;
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| ApiError::Internal(format!("docker exec wait (backup): {}", e)))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ApiError::Internal(format!(
-                "in-container backup failed (exit {:?}): {}",
-                output.status.code(),
-                stderr.trim()
-            )));
-        }
-        Ok(())
+            ],
+            stdin_payload.as_bytes(),
+            "in-container backup",
+        )
     }
 
     /// Import workspace and config data into an instance's gateway container.
@@ -1527,6 +1432,93 @@ curl --fail -sS -T {tar}.age "$BACKUP_URL"
     }
 }
 
+/// Resolve the (config_dir, workspace_dir) pair under /home/agent that holds
+/// an instance's data, by service type.
+fn instance_data_dirs(
+    name: &str,
+    service_type: Option<&str>,
+) -> Result<(&'static str, &'static str), ApiError> {
+    match service_type {
+        Some("ironclaw") => Ok((".ironclaw", "workspace")),
+        Some("openclaw") => Ok((".openclaw", "openclaw")),
+        None => Err(ApiError::Internal(format!(
+            "Cannot export instance '{}': service_type is unknown (set SERVICE_TYPE in .env or recreate with correct type)",
+            name
+        ))),
+        Some(other) => Err(ApiError::Internal(format!(
+            "Unknown service_type for export: '{}' (instance '{}')",
+            other, name
+        ))),
+    }
+}
+
+/// Build the shell script that runs the backup pipeline inside a worker
+/// container: tar+gzip to a temp file, age-encrypt, curl PUT to $BACKUP_URL.
+///
+/// stdin protocol: first line is an X25519 recipient ("age1...") or empty;
+/// remaining lines are SSH pubkeys, written to a file for age -R. At least
+/// one recipient is required (exit 3 otherwise). tar exit 1 ("file changed
+/// as we read it" on live containers) is tolerated; >1 is fatal. Temp file
+/// names embed the backup id so concurrent backups of the same instance
+/// don't collide, and a trap removes them on every exit path.
+fn build_backup_script(backup_id: &str, tar_args: &str) -> String {
+    let tarball = format!("/tmp/backup-{}.tar.gz", backup_id);
+    let recipients_file = format!("/tmp/age-r-{}", backup_id);
+    format!(
+        r#"read -r AGE_RCPT
+cat > {rcpt}
+RARG=""
+if [ -n "$AGE_RCPT" ]; then RARG="-r $AGE_RCPT"; fi
+RFLAG=""
+if [ -s {rcpt} ]; then RFLAG="-R {rcpt}"; fi
+if [ -z "$RARG$RFLAG" ]; then echo "no encryption recipients" >&2; exit 3; fi
+trap 'rm -f {tar} {tar}.age {rcpt}' EXIT
+tar czf {tar} {tar_args}
+rc=$?
+if [ $rc -gt 1 ]; then echo "tar failed rc=$rc" >&2; exit $rc; fi
+/tmp/age -e $RARG $RFLAG -o {tar}.age {tar} || exit 4
+curl --fail -sS -T {tar}.age "$BACKUP_URL"
+"#,
+        rcpt = recipients_file,
+        tar = tarball,
+        tar_args = tar_args,
+    )
+}
+
+/// Spawn a docker command with piped stdin, write `stdin_bytes`, and wait.
+/// Closing stdin (by dropping it after the write) signals EOF to the
+/// container-side script. `context` labels error messages.
+fn run_docker_exec_stdin(args: &[&str], stdin_bytes: &[u8], context: &str) -> Result<(), ApiError> {
+    let mut child = docker_command()
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| ApiError::Internal(format!("docker exec spawn ({}): {}", context, e)))?;
+
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(stdin_bytes)
+        .map_err(|e| ApiError::Internal(format!("write stdin ({}): {}", context, e)))?;
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| ApiError::Internal(format!("docker exec wait ({}): {}", context, e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::Internal(format!(
+            "{} failed (exit {:?}): {}",
+            context,
+            output.status.code(),
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(test))]
 fn docker_command() -> Command {
     Command::new("docker")
@@ -1538,5 +1530,41 @@ fn docker_command() -> Command {
         Command::new(path)
     } else {
         Command::new("docker")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_backup_script_paths_embed_backup_id() {
+        let script = build_backup_script("20260611T120000Z", "-C /home/agent .");
+        assert!(script.contains("/tmp/backup-20260611T120000Z.tar.gz"));
+        assert!(script.contains("/tmp/age-r-20260611T120000Z"));
+        assert!(script.contains("tar czf /tmp/backup-20260611T120000Z.tar.gz -C /home/agent ."));
+    }
+
+    #[test]
+    fn test_build_backup_script_cleans_up_and_uploads() {
+        let script = build_backup_script("id1", "-C /home/agent .");
+        assert!(script.contains(
+            "trap 'rm -f /tmp/backup-id1.tar.gz /tmp/backup-id1.tar.gz.age /tmp/age-r-id1' EXIT"
+        ));
+        assert!(script.contains(r#"curl --fail -sS -T /tmp/backup-id1.tar.gz.age "$BACKUP_URL""#));
+    }
+
+    #[test]
+    fn test_instance_data_dirs() {
+        assert_eq!(
+            instance_data_dirs("x", Some("ironclaw")).unwrap(),
+            (".ironclaw", "workspace")
+        );
+        assert_eq!(
+            instance_data_dirs("x", Some("openclaw")).unwrap(),
+            (".openclaw", "openclaw")
+        );
+        assert!(instance_data_dirs("x", None).is_err());
+        assert!(instance_data_dirs("x", Some("weird")).is_err());
     }
 }
