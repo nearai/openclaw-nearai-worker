@@ -328,68 +328,16 @@ impl AppState {
             .flatten()
     }
 
-    async fn compose_export_instance_data(
+    /// Run a blocking ComposeManager call on the blocking thread pool.
+    /// The closure must own its arguments (clone before calling).
+    async fn compose_blocking<T: Send + 'static>(
         &self,
-        name: &str,
-        service_type: Option<&str>,
-        full_export: bool,
-    ) -> Result<Vec<u8>, ApiError> {
+        f: impl FnOnce(&ComposeManager) -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
         let compose = self.compose.clone();
-        let name = name.to_string();
-        let service_type = service_type.map(|s| s.to_string());
-        tokio::task::spawn_blocking(move || {
-            compose.export_instance_data(&name, service_type.as_deref(), full_export)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
-    }
-
-    async fn compose_import_instance_data(
-        &self,
-        name: &str,
-        tar_bytes: Vec<u8>,
-    ) -> Result<(), ApiError> {
-        let compose = self.compose.clone();
-        let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.import_instance_data(&name, &tar_bytes))
+        tokio::task::spawn_blocking(move || f(&compose))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
-    }
-
-    async fn compose_copy_age_to_container(&self, name: &str) -> Result<(), ApiError> {
-        let compose = self.compose.clone();
-        let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.copy_age_to_container(&name))
-            .await
-            .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
-    }
-
-    async fn compose_backup_in_container(
-        &self,
-        name: &str,
-        service_type: Option<&str>,
-        full_export: bool,
-        backup_id: &str,
-        upload_url: &str,
-        stdin_payload: String,
-    ) -> Result<(), ApiError> {
-        let compose = self.compose.clone();
-        let name = name.to_string();
-        let service_type = service_type.map(|s| s.to_string());
-        let backup_id = backup_id.to_string();
-        let upload_url = upload_url.to_string();
-        tokio::task::spawn_blocking(move || {
-            compose.backup_instance_in_container(
-                &name,
-                service_type.as_deref(),
-                full_export,
-                &backup_id,
-                &upload_url,
-                &stdin_payload,
-            )
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 }
 
@@ -2803,7 +2751,11 @@ async fn restart_instance(
                     .await;
 
                 let tar_bytes = match state
-                    .compose_export_instance_data(&name, Some(stype), false)
+                    .compose_blocking({
+                        let name = name.clone();
+                        let stype = stype.to_string();
+                        move |c| c.export_instance_data(&name, Some(&stype), false)
+                    })
                     .await
                 {
                     Ok(bytes) => {
@@ -2918,7 +2870,12 @@ async fn restart_instance(
                     }
                     // Rollback succeeded — restore workspace into the old container
                     if !tar_bytes.is_empty() {
-                        let _ = state.compose_import_instance_data(&name, tar_bytes).await;
+                        let _ = state
+                            .compose_blocking({
+                                let name = name.clone();
+                                move |c| c.import_instance_data(&name, &tar_bytes)
+                            })
+                            .await;
                     }
                     let _ = tx
                         .send(sse_error(&format!(
@@ -2953,7 +2910,13 @@ async fn restart_instance(
                         .send(sse_stage("restoring", "Restoring workspace and config..."))
                         .await;
 
-                    if let Err(e) = state.compose_import_instance_data(&name, tar_bytes).await {
+                    let restore = state
+                        .compose_blocking({
+                            let name = name.clone();
+                            move |c| c.import_instance_data(&name, &tar_bytes)
+                        })
+                        .await;
+                    if let Err(e) = restore {
                         let _ = tx.send(sse_error(&format!(
                             "Failed to restore workspace, the instance may be missing user data: {}", e
                         ))).await;
@@ -3357,20 +3320,26 @@ async fn run_container_backup(
         full_export
     );
 
-    state.compose_copy_age_to_container(name).await?;
-
     let upload_url = backup_mgr.upload_url(name, &backup_id).await?;
 
     // On timeout the docker exec keeps running detached; its trap cleans up
     // the container-side temp files when it eventually exits.
-    let pipeline = state.compose_backup_in_container(
-        name,
-        service_type,
-        full_export,
-        &backup_id,
-        &upload_url,
-        stdin_payload,
-    );
+    let pipeline = state.compose_blocking({
+        let name = name.to_string();
+        let service_type = service_type.map(str::to_string);
+        let backup_id = backup_id.clone();
+        move |c| {
+            c.copy_age_to_container(&name)?;
+            c.backup_instance_in_container(
+                &name,
+                service_type.as_deref(),
+                full_export,
+                &backup_id,
+                &upload_url,
+                &stdin_payload,
+            )
+        }
+    });
     tokio::time::timeout(BACKUP_PIPELINE_TIMEOUT, pipeline)
         .await
         .map_err(|_| {
