@@ -1,16 +1,28 @@
-use std::io::Write;
 use std::str::FromStr;
 use std::time::Duration;
 
 use aws_sdk_s3::presigning::PresigningConfig;
 use chrono::{DateTime, Utc};
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde::Serialize;
 
 use crate::error::ApiError;
 
 const DEFAULT_PRESIGNED_URL_EXPIRY_SECS: u64 = 3600;
+/// Presigned PUT URL lifetime. Must cover tar + encrypt + the whole upload,
+/// since the clock starts when we presign (before the container does any
+/// work). 1h leaves comfortable margin for large/slow backups.
+const UPLOAD_URL_EXPIRY_SECS: u64 = 3600;
+
+const BACKUP_KEY_SUFFIX: &str = ".tar.gz.age";
+
+/// S3 object key for an instance backup. Every path that touches a backup
+/// object (presign PUT, verify, list, presign GET) must agree on this layout.
+fn backup_s3_key(instance_name: &str, backup_id: &str) -> String {
+    format!(
+        "backups/{}/{}{}",
+        instance_name, backup_id, BACKUP_KEY_SUFFIX
+    )
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupInfo {
@@ -46,60 +58,48 @@ impl BackupManager {
         Some(Self { s3, bucket })
     }
 
-    /// Create an encrypted backup from pre-exported instance data.
-    /// tar_bytes → gzip → age-encrypt → upload to S3.
-    ///
-    /// When `age_recipient` is provided, encrypts to that key (X25519 "age1..." or SSH pubkey).
-    /// Otherwise falls back to the instance's SSH pubkey.
-    pub async fn create_backup(
+    /// Generate a presigned PUT URL so the worker container can upload the
+    /// encrypted backup directly to S3 — archive bytes never pass through
+    /// this process.
+    pub async fn upload_url(
         &self,
         instance_name: &str,
-        ssh_pubkey: &str,
-        tar_bytes: Vec<u8>,
-        age_recipient: Option<&str>,
-    ) -> Result<BackupInfo, ApiError> {
-        if tar_bytes.is_empty() {
-            return Err(ApiError::Internal(
-                "instance data export returned empty data".into(),
-            ));
-        }
+        backup_id: &str,
+    ) -> Result<String, ApiError> {
+        let key = backup_s3_key(instance_name, backup_id);
 
-        // Gzip compress
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder
-            .write_all(&tar_bytes)
-            .map_err(|e| ApiError::Internal(format!("gzip failed: {}", e)))?;
-        let gz_bytes = encoder
-            .finish()
-            .map_err(|e| ApiError::Internal(format!("gzip finish failed: {}", e)))?;
-
-        // Encrypt with age: prefer explicit age_recipient, fall back to SSH pubkey
-        let encrypted = match age_recipient {
-            Some(recipient_str) => encrypt_with_recipient(&gz_bytes, recipient_str)?,
-            None => encrypt_with_ssh_pubkey(&gz_bytes, ssh_pubkey)?,
-        };
-
-        // Upload to S3
-        let now = Utc::now();
-        let timestamp_str = now.format("%Y%m%dT%H%M%SZ").to_string();
-        let key = format!("backups/{}/{}.tar.gz.age", instance_name, timestamp_str);
-
-        let size = encrypted.len() as i64;
-
-        self.s3
+        let presigned = self
+            .s3
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
-            .body(encrypted.into())
+            .presigned(
+                PresigningConfig::builder()
+                    .expires_in(Duration::from_secs(UPLOAD_URL_EXPIRY_SECS))
+                    .build()
+                    .map_err(|e| ApiError::Internal(format!("presign config error: {}", e)))?,
+            )
+            .await
+            .map_err(|e| ApiError::Internal(format!("presign PUT failed: {}", e)))?;
+
+        Ok(presigned.uri().to_string())
+    }
+
+    /// Size of an uploaded backup object, used to verify the in-container
+    /// upload actually landed in S3.
+    pub async fn object_size(&self, instance_name: &str, backup_id: &str) -> Result<i64, ApiError> {
+        let key = backup_s3_key(instance_name, backup_id);
+
+        let head = self
+            .s3
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
             .send()
             .await
-            .map_err(|e| ApiError::Internal(format!("S3 upload failed: {}", e)))?;
+            .map_err(|e| ApiError::Internal(format!("S3 head_object failed: {}", e)))?;
 
-        Ok(BackupInfo {
-            id: timestamp_str,
-            timestamp: now,
-            size_bytes: size,
-        })
+        Ok(head.content_length().unwrap_or(0))
     }
 
     /// List available backups for an instance.
@@ -122,9 +122,8 @@ impl BackupManager {
                     Some(k) => k,
                     None => continue,
                 };
-                // Key format: backups/{name}/{timestamp}.tar.gz.age
                 let filename = key.strip_prefix(&prefix).unwrap_or(key);
-                let id = filename.strip_suffix(".tar.gz.age").unwrap_or(filename);
+                let id = filename.strip_suffix(BACKUP_KEY_SUFFIX).unwrap_or(filename);
 
                 let timestamp = chrono::NaiveDateTime::parse_from_str(id, "%Y%m%dT%H%M%SZ")
                     .ok()
@@ -152,7 +151,7 @@ impl BackupManager {
         expiry_secs: Option<u64>,
     ) -> Result<String, ApiError> {
         let expiry = expiry_secs.unwrap_or(DEFAULT_PRESIGNED_URL_EXPIRY_SECS);
-        let key = format!("backups/{}/{}.tar.gz.age", instance_name, backup_id);
+        let key = backup_s3_key(instance_name, backup_id);
 
         let presigned = self
             .s3
@@ -172,53 +171,72 @@ impl BackupManager {
     }
 }
 
-/// Encrypt data using an SSH public key via the `age` crate.
-fn encrypt_with_ssh_pubkey(data: &[u8], ssh_pubkey: &str) -> Result<Vec<u8>, ApiError> {
-    let recipient = age::ssh::Recipient::from_str(ssh_pubkey)
-        .map_err(|e| ApiError::Internal(format!("invalid SSH public key: {:?}", e)))?;
-
-    encrypt_with_boxed_recipient(data, Box::new(recipient))
+/// Build the stdin payload that delivers encryption recipients to the
+/// in-container backup script: first line is an X25519 recipient ("age1...")
+/// or empty, remaining lines are SSH pubkeys written to a -R file.
+///
+/// Recipients are validated with the `age` crate before any side effects so
+/// bad input fails as 400, not as a shell error mid-backup. Encryption itself
+/// happens in the worker container via the age CLI.
+pub fn build_backup_stdin(
+    age_recipient: Option<&str>,
+    ssh_pubkey: &str,
+) -> Result<String, ApiError> {
+    match age_recipient.map(str::trim) {
+        Some(r) if r.parse::<age::x25519::Recipient>().is_ok() => Ok(format!("{}\n", r)),
+        Some(r) if age::ssh::Recipient::from_str(r).is_ok() => Ok(format!("\n{}\n", r)),
+        Some(_) => Err(ApiError::BadRequest(
+            "age_recipient is neither a valid X25519 recipient (age1...) nor an SSH public key"
+                .into(),
+        )),
+        None => {
+            let key = ssh_pubkey.trim();
+            age::ssh::Recipient::from_str(key).map_err(|e| {
+                ApiError::Internal(format!(
+                    "instance SSH public key is not age-compatible: {:?}",
+                    e
+                ))
+            })?;
+            Ok(format!("\n{}\n", key))
+        }
+    }
 }
 
-/// Encrypt data using an age recipient string.
-/// Tries parsing as X25519 ("age1...") first, then falls back to SSH pubkey.
-fn encrypt_with_recipient(data: &[u8], recipient_str: &str) -> Result<Vec<u8>, ApiError> {
-    let recipient_str = recipient_str.trim();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Try X25519 first (age native keys start with "age1")
-    if let Ok(recipient) = recipient_str.parse::<age::x25519::Recipient>() {
-        return encrypt_with_boxed_recipient(data, Box::new(recipient));
+    const X25519_RECIPIENT: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+    const SSH_PUBKEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBPKJsJZLflZQFUP0jXFomSzoJ0dUwbmXrc6J4qDfqyR test";
+
+    #[test]
+    fn test_build_backup_stdin_x25519_recipient() {
+        let payload = build_backup_stdin(Some(X25519_RECIPIENT), SSH_PUBKEY).unwrap();
+        assert_eq!(payload, format!("{}\n", X25519_RECIPIENT));
     }
 
-    // Fall back to SSH pubkey
-    if let Ok(recipient) = age::ssh::Recipient::from_str(recipient_str) {
-        return encrypt_with_boxed_recipient(data, Box::new(recipient));
+    #[test]
+    fn test_build_backup_stdin_ssh_recipient() {
+        let payload = build_backup_stdin(Some(SSH_PUBKEY), "unused").unwrap();
+        assert_eq!(payload, format!("\n{}\n", SSH_PUBKEY));
     }
 
-    Err(ApiError::BadRequest(format!(
-        "age_recipient is neither a valid X25519 recipient (age1...) nor an SSH public key"
-    )))
-}
+    #[test]
+    fn test_build_backup_stdin_invalid_recipient_is_bad_request() {
+        let err = build_backup_stdin(Some("not-a-key"), SSH_PUBKEY).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
 
-/// Encrypt data with a boxed age::Recipient.
-fn encrypt_with_boxed_recipient(
-    data: &[u8],
-    recipient: Box<dyn age::Recipient + Send>,
-) -> Result<Vec<u8>, ApiError> {
-    let encryptor =
-        age::Encryptor::with_recipients(std::iter::once(&*recipient as &dyn age::Recipient))
-            .map_err(|e| ApiError::Internal(format!("encryptor init failed: {:?}", e)))?;
+    #[test]
+    fn test_build_backup_stdin_falls_back_to_instance_pubkey() {
+        let payload = build_backup_stdin(None, SSH_PUBKEY).unwrap();
+        assert_eq!(payload, format!("\n{}\n", SSH_PUBKEY));
+    }
 
-    let mut encrypted = Vec::new();
-    let mut writer = encryptor
-        .wrap_output(&mut encrypted)
-        .map_err(|e| ApiError::Internal(format!("age wrap_output failed: {}", e)))?;
-    writer
-        .write_all(data)
-        .map_err(|e| ApiError::Internal(format!("age write failed: {}", e)))?;
-    writer
-        .finish()
-        .map_err(|e| ApiError::Internal(format!("age finish failed: {}", e)))?;
-
-    Ok(encrypted)
+    #[test]
+    fn test_build_backup_stdin_rejects_invalid_instance_pubkey() {
+        let err = build_backup_stdin(None, "garbage").unwrap_err();
+        assert!(matches!(err, ApiError::Internal(_)));
+    }
 }

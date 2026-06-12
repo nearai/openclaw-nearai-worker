@@ -43,6 +43,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Static age binary — copied into worker containers at backup time so the
+# tar|age|upload pipeline runs entirely inside the container. SHA256 pinned
+# (computed from the official v1.2.1 release) to guard against a tampered
+# download installing a malicious binary that runs as root in worker containers.
+ARG AGE_VERSION=v1.2.1
+ARG AGE_SHA256=7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50
+RUN curl -fsSL "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/age-${AGE_VERSION}-linux-amd64.tar.gz" -o /tmp/age.tar.gz \
+    && echo "${AGE_SHA256}  /tmp/age.tar.gz" | sha256sum -c - \
+    && tar xz -C /usr/local/bin --strip-components=1 -f /tmp/age.tar.gz age/age \
+    && chmod 0755 /usr/local/bin/age \
+    && rm /tmp/age.tar.gz
+
 # Copy the binary from builder
 COPY --from=builder /app/target/release/openclaw-compose-api /app/openclaw-compose-api
 

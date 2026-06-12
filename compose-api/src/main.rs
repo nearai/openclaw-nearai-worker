@@ -45,7 +45,7 @@ mod names;
 mod nginx_conf;
 mod store;
 
-use backup::BackupManager;
+use backup::{build_backup_stdin, BackupInfo, BackupManager};
 use compose::{ComposeManager, DEFAULT_NEARAI_API_URL};
 use error::ApiError;
 use store::{Instance, InstanceStore, PortRange};
@@ -328,30 +328,14 @@ impl AppState {
             .flatten()
     }
 
-    async fn compose_export_instance_data(
+    /// Run a blocking ComposeManager call on the blocking thread pool.
+    /// The closure must own its arguments (clone before calling).
+    async fn compose_blocking<T: Send + 'static>(
         &self,
-        name: &str,
-        service_type: Option<&str>,
-        full_export: bool,
-    ) -> Result<Vec<u8>, ApiError> {
+        f: impl FnOnce(&ComposeManager) -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
         let compose = self.compose.clone();
-        let name = name.to_string();
-        let service_type = service_type.map(|s| s.to_string());
-        tokio::task::spawn_blocking(move || {
-            compose.export_instance_data(&name, service_type.as_deref(), full_export)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
-    }
-
-    async fn compose_import_instance_data(
-        &self,
-        name: &str,
-        tar_bytes: Vec<u8>,
-    ) -> Result<(), ApiError> {
-        let compose = self.compose.clone();
-        let name = name.to_string();
-        tokio::task::spawn_blocking(move || compose.import_instance_data(&name, &tar_bytes))
+        tokio::task::spawn_blocking(move || f(&compose))
             .await
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
@@ -2767,7 +2751,11 @@ async fn restart_instance(
                     .await;
 
                 let tar_bytes = match state
-                    .compose_export_instance_data(&name, Some(stype), false)
+                    .compose_blocking({
+                        let name = name.clone();
+                        let stype = stype.to_string();
+                        move |c| c.export_instance_data(&name, Some(&stype), false)
+                    })
                     .await
                 {
                     Ok(bytes) => {
@@ -2882,7 +2870,12 @@ async fn restart_instance(
                     }
                     // Rollback succeeded — restore workspace into the old container
                     if !tar_bytes.is_empty() {
-                        let _ = state.compose_import_instance_data(&name, tar_bytes).await;
+                        let _ = state
+                            .compose_blocking({
+                                let name = name.clone();
+                                move |c| c.import_instance_data(&name, &tar_bytes)
+                            })
+                            .await;
                     }
                     let _ = tx
                         .send(sse_error(&format!(
@@ -2917,7 +2910,13 @@ async fn restart_instance(
                         .send(sse_stage("restoring", "Restoring workspace and config..."))
                         .await;
 
-                    if let Err(e) = state.compose_import_instance_data(&name, tar_bytes).await {
+                    let restore = state
+                        .compose_blocking({
+                            let name = name.clone();
+                            move |c| c.import_instance_data(&name, &tar_bytes)
+                        })
+                        .await;
+                    if let Err(e) = restore {
                         let _ = tx.send(sse_error(&format!(
                             "Failed to restore workspace, the instance may be missing user data: {}", e
                         ))).await;
@@ -3246,19 +3245,18 @@ async fn create_backup_endpoint(
     let inst = inst.ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
     let stream = async_stream::stream! {
-        yield Ok(sse_stage("encrypting", "Exporting and encrypting workspace..."));
+        yield Ok(sse_stage("encrypting", "Exporting, encrypting, and uploading from container..."));
 
-        let tar_bytes = match state.compose_export_instance_data(&name, inst.service_type.as_deref(), full_export).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                yield Ok(sse_error(&format!("Backup failed: {}", e)));
-                return;
-            }
-        };
-
-        let result = backup_mgr
-            .create_backup(&name, &inst.ssh_pubkey, tar_bytes, age_recipient.as_deref())
-            .await;
+        let result = run_container_backup(
+            &state,
+            &backup_mgr,
+            &name,
+            inst.service_type.as_deref(),
+            &inst.ssh_pubkey,
+            age_recipient.as_deref(),
+            full_export,
+        )
+        .await;
 
         match result {
             Ok(info) => {
@@ -3290,6 +3288,88 @@ async fn create_backup_endpoint(
     };
 
     Ok(unbuffered_sse(stream))
+}
+
+/// Hard ceiling on the in-container backup pipeline (tar + encrypt + upload).
+/// Worst observed case: ~3 min for a 1.7 GB home dir, plus S3 upload time.
+const BACKUP_PIPELINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Run a backup entirely inside the instance's gateway container and verify
+/// the result landed in S3. Replaces the old export-to-memory path, which
+/// buffered the whole archive in this process and got OOM-killed on large
+/// home directories (multi-GB npm caches).
+async fn run_container_backup(
+    state: &AppState,
+    backup_mgr: &BackupManager,
+    name: &str,
+    service_type: Option<&str>,
+    ssh_pubkey: &str,
+    age_recipient: Option<&str>,
+    full_export: bool,
+) -> Result<BackupInfo, ApiError> {
+    // Validate recipients before any side effects.
+    let stdin_payload = build_backup_stdin(age_recipient, ssh_pubkey)?;
+
+    let now = chrono::Utc::now();
+    let backup_id = now.format("%Y%m%dT%H%M%SZ").to_string();
+
+    tracing::info!(
+        "Backup starting: instance={}, id={}, full_export={}",
+        name,
+        backup_id,
+        full_export
+    );
+
+    let upload_url = backup_mgr.upload_url(name, &backup_id).await?;
+
+    // On timeout the docker exec keeps running detached; its trap cleans up
+    // the container-side temp files when it eventually exits.
+    let pipeline = state.compose_blocking({
+        let name = name.to_string();
+        let service_type = service_type.map(str::to_string);
+        let backup_id = backup_id.clone();
+        move |c| {
+            c.copy_age_to_container(&name)?;
+            c.backup_instance_in_container(
+                &name,
+                service_type.as_deref(),
+                full_export,
+                &backup_id,
+                &upload_url,
+                &stdin_payload,
+            )
+        }
+    });
+    tokio::time::timeout(BACKUP_PIPELINE_TIMEOUT, pipeline)
+        .await
+        .map_err(|_| {
+            ApiError::Internal(format!(
+                "backup pipeline timed out after {}s (instance '{}')",
+                BACKUP_PIPELINE_TIMEOUT.as_secs(),
+                name
+            ))
+        })??;
+
+    let size_bytes = backup_mgr.object_size(name, &backup_id).await?;
+    if size_bytes == 0 {
+        return Err(ApiError::Internal(format!(
+            "backup upload verification failed: S3 object is empty (instance '{}', id {})",
+            name, backup_id
+        )));
+    }
+
+    tracing::info!(
+        "Backup complete: instance={}, id={}, size_bytes={}",
+        name,
+        backup_id,
+        size_bytes
+    );
+
+    Ok(BackupInfo {
+        id: backup_id,
+        timestamp: now,
+        size_bytes,
+    })
 }
 
 #[utoipa::path(get, path = "/instances/{name}/backups", tag = "Backups",
@@ -4689,27 +4769,16 @@ async fn background_sync_loop(state: AppState) {
                         continue;
                     }
                     tracing::info!("Scheduled backup for instance: {}", inst.name);
-                    let tar_bytes = match state
-                        .compose_export_instance_data(
-                            &inst.name,
-                            inst.service_type.as_deref(),
-                            false,
-                        )
-                        .await
-                    {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Scheduled backup export failed for {}: {}",
-                                inst.name,
-                                e
-                            );
-                            continue;
-                        }
-                    };
-                    match backup_mgr
-                        .create_backup(&inst.name, &inst.ssh_pubkey, tar_bytes, None)
-                        .await
+                    match run_container_backup(
+                        &state,
+                        backup_mgr,
+                        &inst.name,
+                        inst.service_type.as_deref(),
+                        &inst.ssh_pubkey,
+                        None,
+                        false,
+                    )
+                    .await
                     {
                         Ok(info) => {
                             tracing::info!(
