@@ -8,8 +8,10 @@ use serde::Serialize;
 use crate::error::ApiError;
 
 const DEFAULT_PRESIGNED_URL_EXPIRY_SECS: u64 = 3600;
-/// Presigned PUT URLs only need to outlive a single in-container upload.
-const UPLOAD_URL_EXPIRY_SECS: u64 = 1800;
+/// Presigned PUT URL lifetime. Must cover tar + encrypt + the whole upload,
+/// since the clock starts when we presign (before the container does any
+/// work). 1h leaves comfortable margin for large/slow backups.
+const UPLOAD_URL_EXPIRY_SECS: u64 = 3600;
 
 const BACKUP_KEY_SUFFIX: &str = ".tar.gz.age";
 

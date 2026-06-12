@@ -831,12 +831,27 @@ impl ComposeManager {
         Ok(output.stdout)
     }
 
-    /// Copy the age binary into an instance's gateway container (to /tmp/age).
-    /// Streamed via docker exec stdin because docker cp does not work reliably
-    /// across storage drivers. Written atomically (tmp + mv) so concurrent
-    /// backups of the same instance cannot observe a partially-written binary.
+    /// Ensure the age binary is present at /tmp/age in an instance's gateway
+    /// container. No-op if it's already there (the container persists across
+    /// backups), otherwise streams it in via docker exec stdin — docker cp
+    /// does not work reliably across storage drivers. Written to a PID-unique
+    /// temp path then atomically renamed, so concurrent copies can't observe a
+    /// partially-written binary.
     pub fn copy_age_to_container(&self, name: &str) -> Result<(), ApiError> {
         let container = format!("openclaw-{}-gateway-1", name);
+
+        // Skip the ~8MB stream if a usable binary is already in place.
+        let present = docker_command()
+            .args(["exec", &container, "test", "-x", "/tmp/age"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if present {
+            return Ok(());
+        }
+
         let age_path =
             std::env::var("AGE_BINARY_PATH").unwrap_or_else(|_| "/usr/local/bin/age".to_string());
         let age_bytes = std::fs::read(&age_path)
@@ -849,7 +864,7 @@ impl ComposeManager {
                 &container,
                 "sh",
                 "-c",
-                "cat > /tmp/.age.tmp && chmod 0755 /tmp/.age.tmp && mv /tmp/.age.tmp /tmp/age",
+                "t=/tmp/.age.$$.tmp; cat > \"$t\" && chmod 0755 \"$t\" && mv \"$t\" /tmp/age",
             ],
             &age_bytes,
             "age copy to container",
@@ -1452,42 +1467,53 @@ fn instance_data_dirs(
     }
 }
 
+/// Total wall-clock cap for the in-container S3 upload. Keeps curl from
+/// hanging forever on a stalled connection — without it the docker exec (and
+/// the host blocking thread waiting on it) could be pinned indefinitely, since
+/// the outer tokio timeout stops awaiting but cannot kill the child.
+const UPLOAD_CURL_MAX_SECS: u32 = 600;
+const UPLOAD_CURL_CONNECT_SECS: u32 = 30;
+
 /// Build the shell script that runs the backup pipeline inside a worker
 /// container: tar+gzip to a temp file, age-encrypt, curl PUT to $BACKUP_URL.
 ///
 /// stdin protocol: first line is an X25519 recipient ("age1...") or empty;
 /// remaining lines are SSH pubkeys, written to a file for age -R. At least
 /// one recipient is required (exit 3 otherwise). tar exit 1 ("file changed
-/// as we read it" on live containers) is tolerated; >1 is fatal. Temp file
-/// names embed the backup id so concurrent backups of the same instance
-/// don't collide, and a trap removes them on every exit path.
+/// as we read it" on live containers) is tolerated; >1 is fatal. Temp paths
+/// embed the backup id (readability) plus the shell PID `$$` so concurrent
+/// backups of the same instance can't collide, and a trap removes them on
+/// every exit path.
 fn build_backup_script(backup_id: &str, tar_args: &str) -> String {
-    let tarball = format!("/tmp/backup-{}.tar.gz", backup_id);
-    let recipients_file = format!("/tmp/age-r-{}", backup_id);
     format!(
         r#"read -r AGE_RCPT
-cat > {rcpt}
+TAR=/tmp/backup-{id}-$$.tar.gz
+RCPT=/tmp/age-r-{id}-$$
+cat > "$RCPT"
 RARG=""
 if [ -n "$AGE_RCPT" ]; then RARG="-r $AGE_RCPT"; fi
 RFLAG=""
-if [ -s {rcpt} ]; then RFLAG="-R {rcpt}"; fi
+if [ -s "$RCPT" ]; then RFLAG="-R $RCPT"; fi
 if [ -z "$RARG$RFLAG" ]; then echo "no encryption recipients" >&2; exit 3; fi
-trap 'rm -f {tar} {tar}.age {rcpt}' EXIT
-tar czf {tar} {tar_args}
+trap 'rm -f "$TAR" "$TAR.age" "$RCPT"' EXIT
+tar czf "$TAR" {tar_args}
 rc=$?
 if [ $rc -gt 1 ]; then echo "tar failed rc=$rc" >&2; exit $rc; fi
-/tmp/age -e $RARG $RFLAG -o {tar}.age {tar} || exit 4
-curl --fail -sS -T {tar}.age "$BACKUP_URL"
+/tmp/age -e $RARG $RFLAG -o "$TAR.age" "$TAR" || exit 4
+curl --fail --connect-timeout {connect} --max-time {maxt} -sS -T "$TAR.age" "$BACKUP_URL"
 "#,
-        rcpt = recipients_file,
-        tar = tarball,
+        id = backup_id,
         tar_args = tar_args,
+        connect = UPLOAD_CURL_CONNECT_SECS,
+        maxt = UPLOAD_CURL_MAX_SECS,
     )
 }
 
 /// Spawn a docker command with piped stdin, write `stdin_bytes`, and wait.
-/// Closing stdin (by dropping it after the write) signals EOF to the
-/// container-side script. `context` labels error messages.
+/// The write runs on a separate thread so a large payload (e.g. the ~8MB age
+/// binary) can't deadlock against the child filling its stderr pipe while we
+/// block on stdin. Dropping stdin when the writer thread ends signals EOF.
+/// `context` labels error messages.
 fn run_docker_exec_stdin(args: &[&str], stdin_bytes: &[u8], context: &str) -> Result<(), ApiError> {
     let mut child = docker_command()
         .args(args)
@@ -1497,16 +1523,21 @@ fn run_docker_exec_stdin(args: &[&str], stdin_bytes: &[u8], context: &str) -> Re
         .spawn()
         .map_err(|e| ApiError::Internal(format!("docker exec spawn ({}): {}", context, e)))?;
 
-    child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(stdin_bytes)
-        .map_err(|e| ApiError::Internal(format!("write stdin ({}): {}", context, e)))?;
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let payload = stdin_bytes.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&payload));
 
     let output = child
         .wait_with_output()
         .map_err(|e| ApiError::Internal(format!("docker exec wait ({}): {}", context, e)))?;
+
+    // Surface a stdin write error only if the child didn't already fail with a
+    // more specific message (a child that exits early closes the pipe, which
+    // shows up here as a broken-pipe write error we'd rather not report).
+    let write_result = writer
+        .join()
+        .map_err(|_| ApiError::Internal(format!("stdin writer panicked ({})", context)))?;
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ApiError::Internal(format!(
@@ -1516,6 +1547,7 @@ fn run_docker_exec_stdin(args: &[&str], stdin_bytes: &[u8], context: &str) -> Re
             stderr.trim()
         )));
     }
+    write_result.map_err(|e| ApiError::Internal(format!("write stdin ({}): {}", context, e)))?;
     Ok(())
 }
 
@@ -1538,20 +1570,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_backup_script_paths_embed_backup_id() {
+    fn test_build_backup_script_paths_embed_backup_id_and_pid() {
         let script = build_backup_script("20260611T120000Z", "-C /home/agent .");
-        assert!(script.contains("/tmp/backup-20260611T120000Z.tar.gz"));
-        assert!(script.contains("/tmp/age-r-20260611T120000Z"));
-        assert!(script.contains("tar czf /tmp/backup-20260611T120000Z.tar.gz -C /home/agent ."));
+        assert!(script.contains("TAR=/tmp/backup-20260611T120000Z-$$.tar.gz"));
+        assert!(script.contains("RCPT=/tmp/age-r-20260611T120000Z-$$"));
+        assert!(script.contains(r#"tar czf "$TAR" -C /home/agent ."#));
     }
 
     #[test]
-    fn test_build_backup_script_cleans_up_and_uploads() {
+    fn test_build_backup_script_cleans_up_and_uploads_with_timeout() {
         let script = build_backup_script("id1", "-C /home/agent .");
-        assert!(script.contains(
-            "trap 'rm -f /tmp/backup-id1.tar.gz /tmp/backup-id1.tar.gz.age /tmp/age-r-id1' EXIT"
-        ));
-        assert!(script.contains(r#"curl --fail -sS -T /tmp/backup-id1.tar.gz.age "$BACKUP_URL""#));
+        assert!(script.contains(r#"trap 'rm -f "$TAR" "$TAR.age" "$RCPT"' EXIT"#));
+        assert!(script.contains("--connect-timeout 30"));
+        assert!(script.contains("--max-time 600"));
+        assert!(script.contains(r#"-T "$TAR.age" "$BACKUP_URL""#));
     }
 
     #[test]
