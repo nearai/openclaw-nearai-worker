@@ -11,6 +11,17 @@ const DEFAULT_PRESIGNED_URL_EXPIRY_SECS: u64 = 3600;
 /// Presigned PUT URLs only need to outlive a single in-container upload.
 const UPLOAD_URL_EXPIRY_SECS: u64 = 1800;
 
+const BACKUP_KEY_SUFFIX: &str = ".tar.gz.age";
+
+/// S3 object key for an instance backup. Every path that touches a backup
+/// object (presign PUT, verify, list, presign GET) must agree on this layout.
+fn backup_s3_key(instance_name: &str, backup_id: &str) -> String {
+    format!(
+        "backups/{}/{}{}",
+        instance_name, backup_id, BACKUP_KEY_SUFFIX
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupInfo {
     pub id: String,
@@ -53,7 +64,7 @@ impl BackupManager {
         instance_name: &str,
         backup_id: &str,
     ) -> Result<String, ApiError> {
-        let key = format!("backups/{}/{}.tar.gz.age", instance_name, backup_id);
+        let key = backup_s3_key(instance_name, backup_id);
 
         let presigned = self
             .s3
@@ -75,7 +86,7 @@ impl BackupManager {
     /// Size of an uploaded backup object, used to verify the in-container
     /// upload actually landed in S3.
     pub async fn object_size(&self, instance_name: &str, backup_id: &str) -> Result<i64, ApiError> {
-        let key = format!("backups/{}/{}.tar.gz.age", instance_name, backup_id);
+        let key = backup_s3_key(instance_name, backup_id);
 
         let head = self
             .s3
@@ -109,9 +120,8 @@ impl BackupManager {
                     Some(k) => k,
                     None => continue,
                 };
-                // Key format: backups/{name}/{timestamp}.tar.gz.age
                 let filename = key.strip_prefix(&prefix).unwrap_or(key);
-                let id = filename.strip_suffix(".tar.gz.age").unwrap_or(filename);
+                let id = filename.strip_suffix(BACKUP_KEY_SUFFIX).unwrap_or(filename);
 
                 let timestamp = chrono::NaiveDateTime::parse_from_str(id, "%Y%m%dT%H%M%SZ")
                     .ok()
@@ -139,7 +149,7 @@ impl BackupManager {
         expiry_secs: Option<u64>,
     ) -> Result<String, ApiError> {
         let expiry = expiry_secs.unwrap_or(DEFAULT_PRESIGNED_URL_EXPIRY_SECS);
-        let key = format!("backups/{}/{}.tar.gz.age", instance_name, backup_id);
+        let key = backup_s3_key(instance_name, backup_id);
 
         let presigned = self
             .s3
