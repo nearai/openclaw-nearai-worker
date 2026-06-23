@@ -147,7 +147,7 @@ services:
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     user: "0:0"
     environment:
-      - MONITORING_INGEST_TOKEN=${MONITORING_INGEST_TOKEN}
+      - MONITORING_INGEST_TOKEN=${MONITORING_INGEST_TOKEN:-}
       - MONITORING_OTLP_ENDPOINT=${MONITORING_OTLP_ENDPOINT:-https://telemetry.infra.near.ai}
       - DD_HOSTNAME=${DD_HOSTNAME:-openclaw-management-stack}
       - CVM_NAME=${CVM_NAME:-openclaw-management-stack}
@@ -156,8 +156,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /:/hostfs:ro
-      - /proc:/hostfs/proc:ro
-      - /sys:/hostfs/sys:ro
       - otelcol-storage:/var/lib/otelcol-contrib
     configs:
       - source: otelcol_openclaw_config
@@ -244,8 +242,7 @@ configs:
           error_mode: ignore
           metrics:
             datapoint:
-              - 'resource.attributes["container.name"] != nil and IsMatch(resource.attributes["container.name"], "^/?openclaw-.*-gateway-1$")'
-              - 'attributes["compose_project"] != nil and IsMatch(attributes["compose_project"], "^openclaw-")'
+              - 'resource.attributes["container.name"] != nil and IsMatch(resource.attributes["container.name"], "^/?(openclaw|ironclaw)-.*-gateway-[0-9]+$")'
 
         batch:
           send_batch_size: 1024
