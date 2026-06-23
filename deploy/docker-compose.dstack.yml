@@ -199,9 +199,6 @@ configs:
           excluded_images:
             - /.*openclaw-nearai-worker.*/
             - /.*ironclaw-nearai-worker.*/
-          container_labels_to_metric_labels:
-            com.docker.compose.service: compose_service
-            com.docker.compose.project: compose_project
 
         prometheus/self:
           config:
@@ -234,9 +231,17 @@ configs:
             - key: service.namespace
               value: near-ai
               action: insert
-            - key: service.name
-              value: openclaw-management-stack
-              action: insert
+
+        transform/datadog_container_labels:
+          error_mode: ignore
+          metric_statements:
+            - context: resource
+              statements:
+                - set(attributes["image_name"], attributes["container.image.name"]) where attributes["image_name"] == nil and attributes["container.image.name"] != nil
+                - delete_key(attributes, "container.id")
+                - delete_key(attributes, "container.hostname")
+                - delete_key(attributes, "container.image.name")
+                - delete_key(attributes, "container.runtime")
 
         filter/drop_worker_containers:
           error_mode: ignore
@@ -268,7 +273,7 @@ configs:
         pipelines:
           metrics:
             receivers: [hostmetrics, docker_stats, prometheus/self]
-            processors: [memory_limiter, resource, filter/drop_worker_containers, batch]
+            processors: [memory_limiter, resource, transform/datadog_container_labels, filter/drop_worker_containers, batch]
             exporters: [otlphttp/gateway]
         telemetry:
           metrics:
