@@ -411,7 +411,7 @@ bootstrap() {
     # mid-bootstrap if our config hash changed. Self-updates are handled
     # separately by update_self() which uses a helper container.
     log "Bootstrap: ensuring all services are running..."
-    compose_up -d --remove-orphans cert-init nginx compose-api ssh-bastion datadog-agent
+    compose_up -d --remove-orphans cert-init nginx compose-api ssh-bastion datadog-agent otelcol-contrib
 
     if [ "$fresh_deploy" = true ]; then
         if wait_for_healthy "$HEALTH_TIMEOUT"; then

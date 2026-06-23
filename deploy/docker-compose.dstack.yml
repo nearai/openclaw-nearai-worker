@@ -141,10 +141,143 @@ services:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
     restart: unless-stopped
 
+  otelcol-contrib:
+    image: ${OTELCOL_IMAGE:-otel/opentelemetry-collector-contrib:0.120.0}
+    container_name: otelcol-contrib
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    user: "0:0"
+    environment:
+      - MONITORING_INGEST_TOKEN=${MONITORING_INGEST_TOKEN}
+      - MONITORING_OTLP_ENDPOINT=${MONITORING_OTLP_ENDPOINT:-https://telemetry.infra.near.ai}
+      - DD_HOSTNAME=${DD_HOSTNAME:-openclaw-management-stack}
+      - CVM_NAME=${CVM_NAME:-openclaw-management-stack}
+      - CVM_HOST=${CVM_HOST:-}
+      - ENV=${ENV:-dev}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/hostfs:ro
+      - /proc:/hostfs/proc:ro
+      - /sys:/hostfs/sys:ro
+      - otelcol-storage:/var/lib/otelcol-contrib
+    configs:
+      - source: otelcol_openclaw_config
+        target: /etc/otelcol-contrib/config.yaml
+        mode: 0444
+    restart: unless-stopped
+    logging:
+      driver: "local"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
 configs:
   docker_registry_config:
     content: |
       {"auths":{"https://index.docker.io/v1/":{"auth":"${DOCKER_REGISTRY_AUTH:-}"}}}
+
+  otelcol_openclaw_config:
+    content: |
+      receivers:
+        hostmetrics:
+          root_path: /hostfs
+          collection_interval: 30s
+          scrapers:
+            cpu: {}
+            memory: {}
+            load: {}
+            paging: {}
+            network: {}
+            disk: {}
+            filesystem:
+              exclude_mount_points:
+                mount_points: ["^/dev(/.*)?$", "^/proc(/.*)?$", "^/sys(/.*)?$", "^/run(/.*)?$", "^/var/lib/docker(/.*)?$"]
+                match_type: regexp
+
+        docker_stats:
+          endpoint: unix:///var/run/docker.sock
+          collection_interval: 30s
+          timeout: 10s
+          api_version: "1.44"
+          excluded_images:
+            - /.*openclaw-nearai-worker.*/
+            - /.*ironclaw-nearai-worker.*/
+          container_labels_to_metric_labels:
+            com.docker.compose.service: compose_service
+            com.docker.compose.project: compose_project
+
+        prometheus/self:
+          config:
+            scrape_configs:
+              - job_name: otelcol-openclaw
+                scrape_interval: 30s
+                static_configs:
+                  - targets: ['localhost:8888']
+
+      processors:
+        memory_limiter:
+          check_interval: 1s
+          limit_mib: 256
+          spike_limit_mib: 64
+
+        resource:
+          attributes:
+            - key: host.name
+              value: $${env:DD_HOSTNAME}
+              action: upsert
+            - key: cvm.name
+              value: $${env:CVM_NAME}
+              action: upsert
+            - key: host.machine
+              value: $${env:CVM_HOST}
+              action: insert
+            - key: deployment.environment
+              value: $${env:ENV}
+              action: upsert
+            - key: service.namespace
+              value: near-ai
+              action: insert
+            - key: service.name
+              value: openclaw-management-stack
+              action: insert
+
+        filter/drop_worker_containers:
+          error_mode: ignore
+          metrics:
+            datapoint:
+              - 'resource.attributes["container.name"] != nil and IsMatch(resource.attributes["container.name"], "^/?openclaw-.*-gateway-1$")'
+              - 'attributes["compose_project"] != nil and IsMatch(attributes["compose_project"], "^openclaw-")'
+
+        batch:
+          send_batch_size: 1024
+          send_batch_max_size: 2048
+          timeout: 5s
+
+      exporters:
+        otlphttp/gateway:
+          endpoint: $${env:MONITORING_OTLP_ENDPOINT}
+          headers:
+            Authorization: "Bearer $${env:MONITORING_INGEST_TOKEN}"
+          sending_queue:
+            queue_size: 128
+            storage: file_storage
+
+      extensions:
+        file_storage:
+          directory: /var/lib/otelcol-contrib/storage
+          create_directory: true
+
+      service:
+        extensions: [file_storage]
+        pipelines:
+          metrics:
+            receivers: [hostmetrics, docker_stats, prometheus/self]
+            processors: [memory_limiter, resource, filter/drop_worker_containers, batch]
+            exporters: [otlphttp/gateway]
+        telemetry:
+          metrics:
+            address: localhost:8888
+          logs:
+            level: info
 
   openclaw_nginx:
     content: |
@@ -263,3 +396,4 @@ volumes:
   management-data:
   bastion-data:
   compose-files:
+  otelcol-storage:
