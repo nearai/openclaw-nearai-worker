@@ -232,7 +232,6 @@ configs:
           include: [/var/lib/docker/containers/*/*-json.log]
           start_at: end
           storage: file_storage
-          include_file_path: true
           operators:
             - type: json_parser
               parse_from: body
@@ -253,10 +252,6 @@ configs:
             - type: remove
               field: attributes.time
               if: 'attributes.time != nil'
-            - type: regex_parser
-              parse_from: attributes["log.file.path"]
-              regex: '/var/lib/docker/containers/(?P<container_id>[a-f0-9]{12})[a-f0-9]*/'
-              on_error: send_quiet
 
       processors:
         memory_limiter:
@@ -309,6 +304,15 @@ configs:
             log_record:
               - 'attributes["attrs"] == nil or attributes["attrs"]["com.datadoghq.ad.logs"] == nil'
 
+        transform/drop_docker_log_metadata:
+          error_mode: ignore
+          log_statements:
+            - context: log
+              statements:
+                - delete_key(attributes, "attrs") where attributes["attrs"] != nil
+                - delete_key(attributes, "container_id") where attributes["container_id"] != nil
+                - delete_key(attributes, "log.file.path") where attributes["log.file.path"] != nil
+
         groupbyattrs/docker_logs:
           keys:
             - service.name
@@ -344,7 +348,7 @@ configs:
             exporters: [otlphttp/gateway]
           logs:
             receivers: [filelog/docker_containers]
-            processors: [memory_limiter, resource, transform/datadog_container_labels, filter/drop_worker_containers, groupbyattrs/docker_logs, batch]
+            processors: [memory_limiter, resource, transform/datadog_container_labels, filter/drop_worker_containers, transform/drop_docker_log_metadata, groupbyattrs/docker_logs, batch]
             exporters: [otlphttp/gateway]
         telemetry:
           metrics:
