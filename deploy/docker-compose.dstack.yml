@@ -1,3 +1,10 @@
+x-logging-conf: &logging-conf
+  driver: "json-file"
+  options:
+    max-size: "100m"
+    max-file: "10"
+    labels: "com.datadoghq.ad.logs,com.docker.compose.service"
+
 services:
   cert-init:
     image: alpine:3
@@ -20,6 +27,9 @@ services:
     configs:
       - source: openclaw_nginx
         target: /etc/nginx/conf.d/openclaw.conf
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "openclaw-ingress", "service": "openclaw-ingress"}]'
+    logging: *logging-conf
     depends_on:
       cert-init:
         condition: service_completed_successfully
@@ -65,6 +75,9 @@ services:
       timeout: 3s
       retries: 60
       start_period: 600s
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "openclaw-compose-api", "service": "openclaw-compose-api"}]'
+    logging: *logging-conf
     restart: unless-stopped
     depends_on:
       - nginx
@@ -78,6 +91,9 @@ services:
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - BASTION_SSH_PORT=${BASTION_SSH_PORT:-2222}
       - COMPOSE_API_PORT=8080
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "openclaw-ssh-bastion", "service": "openclaw-ssh-bastion"}]'
+    logging: *logging-conf
     restart: unless-stopped
     depends_on:
       compose-api:
@@ -115,6 +131,9 @@ services:
       - UPDATER_STATE_FILE=/app/data/updater-state.json
       - DOCKER_REGISTRY_USER=${DOCKER_REGISTRY_USER:-}
       - DOCKER_REGISTRY_TOKEN=${DOCKER_REGISTRY_TOKEN:-}
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "openclaw-updater", "service": "openclaw-updater"}]'
+    logging: *logging-conf
     restart: unless-stopped
     depends_on:
       - compose-api
@@ -156,6 +175,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /:/hostfs:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - otelcol-storage:/var/lib/otelcol-contrib
     configs:
       - source: otelcol_openclaw_config
@@ -208,6 +228,31 @@ configs:
                 static_configs:
                   - targets: ['localhost:8888']
 
+        filelog/docker_containers:
+          include: [/var/lib/docker/containers/*/*-json.log]
+          start_at: end
+          storage: file_storage
+          operators:
+            - type: json_parser
+              parse_from: body
+              parse_to: attributes
+              timestamp:
+                parse_from: attributes.time
+                layout_type: gotime
+                layout: '2006-01-02T15:04:05.999999999Z07:00'
+              on_error: send_quiet
+            - type: move
+              from: attributes.log
+              to: body
+              if: 'attributes.log != nil'
+            - type: move
+              from: attributes.stream
+              to: attributes["log.iostream"]
+              if: 'attributes.stream != nil'
+            - type: remove
+              field: attributes.time
+              if: 'attributes.time != nil'
+
       processors:
         memory_limiter:
           check_interval: 1s
@@ -242,12 +287,38 @@ configs:
                 - delete_key(attributes, "container.hostname")
                 - delete_key(attributes, "container.image.name")
                 - delete_key(attributes, "container.runtime")
+          log_statements:
+            - context: log
+              statements:
+                - set(attributes["service.name"], attributes["attrs"]["com.docker.compose.service"]) where attributes["attrs"] != nil and attributes["attrs"]["com.docker.compose.service"] != nil
+                - set(attributes["service.name"], ParseJSON(attributes["attrs"]["com.datadoghq.ad.logs"])[0]["service"]) where attributes["attrs"] != nil and attributes["attrs"]["com.datadoghq.ad.logs"] != nil
+                - set(attributes["log.source"], ParseJSON(attributes["attrs"]["com.datadoghq.ad.logs"])[0]["source"]) where attributes["attrs"] != nil and attributes["attrs"]["com.datadoghq.ad.logs"] != nil
+                - set(attributes["container.name"], attributes["attrs"]["com.docker.compose.service"]) where attributes["attrs"] != nil and attributes["attrs"]["com.docker.compose.service"] != nil
 
         filter/drop_worker_containers:
           error_mode: ignore
           metrics:
             datapoint:
               - 'resource.attributes["container.name"] != nil and IsMatch(resource.attributes["container.name"], "^/?(openclaw|ironclaw)-.*-gateway-[0-9]+$")'
+          logs:
+            log_record:
+              - 'attributes["attrs"] == nil or attributes["attrs"]["com.datadoghq.ad.logs"] == nil'
+
+        transform/drop_docker_log_metadata:
+          error_mode: ignore
+          log_statements:
+            - context: log
+              statements:
+                - delete_key(attributes, "attrs") where attributes["attrs"] != nil
+                - delete_key(attributes, "container_id") where attributes["container_id"] != nil
+                - delete_key(attributes, "log.file.path") where attributes["log.file.path"] != nil
+
+        groupbyattrs/docker_logs:
+          keys:
+            - service.name
+            - container.name
+            - log.source
+            - log.iostream
 
         batch:
           send_batch_size: 1024
@@ -274,6 +345,10 @@ configs:
           metrics:
             receivers: [hostmetrics, docker_stats, prometheus/self]
             processors: [memory_limiter, resource, transform/datadog_container_labels, filter/drop_worker_containers, batch]
+            exporters: [otlphttp/gateway]
+          logs:
+            receivers: [filelog/docker_containers]
+            processors: [memory_limiter, resource, transform/datadog_container_labels, filter/drop_worker_containers, transform/drop_docker_log_metadata, groupbyattrs/docker_logs, batch]
             exporters: [otlphttp/gateway]
         telemetry:
           metrics:
