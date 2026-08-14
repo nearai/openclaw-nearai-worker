@@ -3391,13 +3391,10 @@ async fn list_backups_endpoint(
         .as_ref()
         .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?;
 
-    {
-        let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
-
+    // Backups are keyed in S3 by instance name alone, so listing them needs no container: the
+    // store only holds instances discovered running, and a migrated instance is stopped, which
+    // made its archives unlistable exactly when an operator needs them. An unknown name simply
+    // yields an empty list — the S3 prefix matches nothing.
     let backups = backup_mgr.list_backups(&name).await?;
 
     let items: Vec<BackupInfoResponse> = backups
@@ -3434,11 +3431,14 @@ async fn download_backup_endpoint(
         .as_ref()
         .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?;
 
-    {
-        let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
+    // Presign by name + id rather than by container state, so a stopped or already-migrated
+    // instance can still be restored from. Existence is checked against S3 (head_object) instead
+    // of the in-memory store, which only holds instances discovered running.
+    if backup_mgr.object_size(&name, &id).await.is_err() {
+        return Err(ApiError::NotFound(format!(
+            "Backup '{}' for instance '{}' not found",
+            id, name
+        )));
     }
 
     let url = backup_mgr.download_url(&name, &id, None).await?;
