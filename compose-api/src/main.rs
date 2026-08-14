@@ -294,13 +294,24 @@ impl AppState {
     /// Discovery only reads the key from running containers, and it runs once at startup,
     /// so the store can lack a key the instance does have. Doing the full chain here
     /// keeps that cost per-request instead of adding it to every discovery.
-    async fn resolve_master_key(&self, name: &str, image: Option<&str>) -> Option<String> {
+    async fn resolve_master_key(
+        &self,
+        name: &str,
+        service_type: Option<&str>,
+        image: Option<&str>,
+    ) -> Option<String> {
         let compose = self.compose.clone();
         let owned_name = name.to_string();
         let container_name = format!("openclaw-{}-gateway-1", name);
+        let service_type = service_type.map(|s| s.to_string());
         let image = image.map(|s| s.to_string());
         let key = tokio::task::spawn_blocking(move || {
-            compose.resolve_master_key(&owned_name, &container_name, image.as_deref())
+            compose.resolve_master_key(
+                &owned_name,
+                &container_name,
+                service_type.as_deref(),
+                image.as_deref(),
+            )
         })
         .await
         .map_err(|e| tracing::warn!("Instance '{}': master key task join: {}", name, e))
@@ -2477,17 +2488,30 @@ async fn get_instance(
                 .extra_env
                 .as_ref()
                 .is_some_and(|e| e.contains_key("SECRETS_MASTER_KEY"));
-            if !has_master_key
-                && compose::is_ironclaw(inst.service_type.as_deref(), inst.image.as_deref())
-            {
+            if has_master_key {
+                tracing::debug!(
+                    "Instance '{}': SECRETS_MASTER_KEY already in the store",
+                    inst.name
+                );
+            } else if compose::is_ironclaw(inst.service_type.as_deref(), inst.image.as_deref()) {
                 if let Some(key) = state
-                    .resolve_master_key(&inst.name, inst.image.as_deref())
+                    .resolve_master_key(
+                        &inst.name,
+                        inst.service_type.as_deref(),
+                        inst.image.as_deref(),
+                    )
                     .await
                 {
                     inst.extra_env
                         .get_or_insert_with(Default::default)
                         .insert("SECRETS_MASTER_KEY".to_string(), key);
                 }
+            } else {
+                tracing::info!(
+                    "Instance '{}': no SECRETS_MASTER_KEY and none expected ({})",
+                    inst.name,
+                    compose::type_signals(inst.service_type.as_deref(), inst.image.as_deref())
+                );
             }
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
