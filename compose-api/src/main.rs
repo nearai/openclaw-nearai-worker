@@ -290,6 +290,35 @@ impl AppState {
             .map_err(|e| ApiError::Internal(format!("task join: {e}")))?
     }
 
+    /// Resolve an instance's SECRETS_MASTER_KEY and cache it on the stored instance.
+    /// Discovery only reads the key from running containers, and it runs once at startup,
+    /// so the store can lack a key the instance does have. Doing the full chain here
+    /// keeps that cost per-request instead of adding it to every discovery.
+    async fn resolve_master_key(&self, name: &str, image: Option<&str>) -> Option<String> {
+        let compose = self.compose.clone();
+        let owned_name = name.to_string();
+        let container_name = format!("openclaw-{}-gateway-1", name);
+        let image = image.map(|s| s.to_string());
+        let key = tokio::task::spawn_blocking(move || {
+            compose.resolve_master_key(&owned_name, &container_name, image.as_deref())
+        })
+        .await
+        .map_err(|e| tracing::warn!("Instance '{}': master key task join: {}", name, e))
+        .ok()
+        .flatten()?;
+
+        let mut store = self.store.write().await;
+        if let Some(instance) = store.get(name).cloned() {
+            let mut extra = instance.extra_env.unwrap_or_default();
+            extra.insert("SECRETS_MASTER_KEY".to_string(), key.clone());
+            store.add(Instance {
+                extra_env: Some(extra),
+                ..instance
+            });
+        }
+        Some(key)
+    }
+
     async fn compose_all_statuses(
         &self,
     ) -> Result<std::collections::HashMap<String, String>, ApiError> {
@@ -2438,10 +2467,28 @@ async fn get_instance(
     };
 
     match instance {
-        Some(inst) => {
+        Some(mut inst) => {
             let status = state
                 .compose_status(&inst.name, inst.service_type.as_deref())
                 .await?;
+            // Migration reads the key from this response, so resolve it here rather than
+            // leaving the caller to restart compose-api and hope discovery catches it.
+            let has_master_key = inst
+                .extra_env
+                .as_ref()
+                .is_some_and(|e| e.contains_key("SECRETS_MASTER_KEY"));
+            if !has_master_key
+                && compose::is_ironclaw(inst.service_type.as_deref(), inst.image.as_deref())
+            {
+                if let Some(key) = state
+                    .resolve_master_key(&inst.name, inst.image.as_deref())
+                    .await
+                {
+                    inst.extra_env
+                        .get_or_insert_with(Default::default)
+                        .insert("SECRETS_MASTER_KEY".to_string(), key);
+                }
+            }
             let (url, dashboard_url) =
                 generate_urls(&state.config, &inst.name, inst.gateway_port, &inst.token);
             let ssh_command = generate_ssh_command(&state.config, &inst.name, inst.ssh_port);

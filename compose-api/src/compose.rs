@@ -40,6 +40,57 @@ const SYSTEM_ENV_KEYS: &[&str] = &[
     "PATH", "HOME", "HOSTNAME", "LANG", "LC_ALL", "TERM", "SHLVL", "PWD", "OLDPWD", "USER", "SHELL",
 ];
 
+/// Where ironclaw's entrypoint persists the secrets master key, on the config volume.
+const MASTER_KEY_PATH: &str = "/home/agent/.ironclaw/.master_key";
+
+/// The places an instance's SECRETS_MASTER_KEY can be read from, cheapest first.
+/// `docker cp` reads the config volume whether or not the container runs — verified
+/// against a stopped container and one that was never started — so it covers the
+/// stopped case that `docker exec` cannot. exec stays as the fallback.
+#[derive(Clone, Copy)]
+enum MasterKeySource {
+    EnvFile,
+    Copy,
+    Exec,
+}
+
+impl MasterKeySource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::EnvFile => "instance .env",
+            Self::Copy => "docker cp",
+            Self::Exec => "docker exec",
+        }
+    }
+}
+
+/// True when the instance runs ironclaw, by either signal. The two disagree on
+/// instances whose stored SERVICE_TYPE is openclaw while the image is ironclaw, and
+/// those still hold an ironclaw master key.
+pub fn is_ironclaw(service_type: Option<&str>, image: Option<&str>) -> bool {
+    service_type == Some("ironclaw") || image.is_some_and(|i| i.contains("ironclaw"))
+}
+
+/// A master key is 64 hex chars (32 bytes). Anything else is a miss with a reason.
+fn valid_master_key(raw: &str) -> Result<String, String> {
+    let key = raw.trim();
+    if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(key.to_string())
+    } else {
+        Err(format!("not valid 64-char hex (len={})", key.len()))
+    }
+}
+
+fn docker_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text.trim().lines().next().unwrap_or("").trim().to_string();
+    if line.is_empty() {
+        "docker command failed".to_string()
+    } else {
+        line
+    }
+}
+
 /// Insert OAuth-related env vars into the given map.
 /// Shared by `up()` and `ensure_env_file()` to avoid duplication.
 fn insert_oauth_env_vars(
@@ -1162,9 +1213,13 @@ impl ComposeManager {
 
         // ironclaw generates SECRETS_MASTER_KEY at runtime (entrypoint.sh writes it to
         // .master_key on disk). It's not in Config.Env, so read it from the container.
-        if service_type.as_deref() == Some("ironclaw") && !extra.contains_key("SECRETS_MASTER_KEY")
+        // Gate on the image as well as service_type: instances exist whose stored
+        // SERVICE_TYPE says openclaw while they run an ironclaw image, and those do have
+        // a key. Discover stays at one exec per container; get_instance retries the rest.
+        if is_ironclaw(service_type.as_deref(), Some(image_from_config))
+            && !extra.contains_key("SECRETS_MASTER_KEY")
         {
-            if let Some(key) = self.read_master_key_from_container(container_name) {
+            if let Some(key) = self.read_master_key_from_container(name, container_name) {
                 extra.insert("SECRETS_MASTER_KEY".to_string(), key);
             }
         }
@@ -1206,35 +1261,106 @@ impl ComposeManager {
             .ok()
     }
 
-    /// Read SECRETS_MASTER_KEY from an ironclaw container's persisted .master_key file.
-    /// Returns None if the file doesn't exist or the value is invalid.
-    fn read_master_key_from_container(&self, container_name: &str) -> Option<String> {
-        let output = Command::new("docker")
-            .args([
-                "exec",
-                container_name,
-                "cat",
-                "/home/agent/.ironclaw/.master_key",
-            ])
-            .output()
-            .ok()?;
+    /// Read SECRETS_MASTER_KEY from a running container's persisted .master_key file.
+    /// Discovery's single cheap attempt; `resolve_master_key` covers the rest.
+    fn read_master_key_from_container(&self, name: &str, container_name: &str) -> Option<String> {
+        self.read_master_key(MasterKeySource::Exec, name, container_name)
+            .ok()
+    }
 
-        if !output.status.success() {
-            return None;
+    /// Resolve an instance's SECRETS_MASTER_KEY from every place the key can live.
+    ///
+    /// ironclaw writes the key to `.master_key` on the config volume, so it outlives a
+    /// stopped container — but the exec used during discovery does not, which is why a
+    /// stopped instance stayed unmigratable until someone started it and restarted
+    /// compose-api. Every source logs why it came up empty: an instance that never had a
+    /// key must not look like one whose key we failed to read.
+    pub fn resolve_master_key(
+        &self,
+        name: &str,
+        container_name: &str,
+        image: Option<&str>,
+    ) -> Option<String> {
+        let mut missed: Vec<String> = Vec::new();
+        for source in [
+            MasterKeySource::EnvFile,
+            MasterKeySource::Copy,
+            MasterKeySource::Exec,
+        ] {
+            match self.read_master_key(source, name, container_name) {
+                Ok(key) => {
+                    tracing::info!(
+                        "Instance '{}': SECRETS_MASTER_KEY resolved from {}",
+                        name,
+                        source.label()
+                    );
+                    return Some(key);
+                }
+                Err(reason) => {
+                    tracing::debug!(
+                        "Instance '{}': {} did not yield SECRETS_MASTER_KEY ({})",
+                        name,
+                        source.label(),
+                        reason
+                    );
+                    missed.push(format!("{}: {}", source.label(), reason));
+                }
+            }
         }
+        tracing::warn!(
+            "Instance '{}': no SECRETS_MASTER_KEY anywhere (image={}); tried {}. \
+             Expected when the instance runs openclaw, which has no ironclaw key.",
+            name,
+            image.unwrap_or("unknown"),
+            missed.join("; ")
+        );
+        None
+    }
 
-        let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        // Validate: must be 64 hex chars (32 bytes)
-        if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
-            Some(key)
-        } else {
-            tracing::warn!(
-                "Container {} has .master_key but it's not valid 64-char hex (len={})",
-                container_name,
-                key.len()
-            );
-            None
+    /// One source of the resolution chain. `Err` carries the reason for the log.
+    fn read_master_key(
+        &self,
+        source: MasterKeySource,
+        name: &str,
+        container_name: &str,
+    ) -> Result<String, String> {
+        match source {
+            MasterKeySource::EnvFile => {
+                let raw = self
+                    .read_env_file_value(name, "SECRETS_MASTER_KEY")
+                    .ok_or_else(|| "not in the instance .env".to_string())?;
+                valid_master_key(&raw)
+            }
+            MasterKeySource::Copy => {
+                let dest = std::env::temp_dir().join(format!("{}.master_key", container_name));
+                let output = docker_command()
+                    .args([
+                        "cp",
+                        &format!("{}:{}", container_name, MASTER_KEY_PATH),
+                        &dest.to_string_lossy(),
+                    ])
+                    .output()
+                    .map_err(|e| format!("docker cp failed to run: {}", e))?;
+                let result = if output.status.success() {
+                    std::fs::read_to_string(&dest)
+                        .map_err(|e| format!("copied file unreadable: {}", e))
+                        .and_then(|raw| valid_master_key(&raw))
+                } else {
+                    Err(docker_stderr(&output.stderr))
+                };
+                let _ = std::fs::remove_file(&dest);
+                result
+            }
+            MasterKeySource::Exec => {
+                let output = docker_command()
+                    .args(["exec", container_name, "cat", MASTER_KEY_PATH])
+                    .output()
+                    .map_err(|e| format!("docker exec failed to run: {}", e))?;
+                if !output.status.success() {
+                    return Err(docker_stderr(&output.stderr));
+                }
+                valid_master_key(&String::from_utf8_lossy(&output.stdout))
+            }
         }
     }
 
@@ -1364,10 +1490,15 @@ impl ComposeManager {
     /// Fallback for containers created before SERVICE_TYPE was added to the
     /// compose template environment block.
     pub fn read_service_type_from_env_file(&self, name: &str) -> Option<String> {
-        let path = self.env_path(name);
-        let content = std::fs::read_to_string(&path).ok()?;
+        self.read_env_file_value(name, "SERVICE_TYPE")
+    }
+
+    /// Read one key out of an instance's persisted .env file.
+    fn read_env_file_value(&self, name: &str, key: &str) -> Option<String> {
+        let content = std::fs::read_to_string(self.env_path(name)).ok()?;
+        let prefix = format!("{}=", key);
         for line in content.lines() {
-            if let Some(value) = line.strip_prefix("SERVICE_TYPE=") {
+            if let Some(value) = line.strip_prefix(&prefix) {
                 let value = value.trim();
                 if !value.is_empty() {
                     return Some(value.to_string());
@@ -1568,6 +1699,28 @@ fn docker_command() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_valid_master_key_trims_and_rejects_malformed() {
+        let key = "a".repeat(64);
+        assert_eq!(valid_master_key(&format!("{}\n", key)).unwrap(), key);
+        assert!(valid_master_key("deadbeef").is_err());
+        assert!(valid_master_key(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn test_is_ironclaw_accepts_either_signal() {
+        assert!(is_ironclaw(Some("ironclaw"), None));
+        assert!(is_ironclaw(
+            Some("openclaw"),
+            Some("nearaidev/ironclaw-nearai-worker@sha256:abc")
+        ));
+        assert!(!is_ironclaw(
+            Some("openclaw"),
+            Some("nearaidev/openclaw-nearai-worker:latest")
+        ));
+        assert!(!is_ironclaw(None, None));
+    }
 
     #[test]
     fn test_build_backup_script_paths_embed_backup_id_and_pid() {
