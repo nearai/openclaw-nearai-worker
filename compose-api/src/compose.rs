@@ -1234,31 +1234,34 @@ impl ComposeManager {
 
         // ironclaw generates SECRETS_MASTER_KEY at runtime (entrypoint.sh writes it to
         // .master_key on disk). It's not in Config.Env, so read it from the container.
-        // Gate on the image as well as service_type: instances exist whose stored
-        // SERVICE_TYPE says openclaw while they run an ironclaw image, and those do have
-        // a key. Discover stays at one exec per container; get_instance retries the rest.
-        if is_ironclaw(service_type.as_deref(), Some(image_from_config))
-            && !extra.contains_key("SECRETS_MASTER_KEY")
+        // Deliberately still one exec for one service_type: discovery walks every
+        // container on the node and its duration is bounded by the updater's health
+        // gate. Instances the label misses are resolved by GET /instances/{name},
+        // which every migration calls first.
+        if service_type.as_deref() == Some("ironclaw") && !extra.contains_key("SECRETS_MASTER_KEY")
         {
-            if service_type.as_deref() != Some("ironclaw") {
+            if self
+                .read_master_key_from_container(name, container_name)
+                .map(|key| extra.insert("SECRETS_MASTER_KEY".to_string(), key))
+                .is_none()
+            {
                 tracing::info!(
-                    "Instance '{}': reading the master key on the image signal ({})",
+                    "Instance '{}': no SECRETS_MASTER_KEY at discovery ({})",
                     name,
                     type_signals(service_type.as_deref(), Some(image_from_config))
                 );
             }
-            match self.read_master_key_from_container(name, container_name) {
-                Some(key) => {
-                    extra.insert("SECRETS_MASTER_KEY".to_string(), key);
-                }
-                None => tracing::info!(
-                    "Instance '{}': no SECRETS_MASTER_KEY at discovery ({}); \
-                     GET /instances/{} will try the rest of the chain",
-                    name,
-                    type_signals(service_type.as_deref(), Some(image_from_config)),
-                    name
-                ),
-            }
+        } else if is_ironclaw(service_type.as_deref(), Some(image_from_config))
+            && !extra.contains_key("SECRETS_MASTER_KEY")
+        {
+            // The label and the image disagree — the roster this prints is what the
+            // last investigation needed a log export to reconstruct.
+            tracing::info!(
+                "Instance '{}': master key deferred to GET /instances/{} ({})",
+                name,
+                name,
+                type_signals(service_type.as_deref(), Some(image_from_config))
+            );
         }
 
         let extra_env = if extra.is_empty() { None } else { Some(extra) };
