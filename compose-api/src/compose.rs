@@ -71,6 +71,27 @@ pub fn is_ironclaw(service_type: Option<&str>, image: Option<&str>) -> bool {
     service_type == Some("ironclaw") || image.is_some_and(|i| i.contains("ironclaw"))
 }
 
+/// Both type signals and whether they agree, as one phrase — a master-key log line
+/// has to be readable without cross-referencing the instance anywhere else.
+pub fn type_signals(service_type: Option<&str>, image: Option<&str>) -> String {
+    let image_says = match image {
+        Some(i) if i.contains("ironclaw") => "ironclaw",
+        Some(i) if i.contains("openclaw") => "openclaw",
+        Some(_) => "unrecognized",
+        None => "none",
+    };
+    let stored = service_type.unwrap_or("none");
+    let verdict = if stored == image_says {
+        "agree"
+    } else {
+        "disagree"
+    };
+    format!(
+        "service_type={} image_says={} ({})",
+        stored, image_says, verdict
+    )
+}
+
 /// A master key is 64 hex chars (32 bytes). Anything else is a miss with a reason.
 fn valid_master_key(raw: &str) -> Result<String, String> {
     let key = raw.trim();
@@ -1219,8 +1240,24 @@ impl ComposeManager {
         if is_ironclaw(service_type.as_deref(), Some(image_from_config))
             && !extra.contains_key("SECRETS_MASTER_KEY")
         {
-            if let Some(key) = self.read_master_key_from_container(name, container_name) {
-                extra.insert("SECRETS_MASTER_KEY".to_string(), key);
+            if service_type.as_deref() != Some("ironclaw") {
+                tracing::info!(
+                    "Instance '{}': reading the master key on the image signal ({})",
+                    name,
+                    type_signals(service_type.as_deref(), Some(image_from_config))
+                );
+            }
+            match self.read_master_key_from_container(name, container_name) {
+                Some(key) => {
+                    extra.insert("SECRETS_MASTER_KEY".to_string(), key);
+                }
+                None => tracing::info!(
+                    "Instance '{}': no SECRETS_MASTER_KEY at discovery ({}); \
+                     GET /instances/{} will try the rest of the chain",
+                    name,
+                    type_signals(service_type.as_deref(), Some(image_from_config)),
+                    name
+                ),
             }
         }
 
@@ -1279,8 +1316,15 @@ impl ComposeManager {
         &self,
         name: &str,
         container_name: &str,
+        service_type: Option<&str>,
         image: Option<&str>,
     ) -> Option<String> {
+        let signals = type_signals(service_type, image);
+        tracing::info!(
+            "Instance '{}': resolving SECRETS_MASTER_KEY ({})",
+            name,
+            signals
+        );
         let mut missed: Vec<String> = Vec::new();
         for source in [
             MasterKeySource::EnvFile,
@@ -1290,14 +1334,16 @@ impl ComposeManager {
             match self.read_master_key(source, name, container_name) {
                 Ok(key) => {
                     tracing::info!(
-                        "Instance '{}': SECRETS_MASTER_KEY resolved from {}",
+                        "Instance '{}': SECRETS_MASTER_KEY resolved from {} ({}); missed before it: {}",
                         name,
-                        source.label()
+                        source.label(),
+                        signals,
+                        if missed.is_empty() { "none".to_string() } else { missed.join("; ") }
                     );
                     return Some(key);
                 }
                 Err(reason) => {
-                    tracing::debug!(
+                    tracing::info!(
                         "Instance '{}': {} did not yield SECRETS_MASTER_KEY ({})",
                         name,
                         source.label(),
@@ -1308,10 +1354,11 @@ impl ComposeManager {
             }
         }
         tracing::warn!(
-            "Instance '{}': no SECRETS_MASTER_KEY anywhere (image={}); tried {}. \
+            "Instance '{}': no SECRETS_MASTER_KEY anywhere ({}, image_ref={}); tried {}. \
              Expected when the instance runs openclaw, which has no ironclaw key.",
             name,
-            image.unwrap_or("unknown"),
+            signals,
+            image.unwrap_or("none"),
             missed.join("; ")
         );
         None
@@ -1706,6 +1753,24 @@ mod tests {
         assert_eq!(valid_master_key(&format!("{}\n", key)).unwrap(), key);
         assert!(valid_master_key("deadbeef").is_err());
         assert!(valid_master_key(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn test_type_signals_names_both_sides_and_the_verdict() {
+        assert_eq!(
+            type_signals(
+                Some("ironclaw"),
+                Some("nearaidev/ironclaw-nearai-worker:1.2.0")
+            ),
+            "service_type=ironclaw image_says=ironclaw (agree)"
+        );
+        assert_eq!(
+            type_signals(
+                Some("openclaw"),
+                Some("nearaidev/ironclaw-nearai-worker@sha256:abc")
+            ),
+            "service_type=openclaw image_says=ironclaw (disagree)"
+        );
     }
 
     #[test]
