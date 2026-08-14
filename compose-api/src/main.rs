@@ -3376,8 +3376,8 @@ async fn run_container_backup(
     params(("name" = String, Path, description = "Instance name")),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "List of available backups", body = BackupListResponse),
-        (status = 404, description = "Instance not found", body = ErrorResponse),
+        (status = 200, description = "List of available backups; empty when the instance has none", body = BackupListResponse),
+        (status = 500, description = "Backup storage unreachable", body = ErrorResponse),
         (status = 501, description = "Backups not configured", body = ErrorResponse),
     )
 )]
@@ -3417,7 +3417,8 @@ async fn list_backups_endpoint(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Presigned download URL", body = BackupDownloadResponse),
-        (status = 404, description = "Instance not found", body = ErrorResponse),
+        (status = 404, description = "Backup not found", body = ErrorResponse),
+        (status = 500, description = "Backup storage unreachable", body = ErrorResponse),
         (status = 501, description = "Backups not configured", body = ErrorResponse),
     )
 )]
@@ -3434,7 +3435,7 @@ async fn download_backup_endpoint(
     // Presign by name + id rather than by container state, so a stopped or already-migrated
     // instance can still be restored from. Existence is checked against S3 (head_object) instead
     // of the in-memory store, which only holds instances discovered running.
-    if backup_mgr.object_size(&name, &id).await.is_err() {
+    if !backup_mgr.object_exists(&name, &id).await? {
         return Err(ApiError::NotFound(format!(
             "Backup '{}' for instance '{}' not found",
             id, name
