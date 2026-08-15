@@ -3,7 +3,6 @@ name: Test
 on:
   pull_request:
     paths:
-      - ".github/workflows/code-format.yml"
       - ".github/workflows/test.yml"
       - "compose-api/**"
       - "oauth-service/**"
@@ -14,8 +13,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  NO_PROXY: 127.0.0.1,localhost
-  no_proxy: 127.0.0.1,localhost
 
 jobs:
   rust:
@@ -39,4 +36,4 @@ jobs:
 
       - name: Run tests
         working-directory: ${{ matrix.path }}
-        run: cargo test --all-features
+        run: cargo +stable test --all-features --locked

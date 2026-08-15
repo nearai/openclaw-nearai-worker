@@ -4,7 +4,6 @@ on:
   pull_request:
     paths:
       - ".github/workflows/code-format.yml"
-      - ".github/workflows/test.yml"
       - "compose-api/**"
       - "oauth-service/**"
   workflow_dispatch:
@@ -37,4 +36,4 @@ jobs:
 
       - name: Check formatting
         working-directory: ${{ matrix.path }}
-        run: cargo fmt --all -- --check
+        run: cargo +stable fmt --all -- --check
