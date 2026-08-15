@@ -3230,7 +3230,7 @@ async fn create_backup_endpoint(
     let age_recipient = req.age_recipient;
     let expiry_secs = req.expiry_secs;
     if let Some(secs) = expiry_secs {
-        if secs < 1 || secs > 604800 {
+        if !(1..=604800).contains(&secs) {
             return Err(ApiError::BadRequest(
                 "expiry_secs must be between 1 and 604800 (S3 presigned URL limit)".into(),
             ));

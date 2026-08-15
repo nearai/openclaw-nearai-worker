@@ -9,6 +9,7 @@ node_modules/
 
 # Rust build artifacts
 compose-api/target/
+oauth-service/target/
 
 # Runtime data
 compose-api/data/
