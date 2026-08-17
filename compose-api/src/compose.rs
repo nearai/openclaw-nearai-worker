@@ -279,31 +279,31 @@ impl ComposeManager {
                 self.service_type_named_by_image(env_map.get("OPENCLAW_IMAGE").map(String::as_str))
             });
 
-        match named {
-            Some(named) => {
-                if let Some(stale) = recorded.as_deref().filter(|r| *r != named) {
-                    tracing::warn!(
-                        "Instance '{}': recorded service_type '{}' disagrees with the running \
-                         image '{}'; using '{}' from the image",
-                        name,
-                        stale,
-                        image_from_config,
-                        named
-                    );
-                }
-                Some(named.to_string())
-            }
-            None => recorded.or_else(|| {
-                let inferred = self.infer_service_type_from_image(Some(image_from_config));
-                tracing::info!(
-                    "Instance '{}': no SERVICE_TYPE in label/env/.env, inferring '{}' from image '{}'",
+        if let Some(named) = named {
+            if let Some(stale) = recorded.as_deref().filter(|r| *r != named) {
+                tracing::warn!(
+                    "Instance '{}': recorded service_type '{}' disagrees with the running \
+                     image '{}'; using '{}' from the image",
                     name,
-                    inferred,
-                    image_from_config
+                    stale,
+                    image_from_config,
+                    named
                 );
-                Some(inferred.to_string())
-            }),
+            }
+            return Some(named.to_string());
         }
+
+        // The image names no product — a container created from a bare image id.
+        recorded.or_else(|| {
+            let inferred = self.infer_service_type_from_image(Some(image_from_config));
+            tracing::info!(
+                "Instance '{}': no SERVICE_TYPE in label/env/.env, inferring '{}' from image '{}'",
+                name,
+                inferred,
+                image_from_config
+            );
+            Some(inferred.to_string())
+        })
     }
 
     /// Resolve the compose file for a given service type, falling back to openclaw.

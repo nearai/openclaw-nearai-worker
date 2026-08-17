@@ -2818,15 +2818,14 @@ async fn patch_instance(
                     k
                 )));
             }
-            match v {
-                Some(v) => {
-                    reject_newlines("extra_env value", &v)?;
-                    extra.insert(k, v);
-                }
-                None => {
-                    extra.remove(&k);
-                }
+            if let Some(v) = v {
+                reject_newlines("extra_env value", &v)?;
+                extra.insert(k, v);
+                continue;
             }
+
+            // null removes the key
+            extra.remove(&k);
         }
         updated.extra_env = (!extra.is_empty()).then_some(extra);
     }
