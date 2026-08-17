@@ -40,6 +40,14 @@ const SYSTEM_ENV_KEYS: &[&str] = &[
     "PATH", "HOME", "HOSTNAME", "LANG", "LC_ALL", "TERM", "SHLVL", "PWD", "OLDPWD", "USER", "SHELL",
 ];
 
+/// Env keys compose-api owns: the ones it writes itself, plus the master key it resolves
+/// from the container. `ensure_env_file` applies `extra_env` after everything else, so an
+/// extra_env entry for one of these silently replaces the managed value — which is why
+/// callers accepting an extra_env patch must refuse them.
+pub fn is_managed_env_key(key: &str) -> bool {
+    CORE_ENV_KEYS.contains(&key) || SYSTEM_ENV_KEYS.contains(&key) || key == "SECRETS_MASTER_KEY"
+}
+
 /// Where ironclaw's entrypoint persists the secrets master key, on the config volume.
 const MASTER_KEY_PATH: &str = "/home/agent/.ironclaw/.master_key";
 

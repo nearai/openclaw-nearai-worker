@@ -2711,6 +2711,16 @@ async fn delete_instance(
 /// volumes are left exactly as they are. Use it to repair an instance whose recorded
 /// service_type or image is wrong — restoring the *contents* of a volume is a backup
 /// concern and stays separate.
+///
+/// Deliberately absent: `ssh_pubkey`, `nearai_api_key` and `nearai_api_url`. Those decide
+/// who gets a shell in the container and where it sends the tenant's traffic, so setting
+/// them is granting access rather than repairing a record, and nothing about a drifted
+/// service_type needs them. There is no other route to change them on a live instance
+/// today, and this should not become the first one.
+///
+/// Also absent: `mem_limit`, `cpus` and `storage_size`. `ensure_env_file` does not write
+/// those — only `up()` does — so accepting them here would update the in-memory instance
+/// and never reach the .env, which is a silent no-op rather than a limit change.
 #[derive(Deserialize, utoipa::ToSchema)]
 struct PatchInstanceRequest {
     /// "openclaw" or "ironclaw".
@@ -2719,19 +2729,9 @@ struct PatchInstanceRequest {
     /// Full digest reference, e.g. `nearaidev/ironclaw-nearai-worker@sha256:46c3…`.
     #[serde(default)]
     image: Option<String>,
-    #[serde(default)]
-    nearai_api_url: Option<String>,
-    #[serde(default)]
-    nearai_api_key: Option<String>,
-    #[serde(default)]
-    ssh_pubkey: Option<String>,
-    #[serde(default)]
-    mem_limit: Option<String>,
-    #[serde(default)]
-    cpus: Option<String>,
-    #[serde(default)]
-    storage_size: Option<String>,
-    /// Merged into the existing extra_env. A null value removes that key.
+    /// Merged into the existing extra_env. A null value removes that key. Keys compose-api
+    /// manages itself are rejected — extra_env is applied last when the .env is written, so
+    /// allowing them here would let this set SSH_PUBKEY or NEARAI_API_URL by another route.
     #[serde(default)]
     extra_env: Option<HashMap<String, Option<String>>>,
     /// Recreate the container so the new .env takes effect. Named volumes are kept.
@@ -2807,40 +2807,17 @@ async fn patch_instance(
         }
     }
 
-    for (field, value) in [
-        ("nearai_api_url", &req.nearai_api_url),
-        ("nearai_api_key", &req.nearai_api_key),
-        ("ssh_pubkey", &req.ssh_pubkey),
-        ("mem_limit", &req.mem_limit),
-        ("cpus", &req.cpus),
-        ("storage_size", &req.storage_size),
-    ] {
-        if let Some(v) = value {
-            reject_newlines(field, v)?;
-        }
-    }
-    if let Some(url) = req.nearai_api_url {
-        updated.nearai_api_url = Some(url);
-    }
-    if let Some(key) = req.nearai_api_key {
-        updated.nearai_api_key = key;
-    }
-    if let Some(pubkey) = req.ssh_pubkey {
-        updated.ssh_pubkey = pubkey;
-    }
-    if let Some(mem) = req.mem_limit {
-        updated.mem_limit = Some(mem);
-    }
-    if let Some(cpus) = req.cpus {
-        updated.cpus = Some(cpus);
-    }
-    if let Some(storage) = req.storage_size {
-        updated.storage_size = Some(storage);
-    }
     if let Some(patch) = req.extra_env {
         let mut extra = updated.extra_env.unwrap_or_default();
         for (k, v) in patch {
             reject_newlines("extra_env key", &k)?;
+            if compose::is_managed_env_key(&k) {
+                return Err(ApiError::BadRequest(format!(
+                    "extra_env may not set '{}': compose-api manages it, and extra_env is \
+                     applied last when the .env is written",
+                    k
+                )));
+            }
             match v {
                 Some(v) => {
                     reject_newlines("extra_env value", &v)?;
@@ -6976,6 +6953,54 @@ exit 1
             written
         );
         assert!(!written.contains("GONE="), "{}", written);
+    }
+
+    /// Access-granting fields are not part of this endpoint. Serde ignores unknown fields,
+    /// so sending them is accepted but must leave the .env untouched — a caller cannot
+    /// re-key an instance or repoint its traffic through here.
+    #[tokio::test]
+    async fn test_patch_instance_ignores_access_granting_fields() {
+        let (status, body, env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "openclaw",
+            "ssh_pubkey": "ssh-ed25519 AAAAattacker",
+            "nearai_api_key": "sk-attacker",
+            "nearai_api_url": "https://exfil.example/v1",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let written = std::fs::read_to_string(env_dir.path().join("tracked-inst.env")).unwrap();
+        assert!(written.contains("SERVICE_TYPE=openclaw"), "{}", written);
+        assert!(!written.contains("AAAAattacker"), "{}", written);
+        assert!(!written.contains("sk-attacker"), "{}", written);
+        assert!(!written.contains("exfil.example"), "{}", written);
+    }
+
+    /// extra_env is written last, so it would otherwise reach the same fields by another
+    /// route — including the master key that decrypts the tenant's secrets.
+    #[tokio::test]
+    async fn test_patch_instance_rejects_extra_env_for_managed_keys() {
+        for key in [
+            "SSH_PUBKEY",
+            "NEARAI_API_URL",
+            "OPENCLAW_IMAGE",
+            "SERVICE_TYPE",
+            "SECRETS_MASTER_KEY",
+            "PATH",
+        ] {
+            let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+                "extra_env": { key: "attacker-value" },
+            }))
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{} was accepted: {}",
+                key,
+                body
+            );
+            assert!(body.contains("compose-api manages it"), "{}", body);
+        }
     }
 
     #[tokio::test]
