@@ -3447,8 +3447,8 @@ async fn run_container_backup(
     params(("name" = String, Path, description = "Instance name")),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "List of available backups", body = BackupListResponse),
-        (status = 404, description = "Instance not found", body = ErrorResponse),
+        (status = 200, description = "List of available backups; empty when the instance has none", body = BackupListResponse),
+        (status = 500, description = "Backup storage unreachable", body = ErrorResponse),
         (status = 501, description = "Backups not configured", body = ErrorResponse),
     )
 )]
@@ -3462,13 +3462,10 @@ async fn list_backups_endpoint(
         .as_ref()
         .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?;
 
-    {
-        let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
-    }
-
+    // Backups are keyed in S3 by instance name alone, so listing them needs no container: the
+    // store only holds instances discovered running, and a migrated instance is stopped, which
+    // made its archives unlistable exactly when an operator needs them. An unknown name simply
+    // yields an empty list — the S3 prefix matches nothing.
     let backups = backup_mgr.list_backups(&name).await?;
 
     let items: Vec<BackupInfoResponse> = backups
@@ -3491,7 +3488,8 @@ async fn list_backups_endpoint(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Presigned download URL", body = BackupDownloadResponse),
-        (status = 404, description = "Instance not found", body = ErrorResponse),
+        (status = 404, description = "Backup not found", body = ErrorResponse),
+        (status = 500, description = "Backup storage unreachable", body = ErrorResponse),
         (status = 501, description = "Backups not configured", body = ErrorResponse),
     )
 )]
@@ -3505,11 +3503,14 @@ async fn download_backup_endpoint(
         .as_ref()
         .ok_or_else(|| ApiError::NotImplemented("Backup not configured".into()))?;
 
-    {
-        let store = state.store.read().await;
-        if store.get(&name).is_none() {
-            return Err(ApiError::NotFound(format!("Instance '{}' not found", name)));
-        }
+    // Presign by name + id rather than by container state, so a stopped or already-migrated
+    // instance can still be restored from. Existence is checked against S3 (head_object) instead
+    // of the in-memory store, which only holds instances discovered running.
+    if !backup_mgr.object_exists(&name, &id).await? {
+        return Err(ApiError::NotFound(format!(
+            "Backup '{}' for instance '{}' not found",
+            id, name
+        )));
     }
 
     let url = backup_mgr.download_url(&name, &id, None).await?;

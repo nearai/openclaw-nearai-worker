@@ -102,6 +102,30 @@ impl BackupManager {
         Ok(head.content_length().unwrap_or(0))
     }
 
+    /// Whether the archive exists. A missing object is `Ok(false)`; every other S3 failure —
+    /// outage, auth, throttling — propagates as an error, so a caller can 404 a genuinely absent
+    /// backup without masking an operational incident as "not found".
+    pub async fn object_exists(&self, instance_name: &str, backup_id: &str) -> Result<bool, ApiError> {
+        let key = backup_s3_key(instance_name, backup_id);
+
+        match self
+            .s3
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.as_service_error().is_some_and(|svc| svc.is_not_found()) {
+                    return Ok(false);
+                }
+                Err(ApiError::Internal(format!("S3 head_object failed: {}", e)))
+            }
+        }
+    }
+
     /// List available backups for an instance.
     pub async fn list_backups(&self, instance_name: &str) -> Result<Vec<BackupInfo>, ApiError> {
         let prefix = format!("backups/{}/", instance_name);
