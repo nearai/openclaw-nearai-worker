@@ -1989,6 +1989,16 @@ pub fn is_valid_instance_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// Whether a string is safe to use as a key in the `.env`. The file is written as
+/// `KEY=value` and parsed back with a trim and `split_once('=')`, so any key containing
+/// '=' or surrounding whitespace would come back as a different key than the one that was
+/// checked. Restricting to a conventional env name rules that out.
+fn is_valid_env_key(key: &str) -> bool {
+    !key.is_empty()
+        && !key.starts_with(|c: char| c.is_ascii_digit())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn reject_newlines(field: &str, value: &str) -> Result<(), ApiError> {
     if value.contains('\n') || value.contains('\r') {
         return Err(ApiError::BadRequest(format!(
@@ -2809,7 +2819,17 @@ async fn patch_instance(
     if let Some(patch) = req.extra_env {
         let mut extra = updated.extra_env.unwrap_or_default();
         for (k, v) in patch {
-            reject_newlines("extra_env key", &k)?;
+            // The .env is written as `KEY=value` and read back with a trim plus
+            // `split_once('=')`, so a key carrying '=' or leading space parses as a
+            // different, shorter key — `SSH_PUBKEY=x` would set SSH_PUBKEY and walk
+            // straight past the managed-key check below. Only accept a plain env name.
+            if !is_valid_env_key(&k) {
+                return Err(ApiError::BadRequest(format!(
+                    "extra_env key '{}' is not a valid environment variable name \
+                     (letters, digits and underscore; must not start with a digit)",
+                    k
+                )));
+            }
             if compose::is_managed_env_key(&k) {
                 return Err(ApiError::BadRequest(format!(
                     "extra_env may not set '{}': compose-api manages it, and extra_env is \
@@ -2859,11 +2879,20 @@ async fn patch_instance(
         store.add(updated.clone());
     }
 
+    // Recreate with the type `ensure_env_file` just settled on, not the one the store
+    // happened to hold: it resolves an unset service_type from the image, and picking the
+    // compose template from the stale value would mount an ironclaw instance through the
+    // openclaw template — the wrong paths for its data.
+    let recreate_type = state
+        .compose
+        .read_service_type_from_env_file(&name)
+        .or(service_type);
+
     // Discovery rebuilds every instance from its container on each compose-api start and
     // rewrites the .env from that, so a change written to the .env alone lasts only until
     // then. Recreating is what makes the patch stick.
     state
-        .compose_start(&name, true, service_type.as_deref())
+        .compose_start(&name, true, recreate_type.as_deref())
         .await?;
 
     tracing::info!(
@@ -6609,6 +6638,10 @@ mod tests {
         token: String,
         env_dir: tempfile::TempDir,
         orphan_cleaning: Arc<Mutex<HashSet<String>>>,
+        /// Distinct from the openclaw template, so which one a recreate used is visible
+        /// in the recorded docker argv.
+        ironclaw_compose: std::path::PathBuf,
+        _compose_dir: tempfile::TempDir,
     }
 
     fn write_fake_docker(volume_names: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -6725,18 +6758,8 @@ exit 1
         (dir, log_path)
     }
 
-    fn test_admin_app() -> TestAdminApp {
-        let config = AppConfig::test_default();
-        let admin_token = "a".repeat(32);
-        let env_dir = tempfile::tempdir().unwrap();
-
-        let mut compose_files = std::collections::HashMap::new();
-        compose_files.insert("openclaw".to_string(), config.compose_file.clone());
-        let compose = Arc::new(
-            ComposeManager::new(compose_files, env_dir.path().to_path_buf(), None).unwrap(),
-        );
-
-        let instance = Instance {
+    fn default_test_instance() -> Instance {
+        Instance {
             name: "tracked-inst".to_string(),
             token: "test-token".to_string(),
             gateway_port: 19001,
@@ -6753,8 +6776,38 @@ exit 1
             cpus: None,
             storage_size: None,
             extra_env: None,
-        };
+        }
+    }
 
+    fn test_admin_app() -> TestAdminApp {
+        test_admin_app_with(test_instance_named("tracked-inst", Some("openclaw")))
+    }
+
+    /// An instance with only the fields these tests care about set.
+    fn test_instance_named(name: &str, service_type: Option<&str>) -> Instance {
+        let mut inst = default_test_instance();
+        inst.name = name.to_string();
+        inst.service_type = service_type.map(str::to_string);
+        inst
+    }
+
+    fn test_admin_app_with(instance: Instance) -> TestAdminApp {
+        let config = AppConfig::test_default();
+        let admin_token = "a".repeat(32);
+        let env_dir = tempfile::tempdir().unwrap();
+
+        // A distinct ironclaw template, so picking the wrong one is observable.
+        let compose_dir = tempfile::tempdir().unwrap();
+        let ironclaw_compose = compose_dir.path().join("docker-compose.ironclaw.yml");
+        std::fs::write(&ironclaw_compose, "services: {}\n").unwrap();
+        let mut compose_files = std::collections::HashMap::new();
+        compose_files.insert("openclaw".to_string(), config.compose_file.clone());
+        compose_files.insert("ironclaw".to_string(), ironclaw_compose.clone());
+        let compose = Arc::new(
+            ComposeManager::new(compose_files, env_dir.path().to_path_buf(), None).unwrap(),
+        );
+
+        let instance = instance;
         let mut instance_store = store::InstanceStore::new(PortRange::from_env());
         instance_store.populate(vec![instance]);
 
@@ -6783,6 +6836,8 @@ exit 1
             token: admin_token,
             env_dir,
             orphan_cleaning,
+            ironclaw_compose,
+            _compose_dir: compose_dir,
         }
     }
 
@@ -6867,7 +6922,12 @@ exit 1
     fn write_accepting_docker() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("docker");
-        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let log_path = dir.path().join("argv.log");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log_path.display()),
+        )
+        .unwrap();
         let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&script_path, perms).unwrap();
@@ -7015,6 +7075,91 @@ exit 1
             );
             assert!(body.contains("compose-api manages it"), "{}", body);
         }
+    }
+
+    /// The .env round-trips through a trim and `split_once('=')`, so a key carrying '='
+    /// or leading space would be checked under one name and written under another —
+    /// setting a managed key without ever failing `is_managed_env_key`.
+    #[tokio::test]
+    async fn test_patch_instance_rejects_env_keys_that_reparse_as_another_key() {
+        for key in [
+            "SSH_PUBKEY=ssh-ed25519 AAAAevil",
+            " SSH_PUBKEY",
+            "SSH_PUBKEY ",
+            "FOO=BAR",
+            "",
+            "1LEADING_DIGIT",
+            "has-dash",
+        ] {
+            let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+                "extra_env": { key: "x" },
+            }))
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "key {:?} was accepted: {}",
+                key,
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_valid_env_key_accepts_only_plain_names() {
+        assert!(is_valid_env_key("LLM_BASE_URL"));
+        assert!(is_valid_env_key("_private"));
+        assert!(is_valid_env_key("A1"));
+        assert!(!is_valid_env_key("SSH_PUBKEY=x"));
+        assert!(!is_valid_env_key(" SSH_PUBKEY"));
+        assert!(!is_valid_env_key("SSH PUBKEY"));
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("1BAD"));
+    }
+
+    /// The compose template is chosen from the type the .env ended up with. When the store
+    /// has no service_type but the image names ironclaw, the recreate must not fall back to
+    /// the openclaw template — that mounts the instance's volumes at the wrong paths.
+    #[tokio::test]
+    async fn test_patch_instance_recreates_with_the_type_written_to_the_env_file() {
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+
+        let _lock = orphan_test_env_lock().lock().await;
+        let docker_dir = write_accepting_docker();
+        let _docker_guard = EnvVarGuard::set_path(
+            "OPENCLAW_TEST_DOCKER_BIN",
+            docker_dir.path().join("docker").as_path(),
+        );
+
+        let test_app = test_admin_app_with(test_instance_named("typeless-inst", None));
+        let request = axum::http::Request::builder()
+            .method("PATCH")
+            .uri("/instances/typeless-inst")
+            .header("Authorization", format!("Bearer {}", test_app.token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "image": "nearaidev/ironclaw-nearai-worker@sha256:46c302d3" })
+                    .to_string(),
+            ))
+            .unwrap();
+
+        let response = test_app.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert_eq!(status, StatusCode::OK, "{}", body);
+
+        let written =
+            std::fs::read_to_string(test_app.env_dir.path().join("typeless-inst.env")).unwrap();
+        assert!(written.contains("SERVICE_TYPE=ironclaw"), "{}", written);
+
+        let argv = std::fs::read_to_string(docker_dir.path().join("argv.log")).unwrap_or_default();
+        assert!(
+            argv.contains(test_app.ironclaw_compose.to_str().unwrap()),
+            "recreate did not use the ironclaw template; docker argv was:\n{}",
+            argv
+        );
     }
 
     #[tokio::test]
