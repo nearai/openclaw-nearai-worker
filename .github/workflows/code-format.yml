@@ -1,0 +1,39 @@
+name: Code Format
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/code-format.yml"
+      - "compose-api/**"
+      - "oauth-service/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rustfmt:
+    name: ${{ matrix.package }} format
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: openclaw-compose-api
+            path: compose-api
+          - package: ironclaw-oauth-service
+            path: oauth-service
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Check formatting
+        working-directory: ${{ matrix.path }}
+        run: cargo +stable fmt --all -- --check
