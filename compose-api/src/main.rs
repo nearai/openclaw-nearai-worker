@@ -6807,7 +6807,6 @@ exit 1
             ComposeManager::new(compose_files, env_dir.path().to_path_buf(), None).unwrap(),
         );
 
-        let instance = instance;
         let mut instance_store = store::InstanceStore::new(PortRange::from_env());
         instance_store.populate(vec![instance]);
 
