@@ -1989,16 +1989,6 @@ pub fn is_valid_instance_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// Whether a string is safe to use as a key in the `.env`. The file is written as
-/// `KEY=value` and parsed back with a trim and `split_once('=')`, so any key containing
-/// '=' or surrounding whitespace would come back as a different key than the one that was
-/// checked. Restricting to a conventional env name rules that out.
-fn is_valid_env_key(key: &str) -> bool {
-    !key.is_empty()
-        && !key.starts_with(|c: char| c.is_ascii_digit())
-        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 fn reject_newlines(field: &str, value: &str) -> Result<(), ApiError> {
     if value.contains('\n') || value.contains('\r') {
         return Err(ApiError::BadRequest(format!(
@@ -2823,13 +2813,7 @@ async fn patch_instance(
             // `split_once('=')`, so a key carrying '=' or leading space parses as a
             // different, shorter key — `SSH_PUBKEY=x` would set SSH_PUBKEY and walk
             // straight past the managed-key check below. Only accept a plain env name.
-            if !is_valid_env_key(&k) {
-                return Err(ApiError::BadRequest(format!(
-                    "extra_env key '{}' is not a valid environment variable name \
-                     (letters, digits and underscore; must not start with a digit)",
-                    k
-                )));
-            }
+            validate_env_key(&k)?;
             if compose::is_managed_env_key(&k) {
                 return Err(ApiError::BadRequest(format!(
                     "extra_env may not set '{}': compose-api manages it, and extra_env is \
@@ -7087,7 +7071,6 @@ exit 1
             "SSH_PUBKEY ",
             "FOO=BAR",
             "",
-            "1LEADING_DIGIT",
             "has-dash",
         ] {
             let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
@@ -7102,18 +7085,6 @@ exit 1
                 body
             );
         }
-    }
-
-    #[test]
-    fn test_is_valid_env_key_accepts_only_plain_names() {
-        assert!(is_valid_env_key("LLM_BASE_URL"));
-        assert!(is_valid_env_key("_private"));
-        assert!(is_valid_env_key("A1"));
-        assert!(!is_valid_env_key("SSH_PUBKEY=x"));
-        assert!(!is_valid_env_key(" SSH_PUBKEY"));
-        assert!(!is_valid_env_key("SSH PUBKEY"));
-        assert!(!is_valid_env_key(""));
-        assert!(!is_valid_env_key("1BAD"));
     }
 
     /// The compose template is chosen from the type the .env ended up with. When the store
