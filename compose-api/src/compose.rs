@@ -215,21 +215,86 @@ impl ComposeManager {
     /// Infer service type from image name: "ironclaw" if image contains "ironclaw", otherwise
     /// "openclaw". Does not depend on which compose files are currently loaded.
     pub fn infer_service_type_from_image(&self, image: Option<&str>) -> &'static str {
-        self.service_type_named_by_image(image)
-            .unwrap_or("openclaw")
+        if image.unwrap_or("").to_lowercase().contains("ironclaw") {
+            "ironclaw"
+        } else {
+            "openclaw"
+        }
     }
 
-    /// Service type the image name states outright, or `None` when it names neither product.
-    /// Unlike [`Self::infer_service_type_from_image`] this never guesses, so callers can use it
-    /// as evidence rather than as a default.
+    /// Service type the image name states outright, or `None` when it names neither product —
+    /// or, ambiguously, both. Unlike [`Self::infer_service_type_from_image`] this never guesses,
+    /// so callers can use it as evidence rather than as a default.
     pub fn service_type_named_by_image(&self, image: Option<&str>) -> Option<&'static str> {
         let img_lower = image.unwrap_or("").to_lowercase();
-        if img_lower.contains("ironclaw") {
-            Some("ironclaw")
-        } else if img_lower.contains("openclaw") {
-            Some("openclaw")
-        } else {
-            None
+        match (
+            img_lower.contains("ironclaw"),
+            img_lower.contains("openclaw"),
+        ) {
+            (true, false) => Some("ironclaw"),
+            (false, true) => Some("openclaw"),
+            _ => None,
+        }
+    }
+
+    /// Decide an instance's service_type from the signals its container carries.
+    ///
+    /// The image decides whenever it names a product, because it is what the container is
+    /// actually running, and service_type only exists to pick the matching compose template
+    /// and binary. The label, the container env and the .env file are all copies of an
+    /// earlier resolution — a "openclaw" recorded against an ironclaw container is exactly
+    /// what `ensure_env_file` turns into an image rewrite, so none of them may outrank the
+    /// image. A container created from a bare image id names no product; there the recorded
+    /// values are used, in their original order.
+    fn resolve_service_type(
+        &self,
+        name: &str,
+        label: Option<&str>,
+        env_map: &HashMap<String, String>,
+        image_from_config: &str,
+    ) -> Option<String> {
+        let recorded = label
+            .map(|s| s.to_string())
+            .or_else(|| {
+                env_map
+                    .get("SERVICE_TYPE")
+                    .cloned()
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| self.read_service_type_from_env_file(name));
+
+        // `.Config.Image` echoes whatever the container was created from, so it is the direct
+        // evidence; OPENCLAW_IMAGE covers the case where that was a bare image id.
+        let named = self
+            .service_type_named_by_image(Some(image_from_config))
+            .or_else(|| {
+                self.service_type_named_by_image(env_map.get("OPENCLAW_IMAGE").map(String::as_str))
+            });
+
+        match named {
+            Some(named) => {
+                if let Some(stale) = recorded.as_deref().filter(|r| *r != named) {
+                    tracing::warn!(
+                        "Instance '{}': recorded service_type '{}' disagrees with the running \
+                         image '{}'; using '{}' from the image",
+                        name,
+                        stale,
+                        image_from_config,
+                        named
+                    );
+                }
+                Some(named.to_string())
+            }
+            None => recorded.or_else(|| {
+                let inferred = self.infer_service_type_from_image(Some(image_from_config));
+                tracing::info!(
+                    "Instance '{}': no SERVICE_TYPE in label/env/.env, inferring '{}' from image '{}'",
+                    name,
+                    inferred,
+                    image_from_config
+                );
+                Some(inferred.to_string())
+            }),
         }
     }
 
@@ -1161,54 +1226,16 @@ impl ComposeManager {
             .cloned()
             .filter(|s| !s.is_empty());
         let image_env = env_map.get("OPENCLAW_IMAGE").cloned();
-        // Resolve service_type: label → container env → image name → persisted .env file →
-        // infer from image. The label and the container env are recorded on this container, so
-        // they describe it. The image outranks the .env file because it says which product is
-        // actually running, while the .env only records what a previous resolution concluded —
-        // and a .env that once defaulted to "openclaw" for an ironclaw container keeps that
-        // answer alive forever, which `ensure_env_file` then turns into an image rewrite.
         let image_from_config = v
             .pointer("/Config/Image")
             .and_then(|i| i.as_str())
             .unwrap_or("");
-        let service_type = v
+        let label_service_type = v
             .pointer("/Config/Labels/openclaw.service_type")
             .and_then(|s| s.as_str())
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                env_map
-                    .get("SERVICE_TYPE")
-                    .cloned()
-                    .filter(|s| !s.is_empty())
-            })
-            .or_else(|| {
-                let named = self.service_type_named_by_image(Some(image_from_config))?;
-                if self
-                    .read_service_type_from_env_file(name)
-                    .is_some_and(|stored| stored != named)
-                {
-                    tracing::warn!(
-                        "Instance '{}': .env SERVICE_TYPE disagrees with running image '{}', \
-                         using '{}' from the image",
-                        name,
-                        image_from_config,
-                        named
-                    );
-                }
-                Some(named.to_string())
-            })
-            .or_else(|| self.read_service_type_from_env_file(name))
-            .or_else(|| {
-                let inferred = self.infer_service_type_from_image(Some(image_from_config));
-                tracing::info!(
-                    "Instance '{}': no SERVICE_TYPE in label/env/.env, inferring '{}' from image '{}'",
-                    name,
-                    inferred,
-                    image_from_config
-                );
-                Some(inferred.to_string())
-            });
+            .filter(|s| !s.is_empty());
+        let service_type =
+            self.resolve_service_type(name, label_service_type, &env_map, image_from_config);
 
         if service_type.is_none() {
             tracing::warn!(
@@ -1861,6 +1888,85 @@ mod tests {
 
     const IRONCLAW_IMAGE: &str = "nearaidev/ironclaw-nearai-worker@sha256:46c302d3";
     const OPENCLAW_IMAGE: &str = "nearaidev/openclaw-nearai-worker:latest";
+
+    fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The whole point of the change: whichever copy carries the stale "openclaw" — the
+    /// label, the container env, or the .env file — the running image overrules it.
+    #[test]
+    fn test_resolve_service_type_prefers_the_image_over_every_recorded_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        std::fs::write(m.env_path("a"), "SERVICE_TYPE=openclaw\n").unwrap();
+
+        // stale label
+        assert_eq!(
+            m.resolve_service_type("a", Some("openclaw"), &env_map(&[]), IRONCLAW_IMAGE),
+            Some("ironclaw".into())
+        );
+        // stale container env
+        assert_eq!(
+            m.resolve_service_type(
+                "a",
+                None,
+                &env_map(&[("SERVICE_TYPE", "openclaw")]),
+                IRONCLAW_IMAGE
+            ),
+            Some("ironclaw".into())
+        );
+        // stale .env file only
+        assert_eq!(
+            m.resolve_service_type("a", None, &env_map(&[]), IRONCLAW_IMAGE),
+            Some("ironclaw".into())
+        );
+    }
+
+    #[test]
+    fn test_resolve_service_type_falls_back_to_records_when_the_image_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        let bare_id = "sha256:e0e8b3cbfed68a90084781e2962f9c0deead51c5a3f11a488eef0283a4284bc2";
+
+        // A container created from a bare image id carries no product name, so the label wins.
+        assert_eq!(
+            m.resolve_service_type("b", Some("ironclaw"), &env_map(&[]), bare_id),
+            Some("ironclaw".into())
+        );
+        // …and OPENCLAW_IMAGE recovers the name when .Config.Image cannot.
+        assert_eq!(
+            m.resolve_service_type(
+                "b",
+                Some("openclaw"),
+                &env_map(&[("OPENCLAW_IMAGE", IRONCLAW_IMAGE)]),
+                bare_id
+            ),
+            Some("ironclaw".into())
+        );
+        // Nothing recorded and nothing named: the old guess remains.
+        assert_eq!(
+            m.resolve_service_type("b", None, &env_map(&[]), bare_id),
+            Some("openclaw".into())
+        );
+    }
+
+    #[test]
+    fn test_resolve_service_type_keeps_agreeing_signals_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        assert_eq!(
+            m.resolve_service_type("c", Some("openclaw"), &env_map(&[]), OPENCLAW_IMAGE),
+            Some("openclaw".into())
+        );
+        assert_eq!(
+            m.resolve_service_type("c", Some("ironclaw"), &env_map(&[]), IRONCLAW_IMAGE),
+            Some("ironclaw".into())
+        );
+    }
 
     #[test]
     fn test_service_type_named_by_image_reports_unknown_instead_of_guessing() {
