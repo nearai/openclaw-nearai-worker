@@ -5,7 +5,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Redirect,
     },
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -64,6 +64,7 @@ use store::{Instance, InstanceStore, PortRange};
         create_instance,
         get_instance,
         delete_instance,
+        patch_instance,
         restart_instance,
         stop_instance,
         start_instance,
@@ -88,6 +89,8 @@ use store::{Instance, InstanceStore, PortRange};
         VersionResponse,
         AppVersionResponse,
         CreateInstanceRequest,
+        PatchInstanceRequest,
+        PatchInstanceResponse,
         RestartInstanceRequest,
         InstanceInfo,
         InstanceResponse,
@@ -1667,6 +1670,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances", post(create_instance))
         .route("/instances/{name}", get(get_instance))
         .route("/instances/{name}", delete(delete_instance))
+        .route("/instances/{name}", patch(patch_instance))
         .route("/instances/{name}/restart", post(restart_instance))
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
@@ -2698,6 +2702,208 @@ async fn delete_instance(
 
     tracing::info!("Deleted instance: {}", name);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Admin: correct an instance's stored configuration without touching its data.
+///
+/// Every field is optional and only the ones present are changed. Unlike the restart
+/// upgrade path this never runs `down -v`, exports nothing and restores nothing, so the
+/// volumes are left exactly as they are. Use it to repair an instance whose recorded
+/// service_type or image is wrong — restoring the *contents* of a volume is a backup
+/// concern and stays separate.
+#[derive(Deserialize, utoipa::ToSchema)]
+struct PatchInstanceRequest {
+    /// "openclaw" or "ironclaw".
+    #[serde(default)]
+    service_type: Option<String>,
+    /// Full digest reference, e.g. `nearaidev/ironclaw-nearai-worker@sha256:46c3…`.
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    nearai_api_url: Option<String>,
+    #[serde(default)]
+    nearai_api_key: Option<String>,
+    #[serde(default)]
+    ssh_pubkey: Option<String>,
+    #[serde(default)]
+    mem_limit: Option<String>,
+    #[serde(default)]
+    cpus: Option<String>,
+    #[serde(default)]
+    storage_size: Option<String>,
+    /// Merged into the existing extra_env. A null value removes that key.
+    #[serde(default)]
+    extra_env: Option<HashMap<String, Option<String>>>,
+    /// Recreate the container so the new .env takes effect. Named volumes are kept.
+    /// Without this the changes are written and apply the next time it is recreated.
+    #[serde(default)]
+    recreate: Option<bool>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct PatchInstanceResponse {
+    name: String,
+    service_type: Option<String>,
+    image: Option<String>,
+    recreated: bool,
+}
+
+#[utoipa::path(patch, path = "/instances/{name}", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    request_body = PatchInstanceRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Updated configuration", body = PatchInstanceResponse),
+        (status = 400, description = "Invalid field, or service_type and image name different products", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+    )
+)]
+async fn patch_instance(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<PatchInstanceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let inst = {
+        let store = state.store.read().await;
+        store.get(&name).cloned()
+    }
+    .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
+
+    let mut updated = inst.clone();
+
+    if let Some(st) = req.service_type.as_deref().map(str::trim) {
+        if st != "openclaw" && st != "ironclaw" {
+            return Err(ApiError::BadRequest(
+                "service_type must be 'openclaw' or 'ironclaw'".into(),
+            ));
+        }
+        updated.service_type = Some(st.to_string());
+    }
+    if let Some(img) = req.image.as_deref().map(str::trim) {
+        validate_image(img)?;
+        reject_newlines("image", img)?;
+        updated.image = Some(img.to_string());
+        // The digest is only meaningful for the image it was resolved from.
+        updated.image_digest = None;
+    }
+
+    // ensure_env_file replaces an image that contradicts the service_type, which would
+    // silently discard whichever of the two was just asked for. Say so instead.
+    if let (Some(st), Some(named)) = (
+        updated.service_type.as_deref(),
+        state
+            .compose
+            .service_type_named_by_image(updated.image.as_deref()),
+    ) {
+        if st != named {
+            return Err(ApiError::BadRequest(format!(
+                "service_type '{}' and image '{}' name different products; \
+                 pass both so they agree",
+                st,
+                updated.image.as_deref().unwrap_or("")
+            )));
+        }
+    }
+
+    for (field, value) in [
+        ("nearai_api_url", &req.nearai_api_url),
+        ("nearai_api_key", &req.nearai_api_key),
+        ("ssh_pubkey", &req.ssh_pubkey),
+        ("mem_limit", &req.mem_limit),
+        ("cpus", &req.cpus),
+        ("storage_size", &req.storage_size),
+    ] {
+        if let Some(v) = value {
+            reject_newlines(field, v)?;
+        }
+    }
+    if let Some(url) = req.nearai_api_url {
+        updated.nearai_api_url = Some(url);
+    }
+    if let Some(key) = req.nearai_api_key {
+        updated.nearai_api_key = key;
+    }
+    if let Some(pubkey) = req.ssh_pubkey {
+        updated.ssh_pubkey = pubkey;
+    }
+    if let Some(mem) = req.mem_limit {
+        updated.mem_limit = Some(mem);
+    }
+    if let Some(cpus) = req.cpus {
+        updated.cpus = Some(cpus);
+    }
+    if let Some(storage) = req.storage_size {
+        updated.storage_size = Some(storage);
+    }
+    if let Some(patch) = req.extra_env {
+        let mut extra = updated.extra_env.unwrap_or_default();
+        for (k, v) in patch {
+            reject_newlines("extra_env key", &k)?;
+            match v {
+                Some(v) => {
+                    reject_newlines("extra_env value", &v)?;
+                    extra.insert(k, v);
+                }
+                None => {
+                    extra.remove(&k);
+                }
+            }
+        }
+        updated.extra_env = (!extra.is_empty()).then_some(extra);
+    }
+
+    let service_type = updated.service_type.clone();
+    let default_image = match service_type.as_deref() {
+        Some("ironclaw") => state.config.ironclaw_image.clone(),
+        _ => state.config.openclaw_image.clone(),
+    };
+
+    {
+        let compose = state.compose.clone();
+        let inst = updated.clone();
+        let domain = state.config.openclaw_domain.clone();
+        let client_id = state.config.google_oauth_client_id.clone();
+        let exchange_url = state.oauth_exchange_url.clone();
+        tokio::task::spawn_blocking(move || {
+            compose.ensure_env_file(
+                &inst,
+                &default_image,
+                domain.as_deref(),
+                client_id.as_deref(),
+                exchange_url.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("env file task join: {}", e)))??;
+    }
+
+    {
+        let mut store = state.store.write().await;
+        store.add(updated.clone());
+    }
+
+    let recreate = req.recreate.unwrap_or(false);
+    if recreate {
+        state
+            .compose_start(&name, true, service_type.as_deref())
+            .await?;
+    }
+
+    tracing::info!(
+        "Patched instance '{}': service_type={:?}, recreated={}",
+        name,
+        updated.service_type,
+        recreate
+    );
+
+    Ok(Json(PatchInstanceResponse {
+        name,
+        service_type: updated.service_type,
+        image: updated.image,
+        recreated: recreate,
+    }))
 }
 
 #[utoipa::path(post, path = "/instances/{name}/restart", tag = "Instances",
@@ -6596,6 +6802,7 @@ exit 1
         let app = Router::new()
             .route("/admin/orphans", delete(delete_all_orphans))
             .route("/admin/orphans/{name}", delete(delete_orphan))
+            .route("/instances/{name}", patch(patch_instance))
             .with_state(state);
 
         TestAdminApp {
@@ -6678,6 +6885,111 @@ exit 1
             .body(Body::empty())
             .unwrap();
 
+        let response = test_app.app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn patch_tracked_inst(
+        body: serde_json::Value,
+    ) -> (StatusCode, String, tempfile::TempDir) {
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+
+        let test_app = test_admin_app();
+        let request = axum::http::Request::builder()
+            .method("PATCH")
+            .uri("/instances/tracked-inst")
+            .header("Authorization", format!("Bearer {}", test_app.token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = test_app.app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            String::from_utf8_lossy(&bytes).to_string(),
+            test_app.env_dir,
+        )
+    }
+
+    /// The repair an instance needs when its recorded type drifted from what it runs:
+    /// set both, write them to the .env, leave the volumes alone.
+    #[tokio::test]
+    async fn test_patch_instance_writes_service_type_and_image_to_env_file() {
+        let image = "nearaidev/ironclaw-nearai-worker@sha256:46c302d3";
+        let (status, body, env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "ironclaw",
+            "image": image,
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["service_type"], "ironclaw");
+        assert_eq!(json["recreated"], false, "recreate defaults to off");
+
+        let written = std::fs::read_to_string(env_dir.path().join("tracked-inst.env")).unwrap();
+        assert!(written.contains("SERVICE_TYPE=ironclaw"), "{}", written);
+        assert!(
+            written.contains(&format!("OPENCLAW_IMAGE={}", image)),
+            "{}",
+            written
+        );
+    }
+
+    #[tokio::test]
+    async fn test_patch_instance_rejects_service_type_that_contradicts_the_image() {
+        let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "ironclaw",
+            "image": "nearaidev/openclaw-nearai-worker@sha256:deadbeef",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+        assert!(body.contains("name different products"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn test_patch_instance_rejects_image_without_a_digest() {
+        let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+            "image": "nearaidev/ironclaw-nearai-worker:latest",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+        assert!(body.contains("digest reference"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn test_patch_instance_merges_extra_env_and_drops_null_keys() {
+        let (status, body, env_dir) = patch_tracked_inst(serde_json::json!({
+            "extra_env": {"CHANNEL_RELAY_URL": "https://relay.example", "GONE": null},
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let written = std::fs::read_to_string(env_dir.path().join("tracked-inst.env")).unwrap();
+        assert!(
+            written.contains("CHANNEL_RELAY_URL=https://relay.example"),
+            "{}",
+            written
+        );
+        assert!(!written.contains("GONE="), "{}", written);
+    }
+
+    #[tokio::test]
+    async fn test_patch_instance_requires_admin_auth() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let test_app = test_admin_app();
+        let request = axum::http::Request::builder()
+            .method("PATCH")
+            .uri("/instances/tracked-inst")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"service_type":"ironclaw"}"#))
+            .unwrap();
         let response = test_app.app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
