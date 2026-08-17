@@ -505,7 +505,7 @@ impl ComposeManager {
         let net = Self::network_name(instance_name);
         // `docker network create` is idempotent-ish: returns an error if the
         // network already exists, which we ignore.
-        let output = Command::new("docker")
+        let output = docker_command()
             .args(["network", "create", "--driver", "bridge", &net])
             .output()
             .map_err(|e| ApiError::Internal(format!("docker network create: {}", e)))?;

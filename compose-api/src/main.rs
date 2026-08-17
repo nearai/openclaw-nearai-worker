@@ -2706,11 +2706,15 @@ async fn delete_instance(
 
 /// Admin: correct an instance's stored configuration without touching its data.
 ///
-/// Every field is optional and only the ones present are changed. Unlike the restart
-/// upgrade path this never runs `down -v`, exports nothing and restores nothing, so the
-/// volumes are left exactly as they are. Use it to repair an instance whose recorded
-/// service_type or image is wrong — restoring the *contents* of a volume is a backup
-/// concern and stays separate.
+/// Every field is optional and only the ones present are changed. The container is then
+/// recreated, because that is the only way a change lasts: discovery rebuilds each
+/// instance from its container on every compose-api start and rewrites the .env from
+/// that, so a .env the container does not agree with is reverted at the next restart.
+///
+/// Unlike the restart upgrade path this never runs `down -v`, exports nothing and
+/// restores nothing, so the named volumes carry over untouched. Use it to repair an
+/// instance whose recorded service_type or image is wrong — restoring the *contents* of
+/// a volume is a backup concern and stays separate.
 ///
 /// Deliberately absent: `ssh_pubkey`, `nearai_api_key` and `nearai_api_url`. Those decide
 /// who gets a shell in the container and where it sends the tenant's traffic, so setting
@@ -2734,10 +2738,6 @@ struct PatchInstanceRequest {
     /// allowing them here would let this set SSH_PUBKEY or NEARAI_API_URL by another route.
     #[serde(default)]
     extra_env: Option<HashMap<String, Option<String>>>,
-    /// Recreate the container so the new .env takes effect. Named volumes are kept.
-    /// Without this the changes are written and apply the next time it is recreated.
-    #[serde(default)]
-    recreate: Option<bool>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -2745,7 +2745,6 @@ struct PatchInstanceResponse {
     name: String,
     service_type: Option<String>,
     image: Option<String>,
-    recreated: bool,
 }
 
 #[utoipa::path(patch, path = "/instances/{name}", tag = "Instances",
@@ -2860,25 +2859,23 @@ async fn patch_instance(
         store.add(updated.clone());
     }
 
-    let recreate = req.recreate.unwrap_or(false);
-    if recreate {
-        state
-            .compose_start(&name, true, service_type.as_deref())
-            .await?;
-    }
+    // Discovery rebuilds every instance from its container on each compose-api start and
+    // rewrites the .env from that, so a change written to the .env alone lasts only until
+    // then. Recreating is what makes the patch stick.
+    state
+        .compose_start(&name, true, service_type.as_deref())
+        .await?;
 
     tracing::info!(
-        "Patched instance '{}': service_type={:?}, recreated={}",
+        "Patched instance '{}': service_type={:?}",
         name,
-        updated.service_type,
-        recreate
+        updated.service_type
     );
 
     Ok(Json(PatchInstanceResponse {
         name,
         service_type: updated.service_type,
         image: updated.image,
-        recreated: recreate,
     }))
 }
 
@@ -6865,11 +6862,30 @@ exit 1
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// A docker that accepts everything, so the recreate at the end of a patch succeeds
+    /// without a real daemon.
+    fn write_accepting_docker() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("docker");
+        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        dir
+    }
+
     async fn patch_tracked_inst(
         body: serde_json::Value,
     ) -> (StatusCode, String, tempfile::TempDir) {
         use axum::body::{to_bytes, Body};
         use tower::ServiceExt;
+
+        let _lock = orphan_test_env_lock().lock().await;
+        let docker_dir = write_accepting_docker();
+        let _docker_guard = EnvVarGuard::set_path(
+            "OPENCLAW_TEST_DOCKER_BIN",
+            docker_dir.path().join("docker").as_path(),
+        );
 
         let test_app = test_admin_app();
         let request = axum::http::Request::builder()
@@ -6903,7 +6919,6 @@ exit 1
         assert_eq!(status, StatusCode::OK, "{}", body);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["service_type"], "ironclaw");
-        assert_eq!(json["recreated"], false, "recreate defaults to off");
 
         let written = std::fs::read_to_string(env_dir.path().join("tracked-inst.env")).unwrap();
         assert!(written.contains("SERVICE_TYPE=ironclaw"), "{}", written);
