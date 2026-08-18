@@ -2745,6 +2745,12 @@ struct PatchInstanceResponse {
     name: String,
     service_type: Option<String>,
     image: Option<String>,
+    /// Whether a SECRETS_MASTER_KEY was readable *before* the recreate, on an instance the
+    /// patch leaves as ironclaw; absent for openclaw, which has no such key. `false` means
+    /// ironclaw minted a fresh one as it came up, so whatever the instance had already
+    /// encrypted stays unreadable and a backup from before the drift is the only copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    master_key_present: Option<bool>,
 }
 
 #[utoipa::path(patch, path = "/instances/{name}", tag = "Instances",
@@ -2833,6 +2839,50 @@ async fn patch_instance(
         updated.extra_env = (!extra.is_empty()).then_some(extra);
     }
 
+    // ironclaw reads its master key off the config volume and mints a fresh one when the file
+    // is not there, which leaves everything it had already encrypted unreadable. The recreate
+    // below is the moment that happens, so resolve the key first, while the container being
+    // repaired is still the one holding it — the volume is the same at either mount point.
+    // Caching it on the instance also puts it in the .env, where /migrate's preflight reads
+    // it. Reported either way: an absent key is the caller's signal to restore from a backup
+    // taken before the drift instead of trusting this volume.
+    let ironclaw = compose::is_ironclaw(updated.service_type.as_deref(), updated.image.as_deref());
+    let mut master_key_present = updated
+        .extra_env
+        .as_ref()
+        .is_some_and(|e| e.contains_key("SECRETS_MASTER_KEY"));
+    if ironclaw && !master_key_present {
+        let compose = state.compose.clone();
+        let owned_name = name.clone();
+        let container_name = format!("openclaw-{}-gateway-1", name);
+        let signal_type = updated.service_type.clone();
+        let signal_image = updated.image.clone();
+        let key = tokio::task::spawn_blocking(move || {
+            compose.resolve_master_key(
+                &owned_name,
+                &container_name,
+                signal_type.as_deref(),
+                signal_image.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("master key task join: {}", e)))?;
+        match key {
+            Some(key) => {
+                updated
+                    .extra_env
+                    .get_or_insert_with(Default::default)
+                    .insert("SECRETS_MASTER_KEY".to_string(), key);
+                master_key_present = true;
+            }
+            None => tracing::warn!(
+                "Instance '{}': no SECRETS_MASTER_KEY to carry through the recreate — ironclaw \
+                 will mint one, and anything already encrypted stays unreadable",
+                name
+            ),
+        }
+    }
+
     let service_type = updated.service_type.clone();
     let default_image = match service_type.as_deref() {
         Some("ironclaw") => state.config.ironclaw_image.clone(),
@@ -2889,6 +2939,7 @@ async fn patch_instance(
         name,
         service_type: updated.service_type,
         image: updated.image,
+        master_key_present: ironclaw.then_some(master_key_present),
     }))
 }
 
@@ -6917,14 +6968,38 @@ exit 1
         dir
     }
 
+    /// A fake docker that answers `cat <path>` with `key` and fails for any other path, so a
+    /// test can say which mount point the config volume's `.master_key` is reachable through.
+    fn write_docker_serving_master_key(path: &str, key: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("docker");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"{path}\"*) echo {key} ;;\n                   *\".master_key\"*) echo 'no such file' >&2; exit 1 ;;\nesac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        dir
+    }
+
     async fn patch_tracked_inst(
         body: serde_json::Value,
+    ) -> (StatusCode, String, tempfile::TempDir) {
+        patch_tracked_inst_with_docker(body, write_accepting_docker()).await
+    }
+
+    async fn patch_tracked_inst_with_docker(
+        body: serde_json::Value,
+        docker_dir: tempfile::TempDir,
     ) -> (StatusCode, String, tempfile::TempDir) {
         use axum::body::{to_bytes, Body};
         use tower::ServiceExt;
 
         let _lock = orphan_test_env_lock().lock().await;
-        let docker_dir = write_accepting_docker();
         let _docker_guard = EnvVarGuard::set_path(
             "OPENCLAW_TEST_DOCKER_BIN",
             docker_dir.path().join("docker").as_path(),
@@ -7130,6 +7205,63 @@ exit 1
             "recreate did not use the ironclaw template; docker argv was:\n{}",
             argv
         );
+    }
+
+    /// The repair's own hazard: ironclaw mints a fresh master key when the file is missing, so
+    /// the key has to be read before the recreate — and on a flipped instance it is readable
+    /// only through openclaw's mount point, because that is where its image puts the volume.
+    #[tokio::test]
+    async fn test_patch_instance_carries_a_flipped_instances_master_key_through_the_recreate() {
+        let key = "a".repeat(64);
+        let docker = write_docker_serving_master_key("/home/agent/.openclaw/.master_key", &key);
+        let (status, body, env_dir) = patch_tracked_inst_with_docker(
+            serde_json::json!({
+                "service_type": "ironclaw",
+                "image": "nearaidev/ironclaw-nearai-worker@sha256:46c302d3",
+            }),
+            docker,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["master_key_present"], true, "{}", body);
+
+        let written = std::fs::read_to_string(env_dir.path().join("tracked-inst.env")).unwrap();
+        assert!(
+            written.contains(&format!("SECRETS_MASTER_KEY={}", key)),
+            "{}",
+            written
+        );
+    }
+
+    /// An instance with no key anywhere still gets repaired — the caller is told, because that
+    /// is the case where the volume is not the copy to trust.
+    #[tokio::test]
+    async fn test_patch_instance_reports_a_master_key_it_could_not_find() {
+        let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "ironclaw",
+            "image": "nearaidev/ironclaw-nearai-worker@sha256:46c302d3",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["master_key_present"], false, "{}", body);
+    }
+
+    /// openclaw has no such key, so the field says nothing rather than saying "missing".
+    #[tokio::test]
+    async fn test_patch_instance_omits_the_master_key_verdict_for_openclaw() {
+        let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "openclaw",
+            "image": "nearaidev/openclaw-nearai-worker@sha256:deadbeef",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json.get("master_key_present").is_none(), "{}", body);
     }
 
     #[tokio::test]

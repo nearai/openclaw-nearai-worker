@@ -51,6 +51,12 @@ pub fn is_managed_env_key(key: &str) -> bool {
 /// Where ironclaw's entrypoint persists the secrets master key, on the config volume.
 const MASTER_KEY_PATH: &str = "/home/agent/.ironclaw/.master_key";
 
+/// The same file, on the same volume, as an openclaw container sees it. Both templates mount
+/// the one `config` volume — ironclaw at `.ironclaw`, openclaw at `.openclaw` — so an instance
+/// recreated onto the openclaw image still carries ironclaw's key, one path over. openclaw
+/// never writes this file, so reading it can only ever return a key the instance already had.
+const MASTER_KEY_PATH_AS_OPENCLAW: &str = "/home/agent/.openclaw/.master_key";
+
 /// The places an instance's SECRETS_MASTER_KEY can be read from, cheapest first.
 /// `docker cp` reads the config volume whether or not the container runs — verified
 /// against a stopped container and one that was never started — so it covers the
@@ -58,16 +64,16 @@ const MASTER_KEY_PATH: &str = "/home/agent/.ironclaw/.master_key";
 #[derive(Clone, Copy)]
 enum MasterKeySource {
     EnvFile,
-    Copy,
-    Exec,
+    Copy(&'static str),
+    Exec(&'static str),
 }
 
 impl MasterKeySource {
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::EnvFile => "instance .env",
-            Self::Copy => "docker cp",
-            Self::Exec => "docker exec",
+            Self::EnvFile => "instance .env".to_string(),
+            Self::Copy(path) => format!("docker cp {}", path),
+            Self::Exec(path) => format!("docker exec cat {}", path),
         }
     }
 }
@@ -1369,7 +1375,7 @@ impl ComposeManager {
     /// Read SECRETS_MASTER_KEY from a running container's persisted .master_key file.
     /// Discovery's single cheap attempt; `resolve_master_key` covers the rest.
     fn read_master_key_from_container(&self, name: &str, container_name: &str) -> Option<String> {
-        self.read_master_key(MasterKeySource::Exec, name, container_name)
+        self.read_master_key(MasterKeySource::Exec(MASTER_KEY_PATH), name, container_name)
             .ok()
     }
 
@@ -1378,8 +1384,10 @@ impl ComposeManager {
     /// ironclaw writes the key to `.master_key` on the config volume, so it outlives a
     /// stopped container — but the exec used during discovery does not, which is why a
     /// stopped instance stayed unmigratable until someone started it and restarted
-    /// compose-api. Every source logs why it came up empty: an instance that never had a
-    /// key must not look like one whose key we failed to read.
+    /// compose-api. The volume is read at both mount points, because an instance recreated
+    /// onto the openclaw image holds the same key one path over. Every source logs why it
+    /// came up empty: an instance that never had a key must not look like one whose key we
+    /// failed to read.
     pub fn resolve_master_key(
         &self,
         name: &str,
@@ -1396,8 +1404,10 @@ impl ComposeManager {
         let mut missed: Vec<String> = Vec::new();
         for source in [
             MasterKeySource::EnvFile,
-            MasterKeySource::Copy,
-            MasterKeySource::Exec,
+            MasterKeySource::Copy(MASTER_KEY_PATH),
+            MasterKeySource::Copy(MASTER_KEY_PATH_AS_OPENCLAW),
+            MasterKeySource::Exec(MASTER_KEY_PATH),
+            MasterKeySource::Exec(MASTER_KEY_PATH_AS_OPENCLAW),
         ] {
             match self.read_master_key(source, name, container_name) {
                 Ok(key) => {
@@ -1446,12 +1456,12 @@ impl ComposeManager {
                     .ok_or_else(|| "not in the instance .env".to_string())?;
                 valid_master_key(&raw)
             }
-            MasterKeySource::Copy => {
+            MasterKeySource::Copy(path) => {
                 let dest = std::env::temp_dir().join(format!("{}.master_key", container_name));
                 let output = docker_command()
                     .args([
                         "cp",
-                        &format!("{}:{}", container_name, MASTER_KEY_PATH),
+                        &format!("{}:{}", container_name, path),
                         &dest.to_string_lossy(),
                     ])
                     .output()
@@ -1466,9 +1476,9 @@ impl ComposeManager {
                 let _ = std::fs::remove_file(&dest);
                 result
             }
-            MasterKeySource::Exec => {
+            MasterKeySource::Exec(path) => {
                 let output = docker_command()
-                    .args(["exec", container_name, "cat", MASTER_KEY_PATH])
+                    .args(["exec", container_name, "cat", path])
                     .output()
                     .map_err(|e| format!("docker exec failed to run: {}", e))?;
                 if !output.status.success() {
