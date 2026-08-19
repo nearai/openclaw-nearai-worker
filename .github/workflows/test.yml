@@ -2,10 +2,7 @@ name: Test
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/test.yml"
-      - "compose-api/**"
-      - "oauth-service/**"
+  merge_group:
   workflow_dispatch:
 
 permissions:

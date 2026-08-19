@@ -2,10 +2,7 @@ name: Code Format
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/code-format.yml"
-      - "compose-api/**"
-      - "oauth-service/**"
+  merge_group:
   workflow_dispatch:
 
 permissions:

@@ -105,7 +105,11 @@ impl BackupManager {
     /// Whether the archive exists. A missing object is `Ok(false)`; every other S3 failure —
     /// outage, auth, throttling — propagates as an error, so a caller can 404 a genuinely absent
     /// backup without masking an operational incident as "not found".
-    pub async fn object_exists(&self, instance_name: &str, backup_id: &str) -> Result<bool, ApiError> {
+    pub async fn object_exists(
+        &self,
+        instance_name: &str,
+        backup_id: &str,
+    ) -> Result<bool, ApiError> {
         let key = backup_s3_key(instance_name, backup_id);
 
         match self
