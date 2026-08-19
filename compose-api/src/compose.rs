@@ -40,8 +40,22 @@ const SYSTEM_ENV_KEYS: &[&str] = &[
     "PATH", "HOME", "HOSTNAME", "LANG", "LC_ALL", "TERM", "SHLVL", "PWD", "OLDPWD", "USER", "SHELL",
 ];
 
+/// Env keys compose-api owns: the ones it writes itself, plus the master key it resolves
+/// from the container. `ensure_env_file` applies `extra_env` after everything else, so an
+/// extra_env entry for one of these silently replaces the managed value — which is why
+/// callers accepting an extra_env patch must refuse them.
+pub fn is_managed_env_key(key: &str) -> bool {
+    CORE_ENV_KEYS.contains(&key) || SYSTEM_ENV_KEYS.contains(&key) || key == "SECRETS_MASTER_KEY"
+}
+
 /// Where ironclaw's entrypoint persists the secrets master key, on the config volume.
 const MASTER_KEY_PATH: &str = "/home/agent/.ironclaw/.master_key";
+
+/// The same file, on the same volume, as an openclaw container sees it. Both templates mount
+/// the one `config` volume — ironclaw at `.ironclaw`, openclaw at `.openclaw` — so an instance
+/// recreated onto the openclaw image still carries ironclaw's key, one path over. openclaw
+/// never writes this file, so reading it can only ever return a key the instance already had.
+const MASTER_KEY_PATH_AS_OPENCLAW: &str = "/home/agent/.openclaw/.master_key";
 
 /// The places an instance's SECRETS_MASTER_KEY can be read from, cheapest first.
 /// `docker cp` reads the config volume whether or not the container runs — verified
@@ -50,16 +64,16 @@ const MASTER_KEY_PATH: &str = "/home/agent/.ironclaw/.master_key";
 #[derive(Clone, Copy)]
 enum MasterKeySource {
     EnvFile,
-    Copy,
-    Exec,
+    Copy(&'static str),
+    Exec(&'static str),
 }
 
 impl MasterKeySource {
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::EnvFile => "instance .env",
-            Self::Copy => "docker cp",
-            Self::Exec => "docker exec",
+            Self::EnvFile => "instance .env".to_string(),
+            Self::Copy(path) => format!("docker cp {}", path),
+            Self::Exec(path) => format!("docker exec cat {}", path),
         }
     }
 }
@@ -215,12 +229,87 @@ impl ComposeManager {
     /// Infer service type from image name: "ironclaw" if image contains "ironclaw", otherwise
     /// "openclaw". Does not depend on which compose files are currently loaded.
     pub fn infer_service_type_from_image(&self, image: Option<&str>) -> &'static str {
-        let img_lower = image.unwrap_or("").to_lowercase();
-        if img_lower.contains("ironclaw") {
+        if image.unwrap_or("").to_lowercase().contains("ironclaw") {
             "ironclaw"
         } else {
             "openclaw"
         }
+    }
+
+    /// Service type the image name states outright, or `None` when it names neither product —
+    /// or, ambiguously, both. Unlike [`Self::infer_service_type_from_image`] this never guesses,
+    /// so callers can use it as evidence rather than as a default.
+    pub fn service_type_named_by_image(&self, image: Option<&str>) -> Option<&'static str> {
+        let img_lower = image.unwrap_or("").to_lowercase();
+        match (
+            img_lower.contains("ironclaw"),
+            img_lower.contains("openclaw"),
+        ) {
+            (true, false) => Some("ironclaw"),
+            (false, true) => Some("openclaw"),
+            _ => None,
+        }
+    }
+
+    /// Decide an instance's service_type from the signals its container carries.
+    ///
+    /// The image decides whenever it names a product, because it is what the container is
+    /// actually running, and service_type only exists to pick the matching compose template
+    /// and binary. The label, the container env and the .env file are all copies of an
+    /// earlier resolution — a "openclaw" recorded against an ironclaw container is exactly
+    /// what `ensure_env_file` turns into an image rewrite, so none of them may outrank the
+    /// image. A container created from a bare image id names no product; there the recorded
+    /// values are used, in their original order.
+    fn resolve_service_type(
+        &self,
+        name: &str,
+        label: Option<&str>,
+        env_map: &HashMap<String, String>,
+        image_from_config: &str,
+    ) -> Option<String> {
+        let recorded = label
+            .map(|s| s.to_string())
+            .or_else(|| {
+                env_map
+                    .get("SERVICE_TYPE")
+                    .cloned()
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| self.read_service_type_from_env_file(name));
+
+        // `.Config.Image` echoes whatever the container was created from, so it is the direct
+        // evidence; OPENCLAW_IMAGE covers the case where that was a bare image id.
+        let named = self
+            .service_type_named_by_image(Some(image_from_config))
+            .or_else(|| {
+                self.service_type_named_by_image(env_map.get("OPENCLAW_IMAGE").map(String::as_str))
+            });
+
+        if let Some(named) = named {
+            if let Some(stale) = recorded.as_deref().filter(|r| *r != named) {
+                tracing::warn!(
+                    "Instance '{}': recorded service_type '{}' disagrees with the running \
+                     image '{}'; using '{}' from the image",
+                    name,
+                    stale,
+                    image_from_config,
+                    named
+                );
+            }
+            return Some(named.to_string());
+        }
+
+        // The image names no product — a container created from a bare image id.
+        recorded.or_else(|| {
+            let inferred = self.infer_service_type_from_image(Some(image_from_config));
+            tracing::info!(
+                "Instance '{}': no SERVICE_TYPE in label/env/.env, inferring '{}' from image '{}'",
+                name,
+                inferred,
+                image_from_config
+            );
+            Some(inferred.to_string())
+        })
     }
 
     /// Resolve the compose file for a given service type, falling back to openclaw.
@@ -422,7 +511,7 @@ impl ComposeManager {
         let net = Self::network_name(instance_name);
         // `docker network create` is idempotent-ish: returns an error if the
         // network already exists, which we ignore.
-        let output = Command::new("docker")
+        let output = docker_command()
             .args(["network", "create", "--driver", "bridge", &net])
             .output()
             .map_err(|e| ApiError::Internal(format!("docker network create: {}", e)))?;
@@ -1151,34 +1240,16 @@ impl ComposeManager {
             .cloned()
             .filter(|s| !s.is_empty());
         let image_env = env_map.get("OPENCLAW_IMAGE").cloned();
-        // Resolve service_type: label → container env → persisted .env file → infer from image.
-        // Infer from image name so e.g. ironclaw-nearai-worker → ironclaw.
         let image_from_config = v
             .pointer("/Config/Image")
             .and_then(|i| i.as_str())
             .unwrap_or("");
-        let service_type = v
+        let label_service_type = v
             .pointer("/Config/Labels/openclaw.service_type")
             .and_then(|s| s.as_str())
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                env_map
-                    .get("SERVICE_TYPE")
-                    .cloned()
-                    .filter(|s| !s.is_empty())
-            })
-            .or_else(|| self.read_service_type_from_env_file(name))
-            .or_else(|| {
-                let inferred = self.infer_service_type_from_image(Some(image_from_config));
-                tracing::info!(
-                    "Instance '{}': no SERVICE_TYPE in label/env/.env, inferring '{}' from image '{}'",
-                    name,
-                    inferred,
-                    image_from_config
-                );
-                Some(inferred.to_string())
-            });
+            .filter(|s| !s.is_empty());
+        let service_type =
+            self.resolve_service_type(name, label_service_type, &env_map, image_from_config);
 
         if service_type.is_none() {
             tracing::warn!(
@@ -1304,7 +1375,7 @@ impl ComposeManager {
     /// Read SECRETS_MASTER_KEY from a running container's persisted .master_key file.
     /// Discovery's single cheap attempt; `resolve_master_key` covers the rest.
     fn read_master_key_from_container(&self, name: &str, container_name: &str) -> Option<String> {
-        self.read_master_key(MasterKeySource::Exec, name, container_name)
+        self.read_master_key(MasterKeySource::Exec(MASTER_KEY_PATH), name, container_name)
             .ok()
     }
 
@@ -1313,8 +1384,10 @@ impl ComposeManager {
     /// ironclaw writes the key to `.master_key` on the config volume, so it outlives a
     /// stopped container — but the exec used during discovery does not, which is why a
     /// stopped instance stayed unmigratable until someone started it and restarted
-    /// compose-api. Every source logs why it came up empty: an instance that never had a
-    /// key must not look like one whose key we failed to read.
+    /// compose-api. The volume is read at both mount points, because an instance recreated
+    /// onto the openclaw image holds the same key one path over. Every source logs why it
+    /// came up empty: an instance that never had a key must not look like one whose key we
+    /// failed to read.
     pub fn resolve_master_key(
         &self,
         name: &str,
@@ -1331,8 +1404,10 @@ impl ComposeManager {
         let mut missed: Vec<String> = Vec::new();
         for source in [
             MasterKeySource::EnvFile,
-            MasterKeySource::Copy,
-            MasterKeySource::Exec,
+            MasterKeySource::Copy(MASTER_KEY_PATH),
+            MasterKeySource::Copy(MASTER_KEY_PATH_AS_OPENCLAW),
+            MasterKeySource::Exec(MASTER_KEY_PATH),
+            MasterKeySource::Exec(MASTER_KEY_PATH_AS_OPENCLAW),
         ] {
             match self.read_master_key(source, name, container_name) {
                 Ok(key) => {
@@ -1381,12 +1456,12 @@ impl ComposeManager {
                     .ok_or_else(|| "not in the instance .env".to_string())?;
                 valid_master_key(&raw)
             }
-            MasterKeySource::Copy => {
+            MasterKeySource::Copy(path) => {
                 let dest = std::env::temp_dir().join(format!("{}.master_key", container_name));
                 let output = docker_command()
                     .args([
                         "cp",
-                        &format!("{}:{}", container_name, MASTER_KEY_PATH),
+                        &format!("{}:{}", container_name, path),
                         &dest.to_string_lossy(),
                     ])
                     .output()
@@ -1401,9 +1476,9 @@ impl ComposeManager {
                 let _ = std::fs::remove_file(&dest);
                 result
             }
-            MasterKeySource::Exec => {
+            MasterKeySource::Exec(path) => {
                 let output = docker_command()
-                    .args(["exec", container_name, "cat", MASTER_KEY_PATH])
+                    .args(["exec", container_name, "cat", path])
                     .output()
                     .map_err(|e| format!("docker exec failed to run: {}", e))?;
                 if !output.status.success() {
@@ -1491,10 +1566,17 @@ impl ComposeManager {
             vars.insert("BASTION_SSH_PUBKEY".into(), bastion_key.clone());
         }
         // Resolve service_type first — needed to validate the image.
-        // Prefer in-memory service_type, then existing .env value; only then default to openclaw.
+        // Prefer in-memory service_type, then what the image names, then the existing .env value;
+        // only then default to openclaw. The image comes before the .env for the same reason as in
+        // `inspect_container`, and the "openclaw" default is last because whatever wins here is
+        // written back to the .env, where a guess would read as fact on every later resolution.
         let service_type = inst
             .service_type
             .clone()
+            .or_else(|| {
+                self.service_type_named_by_image(inst.image.as_deref())
+                    .map(|s| s.to_string())
+            })
             .or_else(|| self.read_service_type_from_env_file(&inst.name))
             .unwrap_or_else(|| "openclaw".to_string());
         // Use the instance's stored image, but if it doesn't match the
@@ -1749,6 +1831,7 @@ fn docker_command() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[test]
     fn test_valid_master_key_trims_and_rejects_malformed() {
@@ -1788,6 +1871,186 @@ mod tests {
             Some("nearaidev/openclaw-nearai-worker:latest")
         ));
         assert!(!is_ironclaw(None, None));
+    }
+
+    fn test_manager(dir: &Path) -> ComposeManager {
+        let mut files = HashMap::new();
+        for st in ["openclaw", "ironclaw"] {
+            let path = dir.join(format!("{}.yml", st));
+            std::fs::write(&path, "services: {}\n").unwrap();
+            files.insert(st.to_string(), path);
+        }
+        ComposeManager::new(files, dir.join("envs"), None).unwrap()
+    }
+
+    fn test_instance(name: &str, image: Option<&str>, service_type: Option<&str>) -> Instance {
+        Instance {
+            name: name.to_string(),
+            token: "t".into(),
+            gateway_port: 18789,
+            ssh_port: 2222,
+            created_at: Utc::now(),
+            ssh_pubkey: "ssh-ed25519 AAAA".into(),
+            nearai_api_key: "k".into(),
+            nearai_api_url: None,
+            active: true,
+            image: image.map(String::from),
+            image_digest: None,
+            service_type: service_type.map(String::from),
+            mem_limit: None,
+            cpus: None,
+            storage_size: None,
+            extra_env: None,
+        }
+    }
+
+    const IRONCLAW_IMAGE: &str = "nearaidev/ironclaw-nearai-worker@sha256:46c302d3";
+    const OPENCLAW_IMAGE: &str = "nearaidev/openclaw-nearai-worker:latest";
+
+    fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The whole point of the change: whichever copy carries the stale "openclaw" — the
+    /// label, the container env, or the .env file — the running image overrules it.
+    #[test]
+    fn test_resolve_service_type_prefers_the_image_over_every_recorded_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        std::fs::write(m.env_path("a"), "SERVICE_TYPE=openclaw\n").unwrap();
+
+        // stale label
+        assert_eq!(
+            m.resolve_service_type("a", Some("openclaw"), &env_map(&[]), IRONCLAW_IMAGE),
+            Some("ironclaw".into())
+        );
+        // stale container env
+        assert_eq!(
+            m.resolve_service_type(
+                "a",
+                None,
+                &env_map(&[("SERVICE_TYPE", "openclaw")]),
+                IRONCLAW_IMAGE
+            ),
+            Some("ironclaw".into())
+        );
+        // stale .env file only
+        assert_eq!(
+            m.resolve_service_type("a", None, &env_map(&[]), IRONCLAW_IMAGE),
+            Some("ironclaw".into())
+        );
+    }
+
+    #[test]
+    fn test_resolve_service_type_falls_back_to_records_when_the_image_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        let bare_id = "sha256:e0e8b3cbfed68a90084781e2962f9c0deead51c5a3f11a488eef0283a4284bc2";
+
+        // A container created from a bare image id carries no product name, so the label wins.
+        assert_eq!(
+            m.resolve_service_type("b", Some("ironclaw"), &env_map(&[]), bare_id),
+            Some("ironclaw".into())
+        );
+        // …and OPENCLAW_IMAGE recovers the name when .Config.Image cannot.
+        assert_eq!(
+            m.resolve_service_type(
+                "b",
+                Some("openclaw"),
+                &env_map(&[("OPENCLAW_IMAGE", IRONCLAW_IMAGE)]),
+                bare_id
+            ),
+            Some("ironclaw".into())
+        );
+        // Nothing recorded and nothing named: the old guess remains.
+        assert_eq!(
+            m.resolve_service_type("b", None, &env_map(&[]), bare_id),
+            Some("openclaw".into())
+        );
+    }
+
+    #[test]
+    fn test_resolve_service_type_keeps_agreeing_signals_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        assert_eq!(
+            m.resolve_service_type("c", Some("openclaw"), &env_map(&[]), OPENCLAW_IMAGE),
+            Some("openclaw".into())
+        );
+        assert_eq!(
+            m.resolve_service_type("c", Some("ironclaw"), &env_map(&[]), IRONCLAW_IMAGE),
+            Some("ironclaw".into())
+        );
+    }
+
+    #[test]
+    fn test_service_type_named_by_image_reports_unknown_instead_of_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        assert_eq!(
+            m.service_type_named_by_image(Some(IRONCLAW_IMAGE)),
+            Some("ironclaw")
+        );
+        assert_eq!(
+            m.service_type_named_by_image(Some(OPENCLAW_IMAGE)),
+            Some("openclaw")
+        );
+        assert_eq!(m.service_type_named_by_image(Some("busybox:latest")), None);
+        assert_eq!(m.service_type_named_by_image(None), None);
+        // The guessing variant keeps its old contract for callers that need a value.
+        assert_eq!(
+            m.infer_service_type_from_image(Some("busybox:latest")),
+            "openclaw"
+        );
+        assert_eq!(
+            m.infer_service_type_from_image(Some(IRONCLAW_IMAGE)),
+            "ironclaw"
+        );
+    }
+
+    /// An .env left saying `openclaw` for a container running an ironclaw image used to win,
+    /// and `ensure_env_file` then rewrote the image to the openclaw default — so the next
+    /// recreate started the wrong product on the instance's data. The image decides now.
+    #[test]
+    fn test_ensure_env_file_keeps_ironclaw_image_when_env_file_says_openclaw() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        let inst = test_instance("stale-agent", Some(IRONCLAW_IMAGE), None);
+        std::fs::write(m.env_path("stale-agent"), "SERVICE_TYPE=openclaw\n").unwrap();
+
+        m.ensure_env_file(&inst, OPENCLAW_IMAGE, None, None, None)
+            .unwrap();
+
+        let written = std::fs::read_to_string(m.env_path("stale-agent")).unwrap();
+        assert!(
+            written.contains(&format!("OPENCLAW_IMAGE={}", IRONCLAW_IMAGE)),
+            "image was rewritten away from ironclaw: {}",
+            written
+        );
+        assert!(written.contains("SERVICE_TYPE=ironclaw"), "{}", written);
+    }
+
+    #[test]
+    fn test_ensure_env_file_still_repairs_an_image_that_contradicts_a_known_service_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        // service_type is known from the container itself, so an openclaw image on an
+        // ironclaw instance is still corrected to the ironclaw default.
+        let inst = test_instance("mixed-agent", Some(OPENCLAW_IMAGE), Some("ironclaw"));
+
+        m.ensure_env_file(&inst, IRONCLAW_IMAGE, None, None, None)
+            .unwrap();
+
+        let written = std::fs::read_to_string(m.env_path("mixed-agent")).unwrap();
+        assert!(
+            written.contains(&format!("OPENCLAW_IMAGE={}", IRONCLAW_IMAGE)),
+            "{}",
+            written
+        );
+        assert!(written.contains("SERVICE_TYPE=ironclaw"), "{}", written);
     }
 
     #[test]

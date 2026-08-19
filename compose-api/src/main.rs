@@ -5,7 +5,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Redirect,
     },
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -64,6 +64,7 @@ use store::{Instance, InstanceStore, PortRange};
         create_instance,
         get_instance,
         delete_instance,
+        patch_instance,
         restart_instance,
         stop_instance,
         start_instance,
@@ -88,6 +89,8 @@ use store::{Instance, InstanceStore, PortRange};
         VersionResponse,
         AppVersionResponse,
         CreateInstanceRequest,
+        PatchInstanceRequest,
+        PatchInstanceResponse,
         RestartInstanceRequest,
         InstanceInfo,
         InstanceResponse,
@@ -1667,6 +1670,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances", post(create_instance))
         .route("/instances/{name}", get(get_instance))
         .route("/instances/{name}", delete(delete_instance))
+        .route("/instances/{name}", patch(patch_instance))
         .route("/instances/{name}/restart", post(restart_instance))
         .route("/instances/{name}/stop", post(stop_instance))
         .route("/instances/{name}/start", post(start_instance))
@@ -2698,6 +2702,245 @@ async fn delete_instance(
 
     tracing::info!("Deleted instance: {}", name);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Admin: correct an instance's stored configuration without touching its data.
+///
+/// Every field is optional and only the ones present are changed. The container is then
+/// recreated, because that is the only way a change lasts: discovery rebuilds each
+/// instance from its container on every compose-api start and rewrites the .env from
+/// that, so a .env the container does not agree with is reverted at the next restart.
+///
+/// Unlike the restart upgrade path this never runs `down -v`, exports nothing and
+/// restores nothing, so the named volumes carry over untouched. Use it to repair an
+/// instance whose recorded service_type or image is wrong — restoring the *contents* of
+/// a volume is a backup concern and stays separate.
+///
+/// Deliberately absent: `ssh_pubkey`, `nearai_api_key` and `nearai_api_url`. Those decide
+/// who gets a shell in the container and where it sends the tenant's traffic, so setting
+/// them is granting access rather than repairing a record, and nothing about a drifted
+/// service_type needs them. There is no other route to change them on a live instance
+/// today, and this should not become the first one.
+///
+/// Also absent: `mem_limit`, `cpus` and `storage_size`. `ensure_env_file` does not write
+/// those — only `up()` does — so accepting them here would update the in-memory instance
+/// and never reach the .env, which is a silent no-op rather than a limit change.
+#[derive(Deserialize, utoipa::ToSchema)]
+struct PatchInstanceRequest {
+    /// "openclaw" or "ironclaw".
+    #[serde(default)]
+    service_type: Option<String>,
+    /// Full digest reference, e.g. `nearaidev/ironclaw-nearai-worker@sha256:46c3…`.
+    #[serde(default)]
+    image: Option<String>,
+    /// Merged into the existing extra_env. A null value removes that key. Keys compose-api
+    /// manages itself are rejected — extra_env is applied last when the .env is written, so
+    /// allowing them here would let this set SSH_PUBKEY or NEARAI_API_URL by another route.
+    #[serde(default)]
+    extra_env: Option<HashMap<String, Option<String>>>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct PatchInstanceResponse {
+    name: String,
+    service_type: Option<String>,
+    image: Option<String>,
+    /// Whether a SECRETS_MASTER_KEY was readable *before* the recreate, on an instance the
+    /// patch leaves as ironclaw; absent for openclaw, which has no such key. `false` means
+    /// ironclaw minted a fresh one as it came up, so whatever the instance had already
+    /// encrypted stays unreadable and a backup from before the drift is the only copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    master_key_present: Option<bool>,
+}
+
+#[utoipa::path(patch, path = "/instances/{name}", tag = "Instances",
+    params(("name" = String, Path, description = "Instance name")),
+    request_body = PatchInstanceRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Updated configuration", body = PatchInstanceResponse),
+        (status = 400, description = "Invalid field, or service_type and image name different products", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Instance not found", body = ErrorResponse),
+    )
+)]
+async fn patch_instance(
+    _auth: AdminAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<PatchInstanceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let inst = {
+        let store = state.store.read().await;
+        store.get(&name).cloned()
+    }
+    .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
+
+    let mut updated = inst.clone();
+
+    if let Some(st) = req.service_type.as_deref().map(str::trim) {
+        if st != "openclaw" && st != "ironclaw" {
+            return Err(ApiError::BadRequest(
+                "service_type must be 'openclaw' or 'ironclaw'".into(),
+            ));
+        }
+        updated.service_type = Some(st.to_string());
+    }
+    if let Some(img) = req.image.as_deref().map(str::trim) {
+        validate_image(img)?;
+        reject_newlines("image", img)?;
+        updated.image = Some(img.to_string());
+        // The digest is only meaningful for the image it was resolved from.
+        updated.image_digest = None;
+    }
+
+    // ensure_env_file replaces an image that contradicts the service_type, which would
+    // silently discard whichever of the two was just asked for. Say so instead.
+    if let (Some(st), Some(named)) = (
+        updated.service_type.as_deref(),
+        state
+            .compose
+            .service_type_named_by_image(updated.image.as_deref()),
+    ) {
+        if st != named {
+            return Err(ApiError::BadRequest(format!(
+                "service_type '{}' and image '{}' name different products; \
+                 pass both so they agree",
+                st,
+                updated.image.as_deref().unwrap_or("")
+            )));
+        }
+    }
+
+    if let Some(patch) = req.extra_env {
+        let mut extra = updated.extra_env.unwrap_or_default();
+        for (k, v) in patch {
+            // The .env is written as `KEY=value` and read back with a trim plus
+            // `split_once('=')`, so a key carrying '=' or leading space parses as a
+            // different, shorter key — `SSH_PUBKEY=x` would set SSH_PUBKEY and walk
+            // straight past the managed-key check below. Only accept a plain env name.
+            validate_env_key(&k)?;
+            if compose::is_managed_env_key(&k) {
+                return Err(ApiError::BadRequest(format!(
+                    "extra_env may not set '{}': compose-api manages it, and extra_env is \
+                     applied last when the .env is written",
+                    k
+                )));
+            }
+            if let Some(v) = v {
+                reject_newlines("extra_env value", &v)?;
+                extra.insert(k, v);
+                continue;
+            }
+
+            // null removes the key
+            extra.remove(&k);
+        }
+        updated.extra_env = (!extra.is_empty()).then_some(extra);
+    }
+
+    // ironclaw reads its master key off the config volume and mints a fresh one when the file
+    // is not there, which leaves everything it had already encrypted unreadable. The recreate
+    // below is the moment that happens, so resolve the key first, while the container being
+    // repaired is still the one holding it — the volume is the same at either mount point.
+    // Caching it on the instance also puts it in the .env, where /migrate's preflight reads
+    // it. Reported either way: an absent key is the caller's signal to restore from a backup
+    // taken before the drift instead of trusting this volume.
+    let ironclaw = compose::is_ironclaw(updated.service_type.as_deref(), updated.image.as_deref());
+    let mut master_key_present = updated
+        .extra_env
+        .as_ref()
+        .is_some_and(|e| e.contains_key("SECRETS_MASTER_KEY"));
+    if ironclaw && !master_key_present {
+        let compose = state.compose.clone();
+        let owned_name = name.clone();
+        let container_name = format!("openclaw-{}-gateway-1", name);
+        let signal_type = updated.service_type.clone();
+        let signal_image = updated.image.clone();
+        let key = tokio::task::spawn_blocking(move || {
+            compose.resolve_master_key(
+                &owned_name,
+                &container_name,
+                signal_type.as_deref(),
+                signal_image.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("master key task join: {}", e)))?;
+        match key {
+            Some(key) => {
+                updated
+                    .extra_env
+                    .get_or_insert_with(Default::default)
+                    .insert("SECRETS_MASTER_KEY".to_string(), key);
+                master_key_present = true;
+            }
+            None => tracing::warn!(
+                "Instance '{}': no SECRETS_MASTER_KEY to carry through the recreate — ironclaw \
+                 will mint one, and anything already encrypted stays unreadable",
+                name
+            ),
+        }
+    }
+
+    let service_type = updated.service_type.clone();
+    let default_image = match service_type.as_deref() {
+        Some("ironclaw") => state.config.ironclaw_image.clone(),
+        _ => state.config.openclaw_image.clone(),
+    };
+
+    {
+        let compose = state.compose.clone();
+        let inst = updated.clone();
+        let domain = state.config.openclaw_domain.clone();
+        let client_id = state.config.google_oauth_client_id.clone();
+        let exchange_url = state.oauth_exchange_url.clone();
+        tokio::task::spawn_blocking(move || {
+            compose.ensure_env_file(
+                &inst,
+                &default_image,
+                domain.as_deref(),
+                client_id.as_deref(),
+                exchange_url.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("env file task join: {}", e)))??;
+    }
+
+    {
+        let mut store = state.store.write().await;
+        store.add(updated.clone());
+    }
+
+    // Recreate with the type `ensure_env_file` just settled on, not the one the store
+    // happened to hold: it resolves an unset service_type from the image, and picking the
+    // compose template from the stale value would mount an ironclaw instance through the
+    // openclaw template — the wrong paths for its data.
+    let recreate_type = state
+        .compose
+        .read_service_type_from_env_file(&name)
+        .or(service_type);
+
+    // Discovery rebuilds every instance from its container on each compose-api start and
+    // rewrites the .env from that, so a change written to the .env alone lasts only until
+    // then. Recreating is what makes the patch stick.
+    state
+        .compose_start(&name, true, recreate_type.as_deref())
+        .await?;
+
+    tracing::info!(
+        "Patched instance '{}': service_type={:?}",
+        name,
+        updated.service_type
+    );
+
+    Ok(Json(PatchInstanceResponse {
+        name,
+        service_type: updated.service_type,
+        image: updated.image,
+        master_key_present: ironclaw.then_some(master_key_present),
+    }))
 }
 
 #[utoipa::path(post, path = "/instances/{name}/restart", tag = "Instances",
@@ -6430,6 +6673,10 @@ mod tests {
         token: String,
         env_dir: tempfile::TempDir,
         orphan_cleaning: Arc<Mutex<HashSet<String>>>,
+        /// Distinct from the openclaw template, so which one a recreate used is visible
+        /// in the recorded docker argv.
+        ironclaw_compose: std::path::PathBuf,
+        _compose_dir: tempfile::TempDir,
     }
 
     fn write_fake_docker(volume_names: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -6546,18 +6793,8 @@ exit 1
         (dir, log_path)
     }
 
-    fn test_admin_app() -> TestAdminApp {
-        let config = AppConfig::test_default();
-        let admin_token = "a".repeat(32);
-        let env_dir = tempfile::tempdir().unwrap();
-
-        let mut compose_files = std::collections::HashMap::new();
-        compose_files.insert("openclaw".to_string(), config.compose_file.clone());
-        let compose = Arc::new(
-            ComposeManager::new(compose_files, env_dir.path().to_path_buf(), None).unwrap(),
-        );
-
-        let instance = Instance {
+    fn default_test_instance() -> Instance {
+        Instance {
             name: "tracked-inst".to_string(),
             token: "test-token".to_string(),
             gateway_port: 19001,
@@ -6574,7 +6811,36 @@ exit 1
             cpus: None,
             storage_size: None,
             extra_env: None,
-        };
+        }
+    }
+
+    fn test_admin_app() -> TestAdminApp {
+        test_admin_app_with(test_instance_named("tracked-inst", Some("openclaw")))
+    }
+
+    /// An instance with only the fields these tests care about set.
+    fn test_instance_named(name: &str, service_type: Option<&str>) -> Instance {
+        let mut inst = default_test_instance();
+        inst.name = name.to_string();
+        inst.service_type = service_type.map(str::to_string);
+        inst
+    }
+
+    fn test_admin_app_with(instance: Instance) -> TestAdminApp {
+        let config = AppConfig::test_default();
+        let admin_token = "a".repeat(32);
+        let env_dir = tempfile::tempdir().unwrap();
+
+        // A distinct ironclaw template, so picking the wrong one is observable.
+        let compose_dir = tempfile::tempdir().unwrap();
+        let ironclaw_compose = compose_dir.path().join("docker-compose.ironclaw.yml");
+        std::fs::write(&ironclaw_compose, "services: {}\n").unwrap();
+        let mut compose_files = std::collections::HashMap::new();
+        compose_files.insert("openclaw".to_string(), config.compose_file.clone());
+        compose_files.insert("ironclaw".to_string(), ironclaw_compose.clone());
+        let compose = Arc::new(
+            ComposeManager::new(compose_files, env_dir.path().to_path_buf(), None).unwrap(),
+        );
 
         let mut instance_store = store::InstanceStore::new(PortRange::from_env());
         instance_store.populate(vec![instance]);
@@ -6596,6 +6862,7 @@ exit 1
         let app = Router::new()
             .route("/admin/orphans", delete(delete_all_orphans))
             .route("/admin/orphans/{name}", delete(delete_orphan))
+            .route("/instances/{name}", patch(patch_instance))
             .with_state(state);
 
         TestAdminApp {
@@ -6603,6 +6870,8 @@ exit 1
             token: admin_token,
             env_dir,
             orphan_cleaning,
+            ironclaw_compose,
+            _compose_dir: compose_dir,
         }
     }
 
@@ -6678,6 +6947,335 @@ exit 1
             .body(Body::empty())
             .unwrap();
 
+        let response = test_app.app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A docker that accepts everything, so the recreate at the end of a patch succeeds
+    /// without a real daemon.
+    fn write_accepting_docker() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("docker");
+        let log_path = dir.path().join("argv.log");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log_path.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        dir
+    }
+
+    /// A fake docker that answers `cat <path>` with `key` and fails for any other path, so a
+    /// test can say which mount point the config volume's `.master_key` is reachable through.
+    fn write_docker_serving_master_key(path: &str, key: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("docker");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"{path}\"*) echo {key} ;;\n                   *\".master_key\"*) echo 'no such file' >&2; exit 1 ;;\nesac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        dir
+    }
+
+    async fn patch_tracked_inst(
+        body: serde_json::Value,
+    ) -> (StatusCode, String, tempfile::TempDir) {
+        patch_tracked_inst_with_docker(body, write_accepting_docker()).await
+    }
+
+    async fn patch_tracked_inst_with_docker(
+        body: serde_json::Value,
+        docker_dir: tempfile::TempDir,
+    ) -> (StatusCode, String, tempfile::TempDir) {
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+
+        let _lock = orphan_test_env_lock().lock().await;
+        let _docker_guard = EnvVarGuard::set_path(
+            "OPENCLAW_TEST_DOCKER_BIN",
+            docker_dir.path().join("docker").as_path(),
+        );
+
+        let test_app = test_admin_app();
+        let request = axum::http::Request::builder()
+            .method("PATCH")
+            .uri("/instances/tracked-inst")
+            .header("Authorization", format!("Bearer {}", test_app.token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = test_app.app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            String::from_utf8_lossy(&bytes).to_string(),
+            test_app.env_dir,
+        )
+    }
+
+    /// The repair an instance needs when its recorded type drifted from what it runs:
+    /// set both, write them to the .env, leave the volumes alone.
+    #[tokio::test]
+    async fn test_patch_instance_writes_service_type_and_image_to_env_file() {
+        let image = "nearaidev/ironclaw-nearai-worker@sha256:46c302d3";
+        let (status, body, env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "ironclaw",
+            "image": image,
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["service_type"], "ironclaw");
+
+        let written = std::fs::read_to_string(env_dir.path().join("tracked-inst.env")).unwrap();
+        assert!(written.contains("SERVICE_TYPE=ironclaw"), "{}", written);
+        assert!(
+            written.contains(&format!("OPENCLAW_IMAGE={}", image)),
+            "{}",
+            written
+        );
+    }
+
+    #[tokio::test]
+    async fn test_patch_instance_rejects_service_type_that_contradicts_the_image() {
+        let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "ironclaw",
+            "image": "nearaidev/openclaw-nearai-worker@sha256:deadbeef",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+        assert!(body.contains("name different products"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn test_patch_instance_rejects_image_without_a_digest() {
+        let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+            "image": "nearaidev/ironclaw-nearai-worker:latest",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+        assert!(body.contains("digest reference"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn test_patch_instance_merges_extra_env_and_drops_null_keys() {
+        let (status, body, env_dir) = patch_tracked_inst(serde_json::json!({
+            "extra_env": {"CHANNEL_RELAY_URL": "https://relay.example", "GONE": null},
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let written = std::fs::read_to_string(env_dir.path().join("tracked-inst.env")).unwrap();
+        assert!(
+            written.contains("CHANNEL_RELAY_URL=https://relay.example"),
+            "{}",
+            written
+        );
+        assert!(!written.contains("GONE="), "{}", written);
+    }
+
+    /// Access-granting fields are not part of this endpoint. Serde ignores unknown fields,
+    /// so sending them is accepted but must leave the .env untouched — a caller cannot
+    /// re-key an instance or repoint its traffic through here.
+    #[tokio::test]
+    async fn test_patch_instance_ignores_access_granting_fields() {
+        let (status, body, env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "openclaw",
+            "ssh_pubkey": "ssh-ed25519 AAAAattacker",
+            "nearai_api_key": "sk-attacker",
+            "nearai_api_url": "https://exfil.example/v1",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let written = std::fs::read_to_string(env_dir.path().join("tracked-inst.env")).unwrap();
+        assert!(written.contains("SERVICE_TYPE=openclaw"), "{}", written);
+        assert!(!written.contains("AAAAattacker"), "{}", written);
+        assert!(!written.contains("sk-attacker"), "{}", written);
+        assert!(!written.contains("exfil.example"), "{}", written);
+    }
+
+    /// extra_env is written last, so it would otherwise reach the same fields by another
+    /// route — including the master key that decrypts the tenant's secrets.
+    #[tokio::test]
+    async fn test_patch_instance_rejects_extra_env_for_managed_keys() {
+        for key in [
+            "SSH_PUBKEY",
+            "NEARAI_API_URL",
+            "OPENCLAW_IMAGE",
+            "SERVICE_TYPE",
+            "SECRETS_MASTER_KEY",
+            "PATH",
+        ] {
+            let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+                "extra_env": { key: "attacker-value" },
+            }))
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{} was accepted: {}",
+                key,
+                body
+            );
+            assert!(body.contains("compose-api manages it"), "{}", body);
+        }
+    }
+
+    /// The .env round-trips through a trim and `split_once('=')`, so a key carrying '='
+    /// or leading space would be checked under one name and written under another —
+    /// setting a managed key without ever failing `is_managed_env_key`.
+    #[tokio::test]
+    async fn test_patch_instance_rejects_env_keys_that_reparse_as_another_key() {
+        for key in [
+            "SSH_PUBKEY=ssh-ed25519 AAAAevil",
+            " SSH_PUBKEY",
+            "SSH_PUBKEY ",
+            "FOO=BAR",
+            "",
+            "has-dash",
+        ] {
+            let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+                "extra_env": { key: "x" },
+            }))
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "key {:?} was accepted: {}",
+                key,
+                body
+            );
+        }
+    }
+
+    /// The compose template is chosen from the type the .env ended up with. When the store
+    /// has no service_type but the image names ironclaw, the recreate must not fall back to
+    /// the openclaw template — that mounts the instance's volumes at the wrong paths.
+    #[tokio::test]
+    async fn test_patch_instance_recreates_with_the_type_written_to_the_env_file() {
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+
+        let _lock = orphan_test_env_lock().lock().await;
+        let docker_dir = write_accepting_docker();
+        let _docker_guard = EnvVarGuard::set_path(
+            "OPENCLAW_TEST_DOCKER_BIN",
+            docker_dir.path().join("docker").as_path(),
+        );
+
+        let test_app = test_admin_app_with(test_instance_named("typeless-inst", None));
+        let request = axum::http::Request::builder()
+            .method("PATCH")
+            .uri("/instances/typeless-inst")
+            .header("Authorization", format!("Bearer {}", test_app.token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "image": "nearaidev/ironclaw-nearai-worker@sha256:46c302d3" })
+                    .to_string(),
+            ))
+            .unwrap();
+
+        let response = test_app.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert_eq!(status, StatusCode::OK, "{}", body);
+
+        let written =
+            std::fs::read_to_string(test_app.env_dir.path().join("typeless-inst.env")).unwrap();
+        assert!(written.contains("SERVICE_TYPE=ironclaw"), "{}", written);
+
+        let argv = std::fs::read_to_string(docker_dir.path().join("argv.log")).unwrap_or_default();
+        assert!(
+            argv.contains(test_app.ironclaw_compose.to_str().unwrap()),
+            "recreate did not use the ironclaw template; docker argv was:\n{}",
+            argv
+        );
+    }
+
+    /// The repair's own hazard: ironclaw mints a fresh master key when the file is missing, so
+    /// the key has to be read before the recreate — and on a flipped instance it is readable
+    /// only through openclaw's mount point, because that is where its image puts the volume.
+    #[tokio::test]
+    async fn test_patch_instance_carries_a_flipped_instances_master_key_through_the_recreate() {
+        let key = "a".repeat(64);
+        let docker = write_docker_serving_master_key("/home/agent/.openclaw/.master_key", &key);
+        let (status, body, env_dir) = patch_tracked_inst_with_docker(
+            serde_json::json!({
+                "service_type": "ironclaw",
+                "image": "nearaidev/ironclaw-nearai-worker@sha256:46c302d3",
+            }),
+            docker,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["master_key_present"], true, "{}", body);
+
+        let written = std::fs::read_to_string(env_dir.path().join("tracked-inst.env")).unwrap();
+        assert!(
+            written.contains(&format!("SECRETS_MASTER_KEY={}", key)),
+            "{}",
+            written
+        );
+    }
+
+    /// An instance with no key anywhere still gets repaired — the caller is told, because that
+    /// is the case where the volume is not the copy to trust.
+    #[tokio::test]
+    async fn test_patch_instance_reports_a_master_key_it_could_not_find() {
+        let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "ironclaw",
+            "image": "nearaidev/ironclaw-nearai-worker@sha256:46c302d3",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["master_key_present"], false, "{}", body);
+    }
+
+    /// openclaw has no such key, so the field says nothing rather than saying "missing".
+    #[tokio::test]
+    async fn test_patch_instance_omits_the_master_key_verdict_for_openclaw() {
+        let (status, body, _env_dir) = patch_tracked_inst(serde_json::json!({
+            "service_type": "openclaw",
+            "image": "nearaidev/openclaw-nearai-worker@sha256:deadbeef",
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json.get("master_key_present").is_none(), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn test_patch_instance_requires_admin_auth() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let test_app = test_admin_app();
+        let request = axum::http::Request::builder()
+            .method("PATCH")
+            .uri("/instances/tracked-inst")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"service_type":"ironclaw"}"#))
+            .unwrap();
         let response = test_app.app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
