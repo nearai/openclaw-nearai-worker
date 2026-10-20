@@ -16,9 +16,17 @@ RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
 
+# eMudhra intermediate CA key compromise (2026-10-20): bookworm has no fixed
+# ca-certificates yet, so distrust the two roots the compromised intermediates
+# chain to. Remove once Debian ships a fixed ca-certificates.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    && sed -i -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt$|!&|' \
+       -e 's|^mozilla/Comodo_AAA_Services_root.crt$|!&|' /etc/ca-certificates.conf \
+    && update-ca-certificates \
+    && test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem \
+    && test ! -e /etc/ssl/certs/Comodo_AAA_Services_root.pem \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
